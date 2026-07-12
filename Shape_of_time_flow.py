@@ -41,19 +41,149 @@ from PIL import Image
 from imgtrans import drawManeuver
 
 
+# ======== i18n (Japanese / English UI) ========
+# 起動時のデフォルト言語は環境変数 STF_LANG で切替可能 (ja / en)。既定は ja。
+# GUI 上の「Language / 言語」セレクタでも実行中に切り替えられる。
+LANG = os.environ.get("STF_LANG", "ja").strip().lower()
+if LANG not in ("ja", "en"):
+    LANG = "ja"
+
+# key -> {"ja": ..., "en": ...}
+TR = {
+    # Window / tabs
+    "window_title": {"ja": "Shape of Time Flow", "en": "Shape of Time Flow"},
+    "tab_setup":   {"ja": "1. 入力 / Setup",     "en": "1. Setup"},
+    "tab_images":  {"ja": "2. 画像 / Images",     "en": "2. Images"},
+    "tab_preview": {"ja": "3. プレビュー / Preview", "en": "3. Preview"},
+    "tab_render":  {"ja": "4. 出力 / Render",     "en": "4. Render"},
+    # Language selector
+    "lang_label":  {"ja": "言語 / Language:",     "en": "Language / 言語:"},
+    # Setup tab
+    "btn_select_video": {"ja": "動画を選択 / Select Video File", "en": "Select Video File"},
+    "no_video":    {"ja": "動画が未選択です",       "en": "No video file selected"},
+    "chk_vertical":{"ja": "縦スリット (Vertical)", "en": "Vertical (check for vertical)"},
+    "slit_h":      {"ja": "スリット方向: 横 (horizontal)", "en": "Slit direction: horizontal"},
+    "slit_v":      {"ja": "スリット方向: 縦 (vertical)",   "en": "Slit direction: vertical"},
+    "btn_initialize": {"ja": "初期化 / Initialize", "en": "Initialize"},
+    "video_not_init": {"ja": "動画情報: (未初期化)", "en": "Video info: (not initialized)"},
+    # Shared size
+    "grp_shared_size": {"ja": "共通サイズ設定 (Shared Image Size)", "en": "Shared Image Size"},
+    "lbl_scan_size":   {"ja": "スキャン方向サイズ:", "en": "Scan-direction size:"},
+    "hint_scan_auto":  {"ja": "(映像幅から自動)",   "en": "(auto from video width)"},
+    "lbl_time_size":   {"ja": "時間方向サイズ:",     "en": "Time-direction size:"},
+    "hint_time_any":   {"ja": "(任意のフレーム数)",  "en": "(any frame count)"},
+    "gen_hint": {
+        "ja": "出力ファイル形状: {dim}\n(各セクションでパターン/波形を個別に設定 → そのセクションの Generate ボタンで生成)",
+        "en": "Output file shape: {dim}\n(Set pattern/wave per section → generate with that section's Generate button)",
+    },
+    # Image sections
+    "grp_space_image": {"ja": "Space 画像 (Space Image)", "en": "Space Image"},
+    "grp_time_image":  {"ja": "Time 画像 (Time Image)",   "en": "Time Image"},
+    "grp_rate_image":  {"ja": "Rate 画像 (Rate Image)",   "en": "Rate Image"},
+    "btn_select_space":{"ja": "Space 画像を選択 / Select Space Image", "en": "Select Space Image"},
+    "btn_select_time": {"ja": "Time 画像を選択 / Select Time Image",   "en": "Select Time Image"},
+    "btn_select_rate": {"ja": "Rate 画像を選択 / Select Rate Image",   "en": "Select Rate Image"},
+    "no_space_image":  {"ja": "Space 画像が未選択です", "en": "No space image selected"},
+    "no_time_image":   {"ja": "Time 画像が未選択です",  "en": "No time image selected"},
+    "no_rate_image":   {"ja": "Rate 画像が未選択です",  "en": "No rate image selected"},
+    "lbl_space_range": {"ja": "space range:", "en": "space range:"},
+    "lbl_vmin": {"ja": "vmin:", "en": "vmin:"},
+    "lbl_vmax": {"ja": "vmax:", "en": "vmax:"},
+    "lbl_baseline": {"ja": "baseline:", "en": "baseline:"},
+    "lbl_max_range": {"ja": "max_range:", "en": "max_range:"},
+    "lbl_start_frame": {"ja": "start frame:", "en": "start frame:"},
+    # Section generator
+    "gen_header": {"ja": "▼ サンプル生成設定 ({t})", "en": "▼ Sample generator ({t})"},
+    "lbl_pattern": {"ja": "パターン:", "en": "Pattern:"},
+    "lbl_wave_dir": {"ja": "方向:", "en": "Direction:"},
+    "lbl_wave_amp": {"ja": "振幅:", "en": "Amplitude:"},
+    "lbl_wave_period": {"ja": "周期:", "en": "Period:"},
+    "lbl_wave_phase": {"ja": "位相:", "en": "Phase:"},
+    "wave_dir_v": {"ja": "上下方向 (vertical)", "en": "Vertical"},
+    "wave_dir_h": {"ja": "左右方向 (horizontal)", "en": "Horizontal"},
+    "preview_after_init": {"ja": "(Initialize 後に表示)", "en": "(shown after Initialize)"},
+    "btn_generate_apply": {"ja": "▶ 生成して {t} に適用 / Generate & Apply",
+                            "en": "▶ Generate & Apply to {t}"},
+    # Maneuver preview panel
+    "grp_maneuver_preview": {"ja": "マニューバ プレビュー (Maneuver Preview)",
+                              "en": "Maneuver Preview"},
+    "preview_hint": {"ja": "Space + (Time または Rate) を設定後、軌道データを生成して 2D/3D で確認できます",
+                      "en": "After setting Space + (Time or Rate), generate trajectory data to check it in 2D/3D"},
+    "lbl_gen_method": {"ja": "データ生成方法 / Generation method:",
+                        "en": "Generation method:"},
+    "lbl_3d_frames": {"ja": "3D frames:", "en": "3D frames:"},
+    "lbl_dpi": {"ja": "dpi:", "en": "dpi:"},
+    "btn_gen_preview": {"ja": "プレビュー生成 (2D Plot + 3D GIF)",
+                         "en": "Generate Preview (2D Plot + 3D GIF)"},
+    "lbl_2d_plot": {"ja": "2D Plot:", "en": "2D Plot:"},
+    "lbl_3d_anim": {"ja": "3D Animation (GIF):", "en": "3D Animation (GIF):"},
+    "preview_after_gen": {"ja": "(プレビュー生成後に表示)", "en": "(shown after generating preview)"},
+    "status_idle": {"ja": "Status: idle", "en": "Status: idle"},
+    "status_need_space": {"ja": "Status: Space 画像が必要です", "en": "Status: a Space image is required"},
+    "status_ready": {"ja": "Status: ready ({m} mode)", "en": "Status: ready ({m} mode)"},
+    "status_need_img": {"ja": "Status: {need} 画像が必要です", "en": "Status: a {need} image is required"},
+    # Render tab
+    "lbl_select_method": {"ja": "軌道データ生成方法を選択 / Select trajectory data generation method",
+                           "en": "Select trajectory data generation method"},
+    "lbl_anim_settings": {"ja": "アニメーション出力設定 / Animation Output Settings",
+                           "en": "Animation Output Settings"},
+    "chk_enable_anim": {"ja": "アニメーション出力を有効化 / Enable animation output",
+                         "en": "Enable animation output"},
+    "lbl_anim_duration": {"ja": "アニメーション長さ (秒) / Animation Duration (seconds):",
+                           "en": "Animation Duration (seconds):"},
+    "btn_start_render": {"ja": "レンダリング開始 / Start Rendering", "en": "Start Rendering"},
+    "btn_anim_only": {"ja": "アニメーションのみ / Animation Only", "en": "Animation Only"},
+    "grp_rendered_preview": {"ja": "レンダリング結果プレビュー (Rendered Preview)",
+                              "en": "Rendered Preview"},
+    "rendered_video_title": {"ja": "レンダリング動画 (Rendered Video)", "en": "Rendered Video"},
+    "anim_title": {"ja": "アニメーション (3D Animation)", "en": "3D Animation"},
+    # Log
+    "lbl_log": {"ja": "Log:", "en": "Log:"},
+    "mode_select_placeholder": {"ja": "Select mode", "en": "Select mode"},
+    # VideoPreview
+    "btn_pause": {"ja": "⏸ 一時停止", "en": "⏸ Pause"},
+    "btn_play": {"ja": "▶ 再生", "en": "▶ Play"},
+    "btn_open_external": {"ja": "外部プレイヤーで開く", "en": "Open in external player"},
+    "no_multimedia": {"ja": "(QtMultimedia が無いため内蔵再生できません)",
+                       "en": "(QtMultimedia not available — embedded playback disabled)"},
+}
+
+
+def tr(key, **fmt):
+    """現在の言語 LANG に応じた訳文を返す。未知キーはキー名をそのまま返す。"""
+    d = TR.get(key)
+    s = (d.get(LANG) or d.get("ja")) if d else key
+    return s.format(**fmt) if fmt else s
+
+
 # ======== Sample image generator ========
-PATTERN_LABELS = [
-    "上→下: 白→黒",
-    "上→下: 黒→白",
-    "左→右: 白→黒",
-    "左→右: 黒→白",
-    "50% グレー均一",
-    "ランダムノイズ",
-    "波形 (Wave) ※ 振幅/周期/位相 編集",
-]
+# パターン表示ラベル (言語別)。ロジックは PATTERN_IDS を使うので翻訳しても安全。
+PATTERN_LABELS_BY_LANG = {
+    "ja": [
+        "上→下: 白→黒",
+        "上→下: 黒→白",
+        "左→右: 白→黒",
+        "左→右: 黒→白",
+        "50% グレー均一",
+        "ランダムノイズ",
+        "波形 (Wave) ※ 振幅/周期/位相 編集",
+    ],
+    "en": [
+        "Top→Bottom: white→black",
+        "Top→Bottom: black→white",
+        "Left→Right: white→black",
+        "Left→Right: black→white",
+        "Solid 50% gray",
+        "Random noise",
+        "Wave ※ edit amplitude/period/phase",
+    ],
+}
 PATTERN_IDS = [
     "v_w2b", "v_b2w", "h_w2b", "h_b2w", "solid_gray", "random", "wave",
 ]
+
+# 「通常再生」サフィックス (言語別)
+NORMAL_SUFFIX = {"ja": "（通常再生）", "en": " (normal playback)"}
 
 # 各セクション (space/time/rate) の「通常再生」に相当するパターン。
 #   space: 左→右 黒→白グラデーション (h_b2w) = 空間を素通し (等倍マッピング)
@@ -67,19 +197,21 @@ SECTION_NORMAL_PATTERN = {
 }
 
 
-def section_pattern_order(type_name):
-    """セクション {type_name} 用の (pattern_ids, labels) を返す。
+def section_pattern_order(type_name, lang=None):
+    """セクション {type_name} 用の (pattern_ids, labels) を現在の言語で返す。
 
     「通常再生」に相当する pattern を先頭 (index 0) に移動し、そのラベル末尾に
-    「（通常再生）」を付与する。残りは元の PATTERN_IDS 順を維持。
+    「（通常再生）」相当のサフィックスを付与する。残りは元の PATTERN_IDS 順を維持。
     """
+    lang = lang or LANG
+    pattern_labels = PATTERN_LABELS_BY_LANG.get(lang, PATTERN_LABELS_BY_LANG["ja"])
     normal = SECTION_NORMAL_PATTERN.get(type_name, PATTERN_IDS[0])
     ordered_ids = [normal] + [pid for pid in PATTERN_IDS if pid != normal]
     labels = []
     for pid in ordered_ids:
-        base = PATTERN_LABELS[PATTERN_IDS.index(pid)]
+        base = pattern_labels[PATTERN_IDS.index(pid)]
         if pid == normal:
-            base = f"{base}（通常再生）"
+            base = f"{base}{NORMAL_SUFFIX.get(lang, NORMAL_SUFFIX['ja'])}"
         labels.append(base)
     return ordered_ids, labels
 
@@ -224,24 +356,39 @@ class VideoPreview(QWidget):
             self.player.mediaStatusChanged.connect(self._on_status)
 
             ctl = QHBoxLayout()
-            self.play_btn = QPushButton("⏸ 一時停止")
+            self.play_btn = QPushButton(tr("btn_pause"))
             self.play_btn.clicked.connect(self._toggle)
             ctl.addWidget(self.play_btn)
-            self.open_btn = QPushButton("外部プレイヤーで開く")
+            self.open_btn = QPushButton(tr("btn_open_external"))
             self.open_btn.clicked.connect(self._open_external)
             ctl.addWidget(self.open_btn)
             ctl.addStretch()
             v.addLayout(ctl)
         else:
-            self.info_label = QLabel("(QtMultimedia が無いため内蔵再生できません)")
+            self.info_label = QLabel(tr("no_multimedia"))
             self.info_label.setWordWrap(True)
             self.info_label.setStyleSheet("color: #a66; font-size: 11px;")
             v.addWidget(self.info_label)
-            self.open_btn = QPushButton("外部プレイヤーで開く")
+            self.open_btn = QPushButton(tr("btn_open_external"))
             self.open_btn.clicked.connect(self._open_external)
             v.addWidget(self.open_btn)
 
         self.setVisible(False)
+
+    def set_base_title(self, base_title):
+        """タイトルおよびボタン等のテキストを現在言語で更新する (言語切替時に呼ばれる)。"""
+        self._base_title = base_title
+        if self.loaded and self.path:
+            self.title_label.setText(f"{base_title}: {os.path.basename(self.path)}")
+        else:
+            self.title_label.setText(base_title)
+        if hasattr(self, "open_btn"):
+            self.open_btn.setText(tr("btn_open_external"))
+        if hasattr(self, "info_label"):
+            self.info_label.setText(tr("no_multimedia"))
+        if hasattr(self, "play_btn") and HAS_MULTIMEDIA:
+            playing = self.player.state() == QMediaPlayer.PlayingState
+            self.play_btn.setText(tr("btn_pause") if playing else tr("btn_play"))
 
     def load(self, path):
         """path の動画を読み込み、あれば表示 + 自動再生。無ければ非表示。"""
@@ -255,7 +402,7 @@ class VideoPreview(QWidget):
         if HAS_MULTIMEDIA:
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(os.path.abspath(path))))
             self.player.play()
-            self.play_btn.setText("⏸ 一時停止")
+            self.play_btn.setText(tr("btn_pause"))
         self.setVisible(True)
 
     def stop(self):
@@ -274,10 +421,10 @@ class VideoPreview(QWidget):
     def _toggle(self):
         if self.player.state() == QMediaPlayer.PlayingState:
             self.player.pause()
-            self.play_btn.setText("▶ 再生")
+            self.play_btn.setText(tr("btn_play"))
         else:
             self.player.play()
-            self.play_btn.setText("⏸ 一時停止")
+            self.play_btn.setText(tr("btn_pause"))
 
     def _open_external(self):
         if not (self.path and os.path.exists(self.path)):
@@ -561,7 +708,7 @@ class ManeuverPreviewWorker(QThread):
 class IMGTransApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IMGTrans GUI v2 (2026-05-26)")
+        self.setWindowTitle(tr("window_title"))
         self.resize(760, 820)
         self.setMinimumSize(640, 480)
 
@@ -574,8 +721,87 @@ class IMGTransApp(QWidget):
         self.render_completed = False
         self._preview_stale = False
 
+        # i18n: 再翻訳用コールバックの登録簿。各エントリは呼ぶと現在の LANG で
+        # 対応 widget のテキストを更新する。
+        self._i18n = []
+
         self.init_ui()
+
+        # 「未選択」系ラベルは画像/動画ロード時にファイル名で上書きされるため、
+        # 言語切替時は「未ロードのときだけ」既定文言を訳し直す (条件付き登録)。
+        self._i18n.append(lambda: (None if self.videopath else self.video_label.setText(tr("no_video"))))
+        self._i18n.append(lambda: (None if self.dm else self.info_label.setText(tr("video_not_init"))))
+        self._i18n.append(lambda: (None if self.space_img_path else self.space_label.setText(tr("no_space_image"))))
+        self._i18n.append(lambda: (None if self.time_img_path else self.time_label.setText(tr("no_time_image"))))
+        self._i18n.append(lambda: (None if self.rate_img_path else self.rate_label.setText(tr("no_rate_image"))))
+
         self.update_ui_state("initial")
+
+    # --- i18n helpers ---
+    def _reg(self, fn):
+        """再翻訳コールバック fn を登録し、初期テキスト適用のため即実行する。"""
+        self._i18n.append(fn)
+        fn()
+
+    def _trlabel(self, key, **fmt):
+        """tr(key) を表示し、言語切替時に自動更新される QLabel を返す。"""
+        lbl = QLabel()
+        self._reg(lambda l=lbl, k=key, f=fmt: l.setText(tr(k, **f)))
+        return lbl
+
+    def on_language_changed(self, *_):
+        global LANG
+        sel = self.lang_select.currentData()
+        if sel in ("ja", "en") and sel != LANG:
+            LANG = sel
+            self.retranslate_ui()
+
+    def retranslate_ui(self):
+        """登録済みの全 i18n コールバックを再実行して UI を現在言語に更新する。"""
+        self.setWindowTitle(tr("window_title"))
+        for fn in self._i18n:
+            try:
+                fn()
+            except Exception:
+                pass
+        # パターン/波形の QComboBox は項目テキストの入れ替えが必要
+        for t in getattr(self, "_section_gens", {}):
+            self._retranslate_section_combo(t)
+            # プレビュー未生成 (pixmap 無し) のプレースホルダのみ差し替え
+            lbl = self._section_gens[t].get('preview_label')
+            if lbl is not None and (lbl.pixmap() is None or lbl.pixmap().isNull()):
+                lbl.setText(tr("preview_after_init"))
+        # マニューバプレビューのプレースホルダ (未生成時のみ)
+        for lbl in (getattr(self, "preview_2dplot_label", None),
+                    getattr(self, "preview_3d_label", None)):
+            if lbl is not None and (lbl.pixmap() is None or lbl.pixmap().isNull()) \
+                    and lbl.movie() is None:
+                lbl.setText(tr("preview_after_gen"))
+        # ステータス表示は idle 相当のときだけ翻訳を反映
+        if hasattr(self, "preview_status_label"):
+            self._update_preview_btn_state()
+
+    def _retranslate_section_combo(self, type_name):
+        """セクションのパターン/波形方向 combo を、選択を保ったまま現在言語で作り直す。"""
+        g = self._section_gens.get(type_name, {})
+        pat = g.get('pattern')
+        if pat is not None:
+            ids, labels = section_pattern_order(type_name)
+            idx = pat.currentIndex()
+            pat.blockSignals(True)
+            pat.clear()
+            pat.addItems(labels)
+            pat.setCurrentIndex(max(0, min(idx, len(labels) - 1)))
+            pat.blockSignals(False)
+            g['pattern_ids'] = ids
+        wdir = g.get('wave_dir')
+        if wdir is not None:
+            idx = wdir.currentIndex()
+            wdir.blockSignals(True)
+            wdir.clear()
+            wdir.addItems([tr("wave_dir_v"), tr("wave_dir_h")])
+            wdir.setCurrentIndex(max(0, min(idx, 1)))
+            wdir.blockSignals(False)
 
     # --- UI Setup ---
     def _wrap_scroll(self, widget):
@@ -587,43 +813,61 @@ class IMGTransApp(QWidget):
         return scroll
 
     def init_ui(self):
+        # --- Language selector (Setup タブ上部に配置) ---
+        self.lang_label = self._trlabel("lang_label")
+        self.lang_select = QComboBox()
+        self.lang_select.addItem("日本語", "ja")
+        self.lang_select.addItem("English", "en")
+        self.lang_select.setCurrentIndex(0 if LANG == "ja" else 1)
+        self.lang_select.currentIndexChanged.connect(self.on_language_changed)
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(self.lang_label)
+        lang_row.addWidget(self.lang_select)
+        lang_row.addStretch()
+        self.lang_row = lang_row
+
         # --- Video file ---
-        self.video_label = QLabel("No video file selected")
-        self.video_btn = QPushButton("Select Video File")
+        self.video_label = QLabel(tr("no_video"))
+        self.video_btn = QPushButton()
+        self._reg(lambda: self.video_btn.setText(tr("btn_select_video")))
         self.video_btn.clicked.connect(self.select_video)
 
         # --- Slit toggle ---
-        self.slit_toggle = QCheckBox("Vertical (check for vertical)")
-        self.slit_label = QLabel("Slit direction: horizontal")
+        self.slit_toggle = QCheckBox()
+        self._reg(lambda: self.slit_toggle.setText(tr("chk_vertical")))
+        self.slit_label = QLabel(tr("slit_h"))
         self.slit_toggle.stateChanged.connect(self.update_slit_label)
+        self._reg(self.update_slit_label)  # 言語切替時にスリット表示も更新
 
         # --- Initialize ---
-        self.init_btn = QPushButton("Initialize")
+        self.init_btn = QPushButton()
+        self._reg(lambda: self.init_btn.setText(tr("btn_initialize")))
         self.init_btn.clicked.connect(self.initialize_drawmaneuver)
-        self.info_label = QLabel("Video info: (not initialized)")
+        self.info_label = QLabel(tr("video_not_init"))
 
         # ===== 共通サイズ設定 (Space/Time/Rate で共有) =====
         # img_to_maneuver は space と time/rate 画像の形状一致を要求するため、サイズは共有。
         # パターン/波形/プレビューは各セクション (Space/Time/Rate) に個別配置。
-        self.gen_group = QGroupBox("共通サイズ設定 (Shared Image Size)")
+        self.gen_group = QGroupBox()
+        self._reg(lambda: self.gen_group.setTitle(tr("grp_shared_size")))
         gen_v = QVBoxLayout(self.gen_group)
 
         s_layout = QHBoxLayout()
-        s_layout.addWidget(QLabel("スキャン方向サイズ:"))
+        s_layout.addWidget(self._trlabel("lbl_scan_size"))
         self.gen_scan_size = QSpinBox()
         self.gen_scan_size.setRange(16, 32768)
         self.gen_scan_size.setValue(1920)
         s_layout.addWidget(self.gen_scan_size)
-        s_layout.addWidget(QLabel("(映像幅から自動)"))
+        s_layout.addWidget(self._trlabel("hint_scan_auto"))
         gen_v.addLayout(s_layout)
 
         t2_layout = QHBoxLayout()
-        t2_layout.addWidget(QLabel("時間方向サイズ:"))
+        t2_layout.addWidget(self._trlabel("lbl_time_size"))
         self.gen_time_size = QSpinBox()
         self.gen_time_size.setRange(2, 32768)
         self.gen_time_size.setValue(120)
         t2_layout.addWidget(self.gen_time_size)
-        t2_layout.addWidget(QLabel("(任意のフレーム数)"))
+        t2_layout.addWidget(self._trlabel("hint_time_any"))
         gen_v.addLayout(t2_layout)
 
         self.gen_hint = QLabel("")
@@ -645,14 +889,15 @@ class IMGTransApp(QWidget):
         # --- Space image (select + per-section generator が下部) ---
         # 生成ボタンはセクション内のジェネレータパネルに統合
         space_btn_row = QHBoxLayout()
-        self.space_btn = QPushButton("Select Space Image")
+        self.space_btn = QPushButton()
+        self._reg(lambda: self.space_btn.setText(tr("btn_select_space")))
         self.space_btn.clicked.connect(lambda: self.select_image('space'))
         space_btn_row.addWidget(self.space_btn)
         self.space_btn_row = space_btn_row
-        self.space_label = QLabel("No space image selected")
+        self.space_label = QLabel(tr("no_space_image"))
 
         sp_layout = QHBoxLayout()
-        sp_label = QLabel("space range:")
+        sp_label = self._trlabel("lbl_space_range")
         self.space_set_value = QSpinBox()
         self.space_set_value.setRange(0, 999999)
         sp_layout.addWidget(sp_label)
@@ -672,20 +917,21 @@ class IMGTransApp(QWidget):
 
         # --- Time image (select + per-section generator が下部) ---
         time_btn_row = QHBoxLayout()
-        self.time_btn = QPushButton("Select Time Image")
+        self.time_btn = QPushButton()
+        self._reg(lambda: self.time_btn.setText(tr("btn_select_time")))
         self.time_btn.clicked.connect(lambda: self.select_image('time'))
         time_btn_row.addWidget(self.time_btn)
         self.time_btn_row = time_btn_row
-        self.time_label = QLabel("No time image selected")
+        self.time_label = QLabel(tr("no_time_image"))
 
         time_layout = QHBoxLayout()
         self.time_vmin_spin = QSpinBox()
         self.time_vmax_spin = QSpinBox()
         self.time_vmin_spin.setRange(-999999, 999999)
         self.time_vmax_spin.setRange(-999999, 999999)
-        time_layout.addWidget(QLabel("vmin:"))
+        time_layout.addWidget(self._trlabel("lbl_vmin"))
         time_layout.addWidget(self.time_vmin_spin)
-        time_layout.addWidget(QLabel("vmax:"))
+        time_layout.addWidget(self._trlabel("lbl_vmax"))
         time_layout.addWidget(self.time_vmax_spin)
 
         self.time_info_label = QLabel("")
@@ -702,24 +948,25 @@ class IMGTransApp(QWidget):
 
         # --- Rate image (select + per-section generator が下部) ---
         rate_btn_row = QHBoxLayout()
-        self.rate_btn = QPushButton("Select Rate Image")
+        self.rate_btn = QPushButton()
+        self._reg(lambda: self.rate_btn.setText(tr("btn_select_rate")))
         self.rate_btn.clicked.connect(lambda: self.select_image('rate'))
         rate_btn_row.addWidget(self.rate_btn)
         self.rate_btn_row = rate_btn_row
-        self.rate_label = QLabel("No rate image selected")
+        self.rate_label = QLabel(tr("no_rate_image"))
 
         rate_layout = QHBoxLayout()
-        rate_layout.addWidget(QLabel("baseline:"))
+        rate_layout.addWidget(self._trlabel("lbl_baseline"))
         self.rate_baseline_spin = QDoubleSpinBox()
         self.rate_baseline_spin.setRange(0.0, 999999.0)
         self.rate_baseline_spin.setDecimals(3)
         rate_layout.addWidget(self.rate_baseline_spin)
-        rate_layout.addWidget(QLabel("max_range:"))
+        rate_layout.addWidget(self._trlabel("lbl_max_range"))
         self.rate_maxdev_spin = QDoubleSpinBox()
         self.rate_maxdev_spin.setRange(0.0, 999999.0)
         self.rate_maxdev_spin.setDecimals(3)
         rate_layout.addWidget(self.rate_maxdev_spin)
-        rate_layout.addWidget(QLabel("start frame:"))
+        rate_layout.addWidget(self._trlabel("lbl_start_frame"))
         self.rate_startpoint_spin = QDoubleSpinBox()
         self.rate_startpoint_spin.setRange(-999999, 999999)
         rate_layout.addWidget(self.rate_startpoint_spin)
@@ -736,16 +983,18 @@ class IMGTransApp(QWidget):
         self.rate_gen_frame = self._build_section_gen('rate')
 
         # ===== マニューバ プレビュー (Time+Space or Rate+Space 揃った時点で確認) =====
-        self.preview_group = QGroupBox("マニューバ プレビュー (Maneuver Preview)")
+        self.preview_group = QGroupBox()
+        self._reg(lambda: self.preview_group.setTitle(tr("grp_maneuver_preview")))
         prev_v = QVBoxLayout(self.preview_group)
-        prev_hint = QLabel("Space + (Time または Rate) を設定後、軌道データを生成して 2D/3D で確認できます")
+        prev_hint = self._trlabel("preview_hint")
         prev_hint.setStyleSheet("color: gray; font-size: 11px;")
         prev_hint.setWordWrap(True)
         prev_v.addWidget(prev_hint)
 
         # データ生成方法の選択 (time to data / rate to data)
+        # ※ combo の項目テキストはロジックの識別子も兼ねるため翻訳しない
         pmode_layout = QHBoxLayout()
-        pmode_layout.addWidget(QLabel("データ生成方法 / Generation method:"))
+        pmode_layout.addWidget(self._trlabel("lbl_gen_method"))
         self.preview_mode_select = QComboBox()
         self.preview_mode_select.addItems(["time to data", "rate to data"])
         self.preview_mode_select.currentIndexChanged.connect(self._update_preview_btn_state)
@@ -755,12 +1004,12 @@ class IMGTransApp(QWidget):
 
         # Settings row: anim frame count + dpi for quick preview
         pset_layout = QHBoxLayout()
-        pset_layout.addWidget(QLabel("3D frames:"))
+        pset_layout.addWidget(self._trlabel("lbl_3d_frames"))
         self.preview_frames_spin = QSpinBox()
         self.preview_frames_spin.setRange(5, 200)
         self.preview_frames_spin.setValue(20)
         pset_layout.addWidget(self.preview_frames_spin)
-        pset_layout.addWidget(QLabel("dpi:"))
+        pset_layout.addWidget(self._trlabel("lbl_dpi"))
         self.preview_dpi_spin = QSpinBox()
         self.preview_dpi_spin.setRange(40, 300)
         self.preview_dpi_spin.setValue(80)
@@ -768,16 +1017,17 @@ class IMGTransApp(QWidget):
         pset_layout.addStretch()
         prev_v.addLayout(pset_layout)
 
-        self.preview_btn = QPushButton("プレビュー生成 (2D Plot + 3D GIF)")
+        self.preview_btn = QPushButton()
+        self._reg(lambda: self.preview_btn.setText(tr("btn_gen_preview")))
         self.preview_btn.clicked.connect(self.start_maneuver_preview)
         prev_v.addWidget(self.preview_btn)
 
-        self.preview_status_label = QLabel("Status: idle")
+        self.preview_status_label = QLabel(tr("status_idle"))
         self.preview_status_label.setStyleSheet("color: gray; font-size: 11px;")
         prev_v.addWidget(self.preview_status_label)
 
-        prev_v.addWidget(QLabel("2D Plot:"))
-        self.preview_2dplot_label = QLabel("(プレビュー生成後に表示)")
+        prev_v.addWidget(self._trlabel("lbl_2d_plot"))
+        self.preview_2dplot_label = QLabel(tr("preview_after_gen"))
         self.preview_2dplot_label.setAlignment(Qt.AlignCenter)
         self.preview_2dplot_label.setMinimumSize(400, 250)
         # 2D プロットは透過 PNG (黒文字/黒線) なので背景を白にして視認性を確保
@@ -786,8 +1036,8 @@ class IMGTransApp(QWidget):
         )
         prev_v.addWidget(self.preview_2dplot_label)
 
-        prev_v.addWidget(QLabel("3D Animation (GIF):"))
-        self.preview_3d_label = QLabel("(プレビュー生成後に表示)")
+        prev_v.addWidget(self._trlabel("lbl_3d_anim"))
+        self.preview_3d_label = QLabel(tr("preview_after_gen"))
         self.preview_3d_label.setAlignment(Qt.AlignCenter)
         self.preview_3d_label.setMinimumSize(400, 300)
         self.preview_3d_label.setStyleSheet(
@@ -799,20 +1049,22 @@ class IMGTransApp(QWidget):
         self._preview_movie = None  # QMovie の生存維持用
 
         # --- Mode selection ---
+        # ※ mode_select の項目テキストはロジックの識別子も兼ねるため翻訳しない
         self.mode_select = QComboBox()
         self.mode_select.addItems(["Select mode", "time to data", "rate to data"])
         self.mode_select.currentIndexChanged.connect(self.on_mode_selected)
-        mode_label = QLabel("Select trajectory data generation method")
+        mode_label = self._trlabel("lbl_select_method")
 
         # --- Animation toggle ---
-        anim_label = QLabel("Animation Output Settings")
-        self.anim_toggle = QCheckBox("Enable animation output")
+        anim_label = self._trlabel("lbl_anim_settings")
+        self.anim_toggle = QCheckBox()
+        self._reg(lambda: self.anim_toggle.setText(tr("chk_enable_anim")))
         self.anim_toggle.stateChanged.connect(self.on_anim_toggle_changed)
 
         self.anim_settings_container = QFrame()
         anim_settings_layout = QVBoxLayout(self.anim_settings_container)
         duration_layout = QHBoxLayout()
-        duration_label = QLabel("Animation Duration (seconds):")
+        duration_label = self._trlabel("lbl_anim_duration")
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(1, 120)
         self.duration_spin.setValue(10)
@@ -823,9 +1075,11 @@ class IMGTransApp(QWidget):
 
         # --- Buttons ---
         btn_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start Rendering")
+        self.start_btn = QPushButton()
+        self._reg(lambda: self.start_btn.setText(tr("btn_start_render")))
         self.start_btn.clicked.connect(self.start_rendering)
-        self.animonly_btn = QPushButton("Animation Only")
+        self.animonly_btn = QPushButton()
+        self._reg(lambda: self.animonly_btn.setText(tr("btn_anim_only")))
         self.animonly_btn.clicked.connect(self.start_animation_only)
         btn_layout.addWidget(self.start_btn)
         btn_layout.addWidget(self.animonly_btn)
@@ -834,16 +1088,18 @@ class IMGTransApp(QWidget):
         self.log_window.setReadOnly(True)
 
         # ===== タブ構造でレイアウト組み立て =====
-        tabs = QTabWidget()
+        self.tabs = QTabWidget()
+        tabs = self.tabs
 
         # --- Tab 1: 入力 (Setup) ---
         t1 = QWidget(); t1_l = QVBoxLayout(t1)
+        t1_l.addLayout(self.lang_row)
         for w in [self.video_btn, self.video_label,
                   self.slit_toggle, self.slit_label,
                   self.init_btn, self.info_label]:
             t1_l.addWidget(w)
         t1_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t1), "1. 入力 / Setup")
+        tabs.addTab(self._wrap_scroll(t1), tr("tab_setup"))
 
         # --- Tab 2: 画像生成 + 選択 (Images) ---
         # 各セクション (Space/Time/Rate) は独立した QGroupBox にまとめる:
@@ -851,7 +1107,8 @@ class IMGTransApp(QWidget):
         t2 = QWidget(); t2_l = QVBoxLayout(t2)
         t2_l.addWidget(self.gen_group)  # 共通サイズ設定
 
-        space_box = QGroupBox("Space Image")
+        space_box = QGroupBox()
+        self._reg(lambda: space_box.setTitle(tr("grp_space_image")))
         space_v = QVBoxLayout(space_box)
         space_v.addLayout(self.space_btn_row)
         space_v.addWidget(self.space_label)
@@ -859,7 +1116,8 @@ class IMGTransApp(QWidget):
         space_v.addWidget(self.space_gen_frame)
         t2_l.addWidget(space_box)
 
-        time_box = QGroupBox("Time Image")
+        time_box = QGroupBox()
+        self._reg(lambda: time_box.setTitle(tr("grp_time_image")))
         time_v = QVBoxLayout(time_box)
         time_v.addLayout(self.time_btn_row)
         time_v.addWidget(self.time_label)
@@ -867,7 +1125,8 @@ class IMGTransApp(QWidget):
         time_v.addWidget(self.time_gen_frame)
         t2_l.addWidget(time_box)
 
-        rate_box = QGroupBox("Rate Image")
+        rate_box = QGroupBox()
+        self._reg(lambda: rate_box.setTitle(tr("grp_rate_image")))
         rate_v = QVBoxLayout(rate_box)
         rate_v.addLayout(self.rate_btn_row)
         rate_v.addWidget(self.rate_label)
@@ -876,13 +1135,13 @@ class IMGTransApp(QWidget):
         t2_l.addWidget(rate_box)
 
         t2_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t2), "2. 画像 / Images")
+        tabs.addTab(self._wrap_scroll(t2), tr("tab_images"))
 
         # --- Tab 3: マニューバ プレビュー (Preview) ---
         t3 = QWidget(); t3_l = QVBoxLayout(t3)
         t3_l.addWidget(self.preview_group)
         t3_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t3), "3. プレビュー / Preview")
+        tabs.addTab(self._wrap_scroll(t3), tr("tab_preview"))
 
         # --- Tab 4: 出力 (Render) ---
         t4 = QWidget(); t4_l = QVBoxLayout(t4)
@@ -893,20 +1152,31 @@ class IMGTransApp(QWidget):
         t4_l.addLayout(btn_layout)
 
         # レンダリング結果プレビュー (完了後に動画を上下に並べて再生)
-        self.result_group = QGroupBox("レンダリング結果プレビュー (Rendered Preview)")
+        self.result_group = QGroupBox()
+        self._reg(lambda: self.result_group.setTitle(tr("grp_rendered_preview")))
         result_v = QVBoxLayout(self.result_group)
-        self.rendered_preview = VideoPreview("レンダリング動画 (Rendered Video)")
-        self.anim_preview = VideoPreview("アニメーション (3D Animation)")
+        self.rendered_preview = VideoPreview(tr("rendered_video_title"))
+        self.anim_preview = VideoPreview(tr("anim_title"))
+        self._reg(lambda: self.rendered_preview.set_base_title(tr("rendered_video_title")))
+        self._reg(lambda: self.anim_preview.set_base_title(tr("anim_title")))
         result_v.addWidget(self.rendered_preview)
         result_v.addWidget(self.anim_preview)
         self.result_group.setVisible(False)
         t4_l.addWidget(self.result_group)
 
         t4_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t4), "4. 出力 / Render")
+        tabs.addTab(self._wrap_scroll(t4), tr("tab_render"))
+
+        # タブ見出しの再翻訳を登録
+        self._reg(lambda: (
+            self.tabs.setTabText(0, tr("tab_setup")),
+            self.tabs.setTabText(1, tr("tab_images")),
+            self.tabs.setTabText(2, tr("tab_preview")),
+            self.tabs.setTabText(3, tr("tab_render")),
+        ))
 
         # ===== ログは常時表示 (タブ外) =====
-        log_label = QLabel("Log:")
+        log_label = self._trlabel("lbl_log")
         log_label.setStyleSheet("color: gray; font-size: 11px; margin-top: 4px;")
         self.log_window.setMinimumHeight(80)
         self.log_window.setMaximumHeight(160)
@@ -1012,10 +1282,7 @@ class IMGTransApp(QWidget):
             file_dim = f"{scan_size}(W) × {time_size}(H)  → Width=scan, Height=time"
         else:
             file_dim = f"{time_size}(W) × {scan_size}(H)  → Width=time, Height=scan"
-        self.gen_hint.setText(
-            f"出力ファイル形状: {file_dim}\n"
-            f"(各セクションでパターン/波形を個別に設定 → そのセクションの Auto Generate ボタンで生成)"
-        )
+        self.gen_hint.setText(tr("gen_hint", dim=file_dim))
 
     # --- Events ---
     def select_video(self):
@@ -1061,14 +1328,14 @@ class IMGTransApp(QWidget):
         frame.setFrameShape(QFrame.StyledPanel)
         v = QVBoxLayout(frame)
 
-        head = QLabel(f"▼ サンプル生成設定 ({type_name})")
+        head = self._trlabel("gen_header", t=type_name)
         head.setStyleSheet("font-weight: bold; color: #555; margin-top: 4px;")
         v.addWidget(head)
 
         # Pattern (セクションごとに「通常再生」を先頭に並べ替えた選択肢)
         g['pattern_ids'], pattern_labels = section_pattern_order(type_name)
         pl = QHBoxLayout()
-        pl.addWidget(QLabel("パターン:"))
+        pl.addWidget(self._trlabel("lbl_pattern"))
         g['pattern'] = QComboBox()
         g['pattern'].addItems(pattern_labels)
         # 既定は先頭 = そのセクションの「通常再生」パターン
@@ -1082,14 +1349,14 @@ class IMGTransApp(QWidget):
         wv = QVBoxLayout(g['wave_frame'])
 
         wd = QHBoxLayout()
-        wd.addWidget(QLabel("方向:"))
+        wd.addWidget(self._trlabel("lbl_wave_dir"))
         g['wave_dir'] = QComboBox()
-        g['wave_dir'].addItems(["上下方向 (vertical)", "左右方向 (horizontal)"])
+        g['wave_dir'].addItems([tr("wave_dir_v"), tr("wave_dir_h")])
         wd.addWidget(g['wave_dir'])
         wv.addLayout(wd)
 
         wa = QHBoxLayout()
-        wa.addWidget(QLabel("振幅:"))
+        wa.addWidget(self._trlabel("lbl_wave_amp"))
         g['wave_amp'] = QDoubleSpinBox()
         g['wave_amp'].setRange(0.0, 1.0)
         g['wave_amp'].setDecimals(3); g['wave_amp'].setSingleStep(0.05)
@@ -1098,7 +1365,7 @@ class IMGTransApp(QWidget):
         wv.addLayout(wa)
 
         wp = QHBoxLayout()
-        wp.addWidget(QLabel("周期:"))
+        wp.addWidget(self._trlabel("lbl_wave_period"))
         g['wave_period'] = QSpinBox()
         g['wave_period'].setRange(1, 32768); g['wave_period'].setValue(120)
         wp.addWidget(g['wave_period'])
@@ -1106,7 +1373,7 @@ class IMGTransApp(QWidget):
         wv.addLayout(wp)
 
         wph = QHBoxLayout()
-        wph.addWidget(QLabel("位相:"))
+        wph.addWidget(self._trlabel("lbl_wave_phase"))
         g['wave_phase'] = QDoubleSpinBox()
         g['wave_phase'].setRange(-360.0, 720.0)
         g['wave_phase'].setDecimals(1); g['wave_phase'].setSingleStep(15.0)
@@ -1119,7 +1386,7 @@ class IMGTransApp(QWidget):
         v.addWidget(g['wave_frame'])
 
         # Preview (パターン編集中はパターン、画像読み込み後はその画像を表示)
-        g['preview_label'] = QLabel("(Initialize 後に表示)")
+        g['preview_label'] = QLabel(tr("preview_after_init"))
         g['preview_label'].setAlignment(Qt.AlignCenter)
         g['preview_label'].setMinimumSize(320, 180)
         g['preview_label'].setStyleSheet(
@@ -1128,10 +1395,9 @@ class IMGTransApp(QWidget):
         v.addWidget(g['preview_label'])
 
         # Generate ボタン (Auto Generate を統合)
-        g['generate_btn'] = QPushButton(f"▶ 生成して {type_name.capitalize()} に適用 / Generate & Apply")
-        g['generate_btn'].setToolTip(
-            "上のパターン設定で画像を生成し、このセクションの画像として自動セット"
-        )
+        g['generate_btn'] = QPushButton()
+        self._reg(lambda b=g['generate_btn'], t=type_name:
+                  b.setText(tr("btn_generate_apply", t=t.capitalize())))
         g['generate_btn'].clicked.connect(lambda *_, t=type_name: self.generate_sample_image_action(t))
         g['generate_btn'].setEnabled(False)  # Initialize 前は無効
         v.addWidget(g['generate_btn'])
@@ -1255,12 +1521,12 @@ class IMGTransApp(QWidget):
         mode = self._can_preview_mode()
         self.preview_btn.setEnabled(mode is not None)
         if not self.dm or not self.space_img_path:
-            self.preview_status_label.setText("Status: Space 画像が必要です")
+            self.preview_status_label.setText(tr("status_need_space"))
         elif mode is not None:
-            self.preview_status_label.setText(f"Status: ready ({mode} mode)")
+            self.preview_status_label.setText(tr("status_ready", m=mode))
         else:
             need = "Time" if self._selected_preview_mode() == "time" else "Rate"
-            self.preview_status_label.setText(f"Status: {need} 画像が必要です")
+            self.preview_status_label.setText(tr("status_need_img", need=need))
 
     def start_maneuver_preview(self):
         mode = self._can_preview_mode()
@@ -1499,9 +1765,9 @@ class IMGTransApp(QWidget):
 
     def update_slit_label(self):
         if self.slit_toggle.isChecked():
-            self.slit_label.setText("Slit direction: vertical")
+            self.slit_label.setText(tr("slit_v"))
         else:
-            self.slit_label.setText("Slit direction: horizontal")
+            self.slit_label.setText(tr("slit_h"))
 
     def start_rendering(self):
         mode = self.mode_select.currentText()
