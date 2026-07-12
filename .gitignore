@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Outputs / generated media
+*.mov
+*.mp4
+*.npy
+out.jpeg

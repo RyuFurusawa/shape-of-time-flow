@@ -1,0 +1,11 @@
+# 外部（サードパーティ）依存
+PyQt5
+numpy
+opencv-python
+Pillow
+
+# imgtrans（drawManeuver）はローカルパッケージです。
+# PyPI 上の "imgtrans" とは別物なので `pip install imgtrans` では入りません。
+# imgtrans_cloude を pip でインストールできるようにした上で、例えば:
+#   pip install -e /path/to/imgtrans_cloude
+#   （または） pip install "git+https://github.com/<you>/imgtrans_cloude.git"
