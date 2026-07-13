@@ -4,6 +4,11 @@ numpy
 opencv-python
 Pillow
 
+# リアルタイム軸間変換プレビュー用の GPU 依存 (任意だが推奨)。
+# wgpu は WebGPU→各OSネイティブ(Metal/D3D12/Vulkan)に橋渡しするクロスプラット
+# ライブラリ。未インストール/GPU無しの環境では自動で CPU(numpy) にフォールバック。
+wgpu
+
 # imgtrans（drawManeuver）はローカルパッケージです。
 # PyPI 上の "imgtrans" とは別物なので `pip install imgtrans` では入りません。
 # imgtrans_cloude を pip でインストールできるようにした上で、例えば:

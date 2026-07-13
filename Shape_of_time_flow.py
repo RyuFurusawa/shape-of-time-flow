@@ -40,6 +40,14 @@ from PIL import Image
 
 from imgtrans import drawManeuver
 
+# リアルタイム GPU プレビュー (任意依存: wgpu)。読み込めなくてもアプリは動く。
+try:
+    from realtime_preview import RealtimePreviewWidget
+    _HAS_RT_PREVIEW = True
+except Exception:
+    RealtimePreviewWidget = None
+    _HAS_RT_PREVIEW = False
+
 
 # ======== i18n (Japanese / English UI) ========
 # 起動時のデフォルト言語は環境変数 STF_LANG で切替可能 (ja / en)。既定は ja。
@@ -107,6 +115,8 @@ TR = {
     # Maneuver preview panel
     "grp_maneuver_preview": {"ja": "マニューバ プレビュー (Maneuver Preview)",
                               "en": "Maneuver Preview"},
+    "grp_realtime": {"ja": "リアルタイム軸間変換プレビュー (GPU)",
+                      "en": "Realtime axis-transform preview (GPU)"},
     "preview_hint": {"ja": "Space + (Time または Rate) を設定後、軌道データを生成して 2D/3D で確認できます",
                       "en": "After setting Space + (Time or Rate), generate trajectory data to check it in 2D/3D"},
     "lbl_gen_method": {"ja": "データ生成方法 / Generation method:",
@@ -780,6 +790,9 @@ class IMGTransApp(QWidget):
         # ステータス表示は idle 相当のときだけ翻訳を反映
         if hasattr(self, "preview_status_label"):
             self._update_preview_btn_state()
+        # リアルタイムプレビューの言語も切替
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.set_lang(LANG)
 
     def _retranslate_section_combo(self, type_name):
         """セクションのパターン/波形方向 combo を、選択を保ったまま現在言語で作り直す。"""
@@ -1139,9 +1152,20 @@ class IMGTransApp(QWidget):
 
         # --- Tab 3: マニューバ プレビュー (Preview) ---
         t3 = QWidget(); t3_l = QVBoxLayout(t3)
+        # リアルタイム GPU プレビュー (最上部に配置)
+        if _HAS_RT_PREVIEW:
+            self.rt_group = QGroupBox()
+            self._reg(lambda: self.rt_group.setTitle(tr("grp_realtime")))
+            rt_v = QVBoxLayout(self.rt_group)
+            self.rt_preview = RealtimePreviewWidget(lang=LANG)
+            rt_v.addWidget(self.rt_preview)
+            t3_l.addWidget(self.rt_group)
+        else:
+            self.rt_preview = None
         t3_l.addWidget(self.preview_group)
         t3_l.addStretch()
         tabs.addTab(self._wrap_scroll(t3), tr("tab_preview"))
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         # --- Tab 4: 出力 (Render) ---
         t4 = QWidget(); t4_l = QVBoxLayout(t4)
@@ -1307,6 +1331,8 @@ class IMGTransApp(QWidget):
             self.info_label.setText(info)
             self.log(info)
             self.update_ui_state("initialized")
+            if getattr(self, "rt_preview", None):
+                self.rt_preview.set_video(self.videopath)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.update_ui_state("video_selected")
@@ -1527,6 +1553,9 @@ class IMGTransApp(QWidget):
         else:
             need = "Time" if self._selected_preview_mode() == "time" else "Rate"
             self.preview_status_label.setText(tr("status_need_img", need=need))
+        # リアルタイムプレビューのモードも同期
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.set_params(mode=self._selected_preview_mode())
 
     def start_maneuver_preview(self):
         mode = self._can_preview_mode()
@@ -1736,6 +1765,18 @@ class IMGTransApp(QWidget):
         self._update_preview_btn_state()
         self._mark_preview_stale()
 
+        # リアルタイムプレビューにも最新のマップ/パラメータを反映 (常駐済みなら即更新)
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.set_maps(self.space_img_path, self.time_img_path,
+                                     self.rate_img_path)
+            self.rt_preview.set_params(
+                mode=self._selected_preview_mode(),
+                space_set=self.space_set_value.value(),
+                vmin=self.time_vmin_spin.value(), vmax=self.time_vmax_spin.value(),
+                baseline=self.rate_baseline_spin.value(),
+                maxdev=self.rate_maxdev_spin.value())
+            self.rt_preview.refresh_maps()
+
     def select_image(self, img_type):
         path, _ = QFileDialog.getOpenFileName(
             self, f"Select {img_type} image", "", "Images (*.png *.jpg *.bmp)")
@@ -1768,6 +1809,16 @@ class IMGTransApp(QWidget):
             self.slit_label.setText(tr("slit_v"))
         else:
             self.slit_label.setText(tr("slit_h"))
+
+    def _on_tab_changed(self, idx):
+        """プレビュータブ (index 2) を表示中だけリアルタイムプレビューを再生。"""
+        rt = getattr(self, "rt_preview", None)
+        if not rt:
+            return
+        if idx == 2:
+            rt.start()
+        else:
+            rt.stop()
 
     def start_rendering(self):
         mode = self.mode_select.currentText()

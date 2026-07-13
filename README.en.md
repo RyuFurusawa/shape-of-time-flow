@@ -132,6 +132,30 @@ preview and render with "time to data" → view the confirmation footage.**
 
 ### 3. Preview (time to data)
 
+#### Realtime axis-transform preview (GPU)
+
+![Realtime GPU preview](images/realtime_preview.png)
+
+At the top of the Preview tab, **Realtime axis-transform preview (GPU)** lets you
+see the transformed result **in real time, without waiting for a render** — for
+fast iteration in workshops.
+
+- Press **Rebuild** to downscale the input to SD/HD, keep a window of frames
+  resident on the GPU, and display the per-pixel transform driven by the current
+  space/time maps.
+- **Play/Pause**, **time / rate** mode, and **speed** are adjustable; edit a map
+  and Rebuild to see it immediately.
+- Resolution follows the input (up to Full HD, never upscaled); preview
+  resolution is auto-adjusted to fit device memory (the chosen S / F / memory is
+  shown below).
+- The GPU path uses **wgpu (Metal / D3D12 / Vulkan)**; it falls back to CPU
+  automatically where no GPU is available.
+
+> The transform itself is essentially free on the GPU; the only cost is the
+> one-time decode and memory (frames × resolution).
+
+#### Trajectory check (2D / 3D)
+
 ![Preview tab (2D plot + 3D trajectory animation)](images/demo3_preview.png)
 
 1. Set **Generation method** to **time to data**.
