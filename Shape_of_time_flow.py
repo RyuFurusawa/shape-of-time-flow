@@ -22,7 +22,8 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QFileDialog,
     QComboBox, QTextEdit, QCheckBox, QMessageBox, QSpinBox, QHBoxLayout,
-    QFrame, QDoubleSpinBox, QGroupBox, QTabWidget, QScrollArea, QSplitter
+    QFrame, QDoubleSpinBox, QGroupBox, QTabWidget, QScrollArea, QSplitter,
+    QProgressBar
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl
 from PyQt5.QtGui import QImage, QPixmap, QMovie, QImageReader
@@ -80,6 +81,11 @@ TR = {
     "hint_scan_auto":  {"ja": "(映像幅から自動)",   "en": "(auto from video width)"},
     "lbl_time_size":   {"ja": "時間方向サイズ:",     "en": "Time-direction size:"},
     "hint_time_any":   {"ja": "(任意のフレーム数)",  "en": "(any frame count)"},
+    "lbl_out_fps":     {"ja": "出力FPS:",            "en": "Output FPS:"},
+    "hint_out_fps":    {"ja": "(最終映像の尺 = 時間方向サイズ ÷ 出力FPS)",
+                        "en": "(final duration = time size ÷ output fps)"},
+    "gen_hint_dur":    {"ja": "→ 出力映像の尺: {dur} 秒  ({ts} frames ÷ {fps} fps)",
+                        "en": "→ Output duration: {dur} s  ({ts} frames ÷ {fps} fps)"},
     "gen_hint": {
         "ja": "出力ファイル形状: {dim}\n(各セクションでパターン/波形を個別に設定 → そのセクションの Generate ボタンで生成)",
         "en": "Output file shape: {dim}\n(Set pattern/wave per section → generate with that section's Generate button)",
@@ -88,9 +94,6 @@ TR = {
     "grp_space_image": {"ja": "Space 画像 (Space Image)", "en": "Space Image"},
     "grp_time_image":  {"ja": "Time 画像 (Time Image)",   "en": "Time Image"},
     "grp_rate_image":  {"ja": "Rate 画像 (Rate Image)",   "en": "Rate Image"},
-    "btn_select_space":{"ja": "Space 画像を選択 / Select Space Image", "en": "Select Space Image"},
-    "btn_select_time": {"ja": "Time 画像を選択 / Select Time Image",   "en": "Select Time Image"},
-    "btn_select_rate": {"ja": "Rate 画像を選択 / Select Rate Image",   "en": "Select Rate Image"},
     "no_space_image":  {"ja": "Space 画像が未選択です", "en": "No space image selected"},
     "no_time_image":   {"ja": "Time 画像が未選択です",  "en": "No time image selected"},
     "no_rate_image":   {"ja": "Rate 画像が未選択です",  "en": "No rate image selected"},
@@ -101,17 +104,52 @@ TR = {
     "lbl_max_range": {"ja": "max_range:", "en": "max_range:"},
     "lbl_start_frame": {"ja": "start frame:", "en": "start frame:"},
     # Section generator
-    "gen_header": {"ja": "▼ サンプル生成設定 ({t})", "en": "▼ Sample generator ({t})"},
+    "gen_header": {"ja": "画像選択 / 生成設定 ({t})", "en": "Image / Generator settings ({t})"},
     "lbl_pattern": {"ja": "パターン:", "en": "Pattern:"},
     "lbl_wave_dir": {"ja": "方向:", "en": "Direction:"},
     "lbl_wave_amp": {"ja": "振幅:", "en": "Amplitude:"},
     "lbl_wave_period": {"ja": "周期:", "en": "Period:"},
     "lbl_wave_phase": {"ja": "位相:", "en": "Phase:"},
+    "lbl_wave_angle": {"ja": "角度:", "en": "Angle:"},
+    "hint_wave_angle": {"ja": "(0°=上下, 90°=左右, 30°/45° など任意)",
+                         "en": "(0°=vertical, 90°=horizontal, any angle)"},
+    # Layer compositing
+    "lbl_layer": {"ja": "レイヤー {n}", "en": "Layer {n}"},
+    "btn_add_layer": {"ja": "＋ レイヤーを追加 (合成)", "en": "+ Add layer (composite)"},
+    "lbl_blend": {"ja": "合成:", "en": "Blend:"},
+    "lbl_opacity": {"ja": "不透明度:", "en": "Opacity:"},
+    "lbl_dot": {"ja": "ドットサイズ:", "en": "Dot size:"},
+    "lbl_blur": {"ja": "ブラー:", "en": "Blur:"},
+    "lbl_seed": {"ja": "シード:", "en": "Seed:"},
+    "lbl_cell": {"ja": "スケール:", "en": "Scale:"},
+    "lbl_octaves": {"ja": "オクターブ:", "en": "Octaves:"},
+    "btn_layer_image": {"ja": "画像を選択…", "en": "Select image…"},
+    "no_layer_image": {"ja": "(画像未選択 → 50%グレー扱い)",
+                        "en": "(no image → treated as 50% gray)"},
     "wave_dir_v": {"ja": "上下方向 (vertical)", "en": "Vertical"},
     "wave_dir_h": {"ja": "左右方向 (horizontal)", "en": "Horizontal"},
     "preview_after_init": {"ja": "(Initialize 後に表示)", "en": "(shown after Initialize)"},
     "btn_generate_apply": {"ja": "▶ 生成して {t} に適用 / Generate & Apply",
                             "en": "▶ Generate & Apply to {t}"},
+    # Apply mode (Tab2 bottom — required before Preview/Render unlock)
+    "grp_apply_mode": {"ja": "適用方法の選択 (Apply Mode) ※必須",
+                        "en": "Apply Mode (required)"},
+    "apply_mode_hint": {
+        "ja": "画像データをどう適用するかを選択してください:\n"
+              "  time to data = Time 画像を「時間マップ」として適用\n"
+              "  rate to data = Rate 画像を「再生レートマップ」として適用\n"
+              "選択して必要な画像が揃うと「3. プレビュー」「4. 出力」タブが使えるようになります。",
+        "en": "Choose how the image data is applied:\n"
+              "  time to data = apply the Time image as a time map\n"
+              "  rate to data = apply the Rate image as a playback-rate map\n"
+              "Selecting this (with the required images set) unlocks the Preview / Render tabs.",
+    },
+    "lbl_apply_mode_info": {"ja": "適用方法: {m}   (変更は「2. 画像」タブ下部で)",
+                             "en": "Apply mode: {m}   (change at the bottom of the Images tab)"},
+    "status_need_mode": {"ja": "Status: 適用方法が未選択です (「2. 画像」タブ下部で選択)",
+                          "en": "Status: choose an apply mode (bottom of the Images tab)"},
+    "processing_wait": {"ja": "⏳ 演算中です — しばらくお待ちください…",
+                         "en": "⏳ Processing — please wait…"},
     # Maneuver preview panel
     "grp_maneuver_preview": {"ja": "マニューバ プレビュー (Maneuver Preview)",
                               "en": "Maneuver Preview"},
@@ -168,28 +206,29 @@ def tr(key, **fmt):
 
 # ======== Sample image generator ========
 # パターン表示ラベル (言語別)。ロジックは PATTERN_IDS を使うので翻訳しても安全。
+# 並び順は全セクション共通の固定順 (黒→白 → 白→黒 → 左右 → グレー → ノイズ → 波形)。
 PATTERN_LABELS_BY_LANG = {
     "ja": [
-        "上→下: 白→黒",
         "上→下: 黒→白",
-        "左→右: 白→黒",
+        "上→下: 白→黒",
         "左→右: 黒→白",
+        "左→右: 白→黒",
         "50% グレー均一",
         "ランダムノイズ",
-        "波形 (Wave) ※ 振幅/周期/位相 編集",
+        "波形 (Wave) ※ 振幅/周期/位相/角度 編集",
     ],
     "en": [
-        "Top→Bottom: white→black",
         "Top→Bottom: black→white",
-        "Left→Right: white→black",
+        "Top→Bottom: white→black",
         "Left→Right: black→white",
+        "Left→Right: white→black",
         "Solid 50% gray",
         "Random noise",
-        "Wave ※ edit amplitude/period/phase",
+        "Wave ※ edit amplitude/period/phase/angle",
     ],
 }
 PATTERN_IDS = [
-    "v_w2b", "v_b2w", "h_w2b", "h_b2w", "solid_gray", "random", "wave",
+    "v_b2w", "v_w2b", "h_b2w", "h_w2b", "solid_gray", "random", "wave",
 ]
 
 # 「通常再生」サフィックス (言語別)
@@ -210,30 +249,29 @@ SECTION_NORMAL_PATTERN = {
 def section_pattern_order(type_name, lang=None):
     """セクション {type_name} 用の (pattern_ids, labels) を現在の言語で返す。
 
-    「通常再生」に相当する pattern を先頭 (index 0) に移動し、そのラベル末尾に
-    「（通常再生）」相当のサフィックスを付与する。残りは元の PATTERN_IDS 順を維持。
+    並び順は全セクション共通の PATTERN_IDS 固定順 (並べ替えなし)。
+    「通常再生」に相当する pattern のラベル末尾にだけサフィックスを付与する。
     """
     lang = lang or LANG
     pattern_labels = PATTERN_LABELS_BY_LANG.get(lang, PATTERN_LABELS_BY_LANG["ja"])
     normal = SECTION_NORMAL_PATTERN.get(type_name, PATTERN_IDS[0])
-    ordered_ids = [normal] + [pid for pid in PATTERN_IDS if pid != normal]
     labels = []
-    for pid in ordered_ids:
-        base = pattern_labels[PATTERN_IDS.index(pid)]
+    for pid, base in zip(PATTERN_IDS, pattern_labels):
         if pid == normal:
             base = f"{base}{NORMAL_SUFFIX.get(lang, NORMAL_SUFFIX['ja'])}"
         labels.append(base)
-    return ordered_ids, labels
+    return list(PATTERN_IDS), labels
 
 
 def render_pattern(h_pix, w_pix, pattern_id, **wave_params):
     """16bit uint16 (H, W) のグレースケール画像を生成する。
 
     pattern_id="wave" の場合は wave_params で:
-        direction  : "v" (上下方向に変化) / "h" (左右方向に変化)
         amplitude  : 0.0 - 1.0 (full-range の割合, 1.0 で 0..65535 振り切る)
         period     : 1サイクルのピクセル数 (例: H==period でちょうど1周期)
         phase_deg  : 開始位相 (度, 0..360)
+        angle_deg  : 波の進行方向の角度 (度)。0°=上下方向, 90°=左右方向,
+                     30°/45° など任意の斜め波が作れる。
     """
     h, w = int(h_pix), int(w_pix)
     if pattern_id == "v_w2b":
@@ -254,26 +292,193 @@ def render_pattern(h_pix, w_pix, pattern_id, **wave_params):
         rng = np.random.default_rng()
         img = rng.integers(0, 65536, size=(h, w), dtype=np.uint16)
     elif pattern_id == "wave":
-        direction = wave_params.get("direction", "v")
         amp = float(wave_params.get("amplitude", 1.0))      # 0..1
         period = max(1.0, float(wave_params.get("period", max(h, 1))))
         phase = np.deg2rad(float(wave_params.get("phase_deg", 0.0)))
+        angle = float(wave_params.get("angle_deg", 0.0)) % 360.0
+        th = np.deg2rad(angle)
         # 0..1 正規化された sin 波 → 16bit
         mid = 32767.5
         amp_scaled = amp * 32767.5
-        if direction == "v":
-            axis = np.arange(h, dtype=np.float64)
+        # 波の座標 u = x·sinθ + y·cosθ (0°=上下方向, 90°=左右方向)。
+        # 軸に沿う角度は 1D ブロードキャストで済ませ、斜めのときだけ 2D 計算。
+        if angle % 180.0 == 0.0:
+            sign = 1.0 if angle < 180.0 else -1.0
+            axis = sign * np.arange(h, dtype=np.float64)
             wave1d = mid + amp_scaled * np.sin(2 * np.pi * axis / period + phase)
             col = np.clip(wave1d, 0, 65535)
             img = np.broadcast_to(col[:, None], (h, w)).astype(np.uint16)
-        else:  # "h"
-            axis = np.arange(w, dtype=np.float64)
+        elif angle % 180.0 == 90.0:
+            sign = 1.0 if angle < 180.0 else -1.0
+            axis = sign * np.arange(w, dtype=np.float64)
             wave1d = mid + amp_scaled * np.sin(2 * np.pi * axis / period + phase)
             row = np.clip(wave1d, 0, 65535)
             img = np.broadcast_to(row[None, :], (h, w)).astype(np.uint16)
+        else:
+            xx = np.arange(w, dtype=np.float32)[None, :]
+            yy = np.arange(h, dtype=np.float32)[:, None]
+            u = xx * np.sin(th) + yy * np.cos(th)
+            wave2d = mid + amp_scaled * np.sin(2 * np.pi * u / period + phase)
+            img = np.clip(wave2d, 0, 65535).astype(np.uint16)
     else:
         raise ValueError(f"Unknown pattern_id: {pattern_id}")
     return img
+
+
+# ======== Layer compositing (パターンを何層でも重ねられる) ========
+
+# レイヤーで追加選択できるパターン (基本パターンに加えて)
+EXTRA_PATTERN_IDS = ["perlin", "image"]
+EXTRA_PATTERN_LABELS = {
+    "ja": ["パーリンノイズ", "画像ファイル…"],
+    "en": ["Perlin noise", "Image file…"],
+}
+
+BLEND_IDS = ["normal", "add", "subtract", "multiply", "screen", "difference"]
+BLEND_LABELS = {
+    "ja": ["通常", "加算", "減算", "乗算", "スクリーン", "差の絶対値"],
+    "en": ["Normal", "Add", "Subtract", "Multiply", "Screen", "Difference"],
+}
+
+
+def layer_pattern_order(type_name, lang=None):
+    """レイヤー用: 基本パターン + perlin + 画像ファイル の (ids, labels)。"""
+    ids, labels = section_pattern_order(type_name, lang)
+    lang = lang or LANG
+    extra = EXTRA_PATTERN_LABELS.get(lang, EXTRA_PATTERN_LABELS["ja"])
+    return ids + list(EXTRA_PATTERN_IDS), labels + list(extra)
+
+
+def perlin2d(h, w, cell, octaves=1, seed=0):
+    """勾配 (Perlin) ノイズの fBm。float32 (h, w) を 0..1 で返す。"""
+    h, w = int(h), int(w)
+    total = np.zeros((h, w), np.float32)
+    amp, amp_sum = 1.0, 0.0
+    for o in range(max(1, int(octaves))):
+        c = max(2.0, float(cell) / (2 ** o))
+        gy = int(np.ceil(h / c)) + 2
+        gx = int(np.ceil(w / c)) + 2
+        rng = np.random.default_rng(int(seed) + o * 1013)
+        ang = rng.uniform(0, 2 * np.pi, (gy, gx)).astype(np.float32)
+        grad = np.stack([np.cos(ang), np.sin(ang)], -1)   # (gy, gx, 2)
+        ys = np.arange(h, dtype=np.float32) / c
+        xs = np.arange(w, dtype=np.float32) / c
+        yi = np.floor(ys).astype(int)
+        xi = np.floor(xs).astype(int)
+        yf = (ys - yi)[:, None]
+        xf = (xs - xi)[None, :]
+        g00 = grad[yi][:, xi]
+        g01 = grad[yi][:, xi + 1]
+        g10 = grad[yi + 1][:, xi]
+        g11 = grad[yi + 1][:, xi + 1]
+        d00 = g00[..., 0] * xf + g00[..., 1] * yf
+        d01 = g01[..., 0] * (xf - 1) + g01[..., 1] * yf
+        d10 = g10[..., 0] * xf + g10[..., 1] * (yf - 1)
+        d11 = g11[..., 0] * (xf - 1) + g11[..., 1] * (yf - 1)
+        u = xf * xf * xf * (xf * (xf * 6 - 15) + 10)      # smoothstep^5
+        v = yf * yf * yf * (yf * (yf * 6 - 15) + 10)
+        n0 = d00 + u * (d01 - d00)
+        n1 = d10 + u * (d11 - d10)
+        total += amp * (n0 + v * (n1 - n0))
+        amp_sum += amp
+        amp *= 0.5
+    total /= max(amp_sum, 1e-6)
+    return np.clip(total * 0.7071 + 0.5, 0.0, 1.0).astype(np.float32)
+
+
+def render_layer(h, w, p, scale=1.0):
+    """1 レイヤーを float32 (h, w) 0..1 で描画する。
+
+    p: LayerWidget.params() が返す dict。
+    scale: プレビュー縮小率 (px 単位のパラメータ — 周期/ドット/ブラー/セル —
+           に乗算して見た目を実サイズと一致させる)。
+    """
+    h, w = int(h), int(w)
+    pid = p.get("pattern", "solid_gray")
+    if pid == "wave":
+        img16 = render_pattern(
+            h, w, "wave",
+            amplitude=p.get("amp", 1.0),
+            period=max(1.0, p.get("period", h) * scale),
+            phase_deg=p.get("phase", 0.0),
+            angle_deg=p.get("angle", 0.0),
+        )
+        return img16.astype(np.float32) / 65535.0
+    if pid == "random":
+        dot = max(1, int(round(p.get("dot", 1) * scale)))
+        rng = np.random.default_rng(int(p.get("nseed", 0)))
+        gh = max(1, int(np.ceil(h / dot)))
+        gw = max(1, int(np.ceil(w / dot)))
+        base = rng.random((gh, gw), dtype=np.float32)
+        img = np.repeat(np.repeat(base, dot, 0), dot, 1)[:h, :w]
+        sigma = float(p.get("blur", 0.0)) * scale
+        if sigma > 0.1:
+            img = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma)
+        return np.clip(np.ascontiguousarray(img), 0.0, 1.0)
+    if pid == "perlin":
+        return perlin2d(h, w, max(2.0, p.get("cell", 64) * scale),
+                        octaves=p.get("octaves", 3), seed=p.get("pseed", 0))
+    if pid == "image":
+        path = p.get("image_path")
+        if path and os.path.exists(path):
+            m = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if m is not None:
+                if m.ndim == 3:
+                    m = m[..., 0]
+                m = cv2.resize(m, (w, h), interpolation=cv2.INTER_AREA)
+                mx = 65535.0 if m.dtype == np.uint16 else 255.0
+                return np.clip(m.astype(np.float32) / mx, 0.0, 1.0)
+        return np.full((h, w), 0.5, np.float32)   # 未選択/読込失敗 → 50% グレー
+    # 基本グラデーション / グレー
+    img16 = render_pattern(h, w, pid)
+    return img16.astype(np.float32) / 65535.0
+
+
+def apply_blend(base, img, mode):
+    """float 0..1 同士のブレンド。"""
+    if mode == "add":
+        return np.clip(base + img, 0.0, 1.0)
+    if mode == "subtract":
+        return np.clip(base - img, 0.0, 1.0)
+    if mode == "multiply":
+        return base * img
+    if mode == "screen":
+        return 1.0 - (1.0 - base) * (1.0 - img)
+    if mode == "difference":
+        return np.abs(base - img)
+    return img   # normal
+
+
+def composite_layers(h, w, layer_params, scale=1.0):
+    """レイヤースタックを上から順に合成し uint16 (h, w) を返す。
+
+    layer_params[0] がベース。以降の各レイヤーは
+        result = base × (1 - opacity) + blend(base, layer) × opacity
+    で積み重なる (opacity は 0..100 の %)。
+    """
+    if not layer_params:
+        return np.full((h, w), 32767, np.uint16)
+    acc = render_layer(h, w, layer_params[0], scale)
+    for p in layer_params[1:]:
+        img = render_layer(h, w, p, scale)
+        op = min(100, max(0, p.get("opacity", 100))) / 100.0
+        blended = apply_blend(acc, img, p.get("blend", "normal"))
+        acc = np.clip(acc * (1.0 - op) + blended * op, 0.0, 1.0)
+    return (acc * 65535.0 + 0.5).astype(np.uint16)
+
+
+def sample_filename(image_type, space_range=None, time_vmin=None,
+                    time_vmax=None, rate_maxdev=None, scan_size=None):
+    """img_to_maneuver の extract_params_from_filename 規約のファイル名。"""
+    if image_type == "space":
+        if space_range is None:
+            space_range = scan_size
+        return f"sample_space_{int(space_range)}.png"
+    if image_type == "time":
+        return f"sample_time_{int(time_vmin or 0)}-{int(time_vmax or 100)}.png"
+    if image_type == "rate":
+        return f"sample_rate_{rate_maxdev if rate_maxdev is not None else 0.5}.png"
+    raise ValueError(f"image_type must be space/time/rate, got {image_type!r}")
 
 
 def generate_sample_image(out_dir, image_type, pattern_id,
@@ -281,7 +486,7 @@ def generate_sample_image(out_dir, image_type, pattern_id,
                           scan_direction,
                           space_range=None, time_vmin=None, time_vmax=None,
                           rate_maxdev=None,
-                          wave_direction="v", wave_amplitude=1.0,
+                          wave_angle_deg=0.0, wave_amplitude=1.0,
                           wave_period=None, wave_phase_deg=0.0):
     """サンプル画像を生成してパスを返す。
 
@@ -291,9 +496,9 @@ def generate_sample_image(out_dir, image_type, pattern_id,
         - horizontal: file shape (H, W) = (scan_size, time_size)  ※img_to_maneuver が .T するため
 
     pattern_id == "wave" の場合の追加パラメータ:
-        wave_direction : "v"(上下) or "h"(左右)
+        wave_angle_deg : 波の角度 (0°=上下, 90°=左右, 任意の斜めも可)
         wave_amplitude : 0.0 - 1.0
-        wave_period    : ピクセル数 (None なら該当軸サイズと同じ → 1周期)
+        wave_period    : ピクセル数 (None なら高さ方向サイズと同じ → 1周期)
         wave_phase_deg : 度 (0..360)
     """
     # ファイル名は img_to_maneuver の extract_params_from_filename 規約に従う
@@ -317,21 +522,277 @@ def generate_sample_image(out_dir, image_type, pattern_id,
     else:
         h_pix, w_pix = int(scan_size), int(time_size)   # (scan, time) — .T される
 
-    # Wave のデフォルト period (該当軸サイズ)
+    # Wave のデフォルト period (高さ方向サイズ)
     if pattern_id == "wave" and wave_period is None:
-        wave_period = h_pix if wave_direction == "v" else w_pix
+        wave_period = h_pix
 
     img16 = render_pattern(
         h_pix, w_pix, pattern_id,
-        direction=wave_direction,
         amplitude=wave_amplitude,
         period=wave_period,
         phase_deg=wave_phase_deg,
+        angle_deg=wave_angle_deg,
     )
 
     out_path = os.path.join(out_dir, fname)
     cv2.imwrite(out_path, img16)
     return out_path
+
+
+# ======== Layer editor widget ========
+class LayerWidget(QFrame):
+    """セクションジェネレータの 1 レイヤー分の編集 UI。
+
+    パターン (基本 + パーリン + 画像ファイル) と、そのパターン固有の
+    パラメータ、レイヤー 2 枚目以降は合成モード + 不透明度を持つ。
+    値が変わるたび changed を emit し、親がプレビューを再合成する。
+    """
+    changed = pyqtSignal()
+    remove_requested = pyqtSignal(object)
+
+    def __init__(self, section, index):
+        super().__init__()
+        self.section = section
+        self.index = index
+        self._image_path = None
+        self.pattern_ids = []
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet("LayerWidget { background: rgba(128,128,128,20); }")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 4, 8, 4)
+        v.setSpacing(3)
+
+        # ヘッダ (レイヤー番号 + 削除)
+        head = QHBoxLayout()
+        self.head_label = QLabel()
+        self.head_label.setStyleSheet("font-weight: bold; color: #557;")
+        head.addWidget(self.head_label)
+        head.addStretch()
+        self.remove_btn = QPushButton("✕")
+        self.remove_btn.setFixedSize(24, 22)
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        head.addWidget(self.remove_btn)
+        v.addLayout(head)
+
+        # 合成モード + 不透明度 (レイヤー 2 枚目以降のみ表示)
+        self.blend_frame = QFrame()
+        bl = QHBoxLayout(self.blend_frame)
+        bl.setContentsMargins(0, 0, 0, 0)
+        self.blend_label = QLabel()
+        bl.addWidget(self.blend_label)
+        self.blend = QComboBox()
+        bl.addWidget(self.blend)
+        self.opacity_label = QLabel()
+        bl.addWidget(self.opacity_label)
+        self.opacity_spin = QSpinBox()
+        self.opacity_spin.setRange(0, 100)
+        self.opacity_spin.setValue(100)
+        self.opacity_spin.setSuffix(" %")
+        bl.addWidget(self.opacity_spin)
+        bl.addStretch()
+        v.addWidget(self.blend_frame)
+
+        # パターン選択
+        pr = QHBoxLayout()
+        self.pattern_label = QLabel()
+        pr.addWidget(self.pattern_label)
+        self.pattern = QComboBox()
+        pr.addWidget(self.pattern, 1)
+        v.addLayout(pr)
+
+        # --- Wave パラメータ ---
+        self.wave_frame = QFrame()
+        wf = QHBoxLayout(self.wave_frame)
+        wf.setContentsMargins(0, 0, 0, 0)
+        self.wave_amp_label = QLabel()
+        wf.addWidget(self.wave_amp_label)
+        self.wave_amp = QDoubleSpinBox()
+        self.wave_amp.setRange(0.0, 1.0); self.wave_amp.setDecimals(3)
+        self.wave_amp.setSingleStep(0.05); self.wave_amp.setValue(1.0)
+        wf.addWidget(self.wave_amp)
+        self.wave_period_label = QLabel()
+        wf.addWidget(self.wave_period_label)
+        self.wave_period = QSpinBox()
+        self.wave_period.setRange(1, 32768); self.wave_period.setValue(120)
+        wf.addWidget(self.wave_period)
+        self.wave_phase_label = QLabel()
+        wf.addWidget(self.wave_phase_label)
+        self.wave_phase = QDoubleSpinBox()
+        self.wave_phase.setRange(-360.0, 720.0); self.wave_phase.setDecimals(1)
+        self.wave_phase.setSingleStep(15.0); self.wave_phase.setValue(0.0)
+        wf.addWidget(self.wave_phase)
+        self.wave_angle_label = QLabel()
+        wf.addWidget(self.wave_angle_label)
+        self.wave_angle = QDoubleSpinBox()
+        self.wave_angle.setRange(0.0, 360.0); self.wave_angle.setDecimals(1)
+        self.wave_angle.setSingleStep(5.0); self.wave_angle.setValue(0.0)
+        wf.addWidget(self.wave_angle)
+        wf.addStretch()
+        v.addWidget(self.wave_frame)
+
+        # --- Random ノイズパラメータ (ドット / ブラー / シード) ---
+        self.noise_frame = QFrame()
+        nf = QHBoxLayout(self.noise_frame)
+        nf.setContentsMargins(0, 0, 0, 0)
+        self.dot_label = QLabel()
+        nf.addWidget(self.dot_label)
+        self.dot_spin = QSpinBox()
+        self.dot_spin.setRange(1, 512); self.dot_spin.setValue(1)
+        self.dot_spin.setSuffix(" px")
+        nf.addWidget(self.dot_spin)
+        self.blur_label = QLabel()
+        nf.addWidget(self.blur_label)
+        self.blur_spin = QDoubleSpinBox()
+        self.blur_spin.setRange(0.0, 128.0); self.blur_spin.setDecimals(1)
+        self.blur_spin.setSingleStep(0.5); self.blur_spin.setValue(0.0)
+        self.blur_spin.setSuffix(" px")
+        nf.addWidget(self.blur_spin)
+        self.nseed_label = QLabel()
+        nf.addWidget(self.nseed_label)
+        self.nseed_spin = QSpinBox()
+        self.nseed_spin.setRange(0, 99999)
+        self.nseed_spin.setValue(int(np.random.default_rng().integers(0, 10000)))
+        nf.addWidget(self.nseed_spin)
+        nf.addStretch()
+        v.addWidget(self.noise_frame)
+
+        # --- Perlin ノイズパラメータ (スケール / オクターブ / シード) ---
+        self.perlin_frame = QFrame()
+        pf = QHBoxLayout(self.perlin_frame)
+        pf.setContentsMargins(0, 0, 0, 0)
+        self.cell_label = QLabel()
+        pf.addWidget(self.cell_label)
+        self.cell_spin = QSpinBox()
+        self.cell_spin.setRange(2, 4096); self.cell_spin.setValue(64)
+        self.cell_spin.setSuffix(" px")
+        pf.addWidget(self.cell_spin)
+        self.oct_label = QLabel()
+        pf.addWidget(self.oct_label)
+        self.oct_spin = QSpinBox()
+        self.oct_spin.setRange(1, 6); self.oct_spin.setValue(3)
+        pf.addWidget(self.oct_spin)
+        self.pseed_label = QLabel()
+        pf.addWidget(self.pseed_label)
+        self.pseed_spin = QSpinBox()
+        self.pseed_spin.setRange(0, 99999)
+        self.pseed_spin.setValue(int(np.random.default_rng().integers(0, 10000)))
+        pf.addWidget(self.pseed_spin)
+        pf.addStretch()
+        v.addWidget(self.perlin_frame)
+
+        # --- 画像ファイル ---
+        self.image_frame = QFrame()
+        imf = QHBoxLayout(self.image_frame)
+        imf.setContentsMargins(0, 0, 0, 0)
+        self.image_btn = QPushButton()
+        self.image_btn.clicked.connect(self._pick_image)
+        imf.addWidget(self.image_btn)
+        self.image_label = QLabel()
+        self.image_label.setStyleSheet("color: gray; font-size: 10px;")
+        imf.addWidget(self.image_label, 1)
+        v.addWidget(self.image_frame)
+
+        # 初期テキスト/combo 構築
+        self.retranslate()
+        # 既定パターン: ベースレイヤーはセクションの通常再生、追加レイヤーはグレー
+        default_pid = SECTION_NORMAL_PATTERN.get(section) if index == 0 else "solid_gray"
+        if default_pid in self.pattern_ids:
+            self.pattern.setCurrentIndex(self.pattern_ids.index(default_pid))
+        self.set_index(index)
+        self._on_pattern()
+
+        # 変更シグナル配線
+        self.pattern.currentIndexChanged.connect(self._on_pattern)
+        self.blend.currentIndexChanged.connect(lambda *_: self.changed.emit())
+        for sp in (self.opacity_spin, self.wave_amp, self.wave_period,
+                   self.wave_phase, self.wave_angle, self.dot_spin,
+                   self.blur_spin, self.nseed_spin, self.cell_spin,
+                   self.oct_spin, self.pseed_spin):
+            sp.valueChanged.connect(lambda *_: self.changed.emit())
+
+    # --- helpers ---
+    def set_index(self, index):
+        """レイヤー番号の更新 (削除後の再番号付けにも使う)。"""
+        self.index = index
+        self.head_label.setText(tr("lbl_layer", n=index + 1))
+        self.blend_frame.setVisible(index > 0)
+        self.remove_btn.setVisible(index > 0)
+
+    def current_pattern_id(self):
+        i = self.pattern.currentIndex()
+        return self.pattern_ids[i] if 0 <= i < len(self.pattern_ids) else "solid_gray"
+
+    def _on_pattern(self, *_):
+        pid = self.current_pattern_id()
+        self.wave_frame.setVisible(pid == "wave")
+        self.noise_frame.setVisible(pid == "random")
+        self.perlin_frame.setVisible(pid == "perlin")
+        self.image_frame.setVisible(pid == "image")
+        self.changed.emit()
+
+    def _pick_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select layer image", "", "Images (*.png *.jpg *.bmp *.tif)")
+        if not path:
+            return
+        self._image_path = path
+        self.image_label.setText(os.path.basename(path))
+        self.changed.emit()
+
+    def params(self):
+        return {
+            "pattern": self.current_pattern_id(),
+            "amp": self.wave_amp.value(),
+            "period": self.wave_period.value(),
+            "phase": self.wave_phase.value(),
+            "angle": self.wave_angle.value(),
+            "dot": self.dot_spin.value(),
+            "blur": self.blur_spin.value(),
+            "nseed": self.nseed_spin.value(),
+            "cell": self.cell_spin.value(),
+            "octaves": self.oct_spin.value(),
+            "pseed": self.pseed_spin.value(),
+            "image_path": self._image_path,
+            "blend": BLEND_IDS[max(0, self.blend.currentIndex())],
+            "opacity": self.opacity_spin.value(),
+        }
+
+    def retranslate(self):
+        """現在言語でラベル/combo を再構築 (選択は保持)。"""
+        self.head_label.setText(tr("lbl_layer", n=self.index + 1))
+        self.blend_label.setText(tr("lbl_blend"))
+        self.opacity_label.setText(tr("lbl_opacity"))
+        self.pattern_label.setText(tr("lbl_pattern"))
+        self.wave_amp_label.setText(tr("lbl_wave_amp"))
+        self.wave_period_label.setText(tr("lbl_wave_period"))
+        self.wave_phase_label.setText(tr("lbl_wave_phase"))
+        self.wave_angle_label.setText(tr("lbl_wave_angle"))
+        self.dot_label.setText(tr("lbl_dot"))
+        self.blur_label.setText(tr("lbl_blur"))
+        self.nseed_label.setText(tr("lbl_seed"))
+        self.cell_label.setText(tr("lbl_cell"))
+        self.oct_label.setText(tr("lbl_octaves"))
+        self.pseed_label.setText(tr("lbl_seed"))
+        self.image_btn.setText(tr("btn_layer_image"))
+        if not self._image_path:
+            self.image_label.setText(tr("no_layer_image"))
+        # pattern combo (選択保持)
+        ids, labels = layer_pattern_order(self.section)
+        idx = self.pattern.currentIndex() if self.pattern.count() else 0
+        self.pattern.blockSignals(True)
+        self.pattern.clear()
+        self.pattern.addItems(labels)
+        self.pattern.setCurrentIndex(max(0, min(idx, len(labels) - 1)))
+        self.pattern.blockSignals(False)
+        self.pattern_ids = ids
+        # blend combo (選択保持)
+        bidx = self.blend.currentIndex() if self.blend.count() else 0
+        blabels = BLEND_LABELS.get(LANG, BLEND_LABELS["ja"])
+        self.blend.blockSignals(True)
+        self.blend.clear()
+        self.blend.addItems(blabels)
+        self.blend.setCurrentIndex(max(0, min(bidx, len(blabels) - 1)))
+        self.blend.blockSignals(False)
 
 
 # ======== Rendered video preview widget ========
@@ -607,6 +1068,7 @@ class ManeuverPreviewWorker(QThread):
       6. 出力 (PNG path, GIF path) を done_signal で通知
     """
     progress_signal = pyqtSignal(str)
+    percent_signal = pyqtSignal(int)          # ステージ基準のおおよその進捗 (0-100)
     done_signal = pyqtSignal(bool, str, str)  # success, plot2d_path, gif_path
 
     def __init__(self, dm, mode, space_img, time_img, rate_img,
@@ -655,6 +1117,7 @@ class ManeuverPreviewWorker(QThread):
             cwd = os.getcwd()
 
             self.progress_signal.emit("img_to_maneuver: ロード中…")
+            self.percent_signal.emit(5)
             if self.mode == "time":
                 self.dm.img_to_maneuver(
                     space_img_path=self.space_img,
@@ -673,12 +1136,14 @@ class ManeuverPreviewWorker(QThread):
                 )
 
             self.progress_signal.emit("zPointCheck…")
+            self.percent_signal.emit(25)
             self.dm.zPointCheck()
 
             # 2D プロット生成: mtime で「呼び出し後に変更されたファイル」を検出
             # (同じファイル名で上書きされるケースに対応するため set 差分は使わない)
             ts_2d = time.time() - 0.5  # 小さなクロックスラックを許容
             self.progress_signal.emit("maneuver_2dplot: 2D プロット生成中…")
+            self.percent_signal.emit(35)
             self.dm.maneuver_2dplot()
             plot2d = self._latest_file(cwd, (".png",), ts_2d)
 
@@ -687,6 +1152,7 @@ class ManeuverPreviewWorker(QThread):
             self.progress_signal.emit(
                 f"maneuver_3dplot: 3D アニメ生成中 ({self.anim_frames} frames @ {self.anim_dpi} dpi)…"
             )
+            self.percent_signal.emit(55)
             self.dm.maneuver_3dplot(
                 out_framenums=self.anim_frames,
                 out_fps=self.anim_fps,
@@ -698,6 +1164,7 @@ class ManeuverPreviewWorker(QThread):
             if mp4 and os.path.exists(mp4):
                 gif = os.path.splitext(mp4)[0] + "_preview.gif"
                 self.progress_signal.emit("ffmpeg で GIF 変換…")
+                self.percent_signal.emit(85)
                 # 横幅 400 にスケール (高さは自動)、ループ無限
                 cmd = ["ffmpeg", "-y", "-i", mp4,
                        "-vf", f"fps={self.anim_fps},scale=400:-1:flags=lanczos",
@@ -708,6 +1175,7 @@ class ManeuverPreviewWorker(QThread):
                     gif = ""
 
             self.progress_signal.emit("完了")
+            self.percent_signal.emit(100)
             self.done_signal.emit(True, plot2d, gif)
         except Exception as e:
             self.progress_signal.emit(f"[ERROR] {e}")
@@ -719,7 +1187,7 @@ class IMGTransApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(tr("window_title"))
-        self.resize(760, 820)
+        self.resize(1360, 900)   # 3カラム (Space/Time/Rate) を横並びで収める幅
         self.setMinimumSize(640, 480)
 
         self.videopath = None
@@ -795,26 +1263,10 @@ class IMGTransApp(QWidget):
             self.rt_preview.set_lang(LANG)
 
     def _retranslate_section_combo(self, type_name):
-        """セクションのパターン/波形方向 combo を、選択を保ったまま現在言語で作り直す。"""
+        """セクションの全レイヤーを現在言語で再構築する (選択は保持)。"""
         g = self._section_gens.get(type_name, {})
-        pat = g.get('pattern')
-        if pat is not None:
-            ids, labels = section_pattern_order(type_name)
-            idx = pat.currentIndex()
-            pat.blockSignals(True)
-            pat.clear()
-            pat.addItems(labels)
-            pat.setCurrentIndex(max(0, min(idx, len(labels) - 1)))
-            pat.blockSignals(False)
-            g['pattern_ids'] = ids
-        wdir = g.get('wave_dir')
-        if wdir is not None:
-            idx = wdir.currentIndex()
-            wdir.blockSignals(True)
-            wdir.clear()
-            wdir.addItems([tr("wave_dir_v"), tr("wave_dir_h")])
-            wdir.setCurrentIndex(max(0, min(idx, 1)))
-            wdir.blockSignals(False)
+        for lw in g.get('layers', []):
+            lw.retranslate()
 
     # --- UI Setup ---
     def _wrap_scroll(self, widget):
@@ -883,6 +1335,17 @@ class IMGTransApp(QWidget):
         t2_layout.addWidget(self._trlabel("hint_time_any"))
         gen_v.addLayout(t2_layout)
 
+        # 出力FPS (選択制) — 最終映像の尺は「時間方向サイズ ÷ 出力FPS」で決まる
+        fps_layout = QHBoxLayout()
+        fps_layout.addWidget(self._trlabel("lbl_out_fps"))
+        self.gen_out_fps = QComboBox()
+        for f in (10, 24, 30, 60, 120):
+            self.gen_out_fps.addItem(str(f), f)
+        self.gen_out_fps.setCurrentIndex(2)   # 30
+        fps_layout.addWidget(self.gen_out_fps)
+        fps_layout.addWidget(self._trlabel("hint_out_fps"))
+        gen_v.addLayout(fps_layout)
+
         self.gen_hint = QLabel("")
         self.gen_hint.setStyleSheet("color: gray; font-size: 11px;")
         self.gen_hint.setWordWrap(True)
@@ -893,21 +1356,24 @@ class IMGTransApp(QWidget):
         # サイズ変更時は全セクションのプレビューを更新
         self.gen_scan_size.valueChanged.connect(self._update_gen_hint)
         self.gen_time_size.valueChanged.connect(self._update_gen_hint)
+        self.gen_out_fps.currentIndexChanged.connect(self._update_gen_hint)
         self.gen_scan_size.valueChanged.connect(self._update_all_section_previews)
         self.gen_time_size.valueChanged.connect(self._update_all_section_previews)
+        # 時間方向サイズ / 出力FPS はリアルタイムプレビューのタイムラインにも反映
+        self.gen_time_size.valueChanged.connect(self._sync_rt_timeline)
+        self.gen_out_fps.currentIndexChanged.connect(self._sync_rt_timeline)
+        # Time 画像の vmin/vmax 既定値 (0 .. 出力FPS×時間方向サイズ) を追従更新
+        self.gen_time_size.valueChanged.connect(self._maybe_update_time_defaults)
+        self.gen_out_fps.currentIndexChanged.connect(self._maybe_update_time_defaults)
 
         # 各セクション (Space/Time/Rate) の独立ジェネレータ widget bundle を保持
         self._section_gens = {}
 
-        # --- Space image (select + per-section generator が下部) ---
-        # 生成ボタンはセクション内のジェネレータパネルに統合
-        space_btn_row = QHBoxLayout()
-        self.space_btn = QPushButton()
-        self._reg(lambda: self.space_btn.setText(tr("btn_select_space")))
-        self.space_btn.clicked.connect(lambda: self.select_image('space'))
-        space_btn_row.addWidget(self.space_btn)
-        self.space_btn_row = space_btn_row
+        # --- Space image ---
+        # 画像の指定はジェネレータパネル (パターン: 画像ファイル…) に統合済み。
+        # 単独の Select ボタンは廃止。
         self.space_label = QLabel(tr("no_space_image"))
+        self.space_label.setWordWrap(True)
 
         sp_layout = QHBoxLayout()
         sp_label = self._trlabel("lbl_space_range")
@@ -928,14 +1394,9 @@ class IMGTransApp(QWidget):
         # Space 用のジェネレータパネル (パターン / 波形エディタ / プレビュー)
         self.space_gen_frame = self._build_section_gen('space')
 
-        # --- Time image (select + per-section generator が下部) ---
-        time_btn_row = QHBoxLayout()
-        self.time_btn = QPushButton()
-        self._reg(lambda: self.time_btn.setText(tr("btn_select_time")))
-        self.time_btn.clicked.connect(lambda: self.select_image('time'))
-        time_btn_row.addWidget(self.time_btn)
-        self.time_btn_row = time_btn_row
+        # --- Time image ---
         self.time_label = QLabel(tr("no_time_image"))
+        self.time_label.setWordWrap(True)
 
         time_layout = QHBoxLayout()
         self.time_vmin_spin = QSpinBox()
@@ -959,14 +1420,9 @@ class IMGTransApp(QWidget):
         # Time 用のジェネレータパネル
         self.time_gen_frame = self._build_section_gen('time')
 
-        # --- Rate image (select + per-section generator が下部) ---
-        rate_btn_row = QHBoxLayout()
-        self.rate_btn = QPushButton()
-        self._reg(lambda: self.rate_btn.setText(tr("btn_select_rate")))
-        self.rate_btn.clicked.connect(lambda: self.select_image('rate'))
-        rate_btn_row.addWidget(self.rate_btn)
-        self.rate_btn_row = rate_btn_row
+        # --- Rate image ---
         self.rate_label = QLabel(tr("no_rate_image"))
+        self.rate_label.setWordWrap(True)
 
         rate_layout = QHBoxLayout()
         rate_layout.addWidget(self._trlabel("lbl_baseline"))
@@ -995,6 +1451,27 @@ class IMGTransApp(QWidget):
         # Rate 用のジェネレータパネル
         self.rate_gen_frame = self._build_section_gen('rate')
 
+        # ===== 適用方法の選択 (タブ2 下部・必須) =====
+        # ここで選択しない限り「3. プレビュー」「4. 出力」タブは開かない。
+        # combo の項目テキストはロジックの識別子も兼ねるため翻訳しない。
+        self.apply_mode_group = QGroupBox()
+        self._reg(lambda: self.apply_mode_group.setTitle(tr("grp_apply_mode")))
+        am_v = QVBoxLayout(self.apply_mode_group)
+        am_hint = self._trlabel("apply_mode_hint")
+        am_hint.setStyleSheet("color: gray; font-size: 11px;")
+        am_hint.setWordWrap(True)
+        am_v.addWidget(am_hint)
+        am_row = QHBoxLayout()
+        am_row.addWidget(self._trlabel("lbl_gen_method"))
+        self.preview_mode_select = QComboBox()
+        self.preview_mode_select.addItems(
+            ["― 選択 / Select ―", "time to data", "rate to data"])
+        self.preview_mode_select.currentIndexChanged.connect(self.on_apply_mode_changed)
+        am_row.addWidget(self.preview_mode_select)
+        am_row.addStretch()
+        am_v.addLayout(am_row)
+        self.apply_mode_group.setVisible(False)  # Initialize 後に表示
+
         # ===== マニューバ プレビュー (Time+Space or Rate+Space 揃った時点で確認) =====
         self.preview_group = QGroupBox()
         self._reg(lambda: self.preview_group.setTitle(tr("grp_maneuver_preview")))
@@ -1004,16 +1481,8 @@ class IMGTransApp(QWidget):
         prev_hint.setWordWrap(True)
         prev_v.addWidget(prev_hint)
 
-        # データ生成方法の選択 (time to data / rate to data)
-        # ※ combo の項目テキストはロジックの識別子も兼ねるため翻訳しない
-        pmode_layout = QHBoxLayout()
-        pmode_layout.addWidget(self._trlabel("lbl_gen_method"))
-        self.preview_mode_select = QComboBox()
-        self.preview_mode_select.addItems(["time to data", "rate to data"])
-        self.preview_mode_select.currentIndexChanged.connect(self._update_preview_btn_state)
-        pmode_layout.addWidget(self.preview_mode_select)
-        pmode_layout.addStretch()
-        prev_v.addLayout(pmode_layout)
+        # ※ 適用方法 (time to data / rate to data) の選択はタブ2「画像」下部に
+        #    移動した (self.apply_mode_group)。ここには置かない。
 
         # Settings row: anim frame count + dpi for quick preview
         pset_layout = QHBoxLayout()
@@ -1039,6 +1508,14 @@ class IMGTransApp(QWidget):
         self.preview_status_label.setStyleSheet("color: gray; font-size: 11px;")
         prev_v.addWidget(self.preview_status_label)
 
+        # 生成中の進捗バー (% 表示付き、実行中のみ表示)
+        self.preview_progress = QProgressBar()
+        self.preview_progress.setRange(0, 100)
+        self.preview_progress.setValue(0)
+        self.preview_progress.setTextVisible(True)
+        self.preview_progress.setVisible(False)
+        prev_v.addWidget(self.preview_progress)
+
         prev_v.addWidget(self._trlabel("lbl_2d_plot"))
         self.preview_2dplot_label = QLabel(tr("preview_after_gen"))
         self.preview_2dplot_label.setAlignment(Qt.AlignCenter)
@@ -1061,12 +1538,11 @@ class IMGTransApp(QWidget):
         self.preview_group.setVisible(False)
         self._preview_movie = None  # QMovie の生存維持用
 
-        # --- Mode selection ---
-        # ※ mode_select の項目テキストはロジックの識別子も兼ねるため翻訳しない
-        self.mode_select = QComboBox()
-        self.mode_select.addItems(["Select mode", "time to data", "rate to data"])
-        self.mode_select.currentIndexChanged.connect(self.on_mode_selected)
-        mode_label = self._trlabel("lbl_select_method")
+        # --- Mode info (選択そのものはタブ2の apply_mode_group で行う) ---
+        self.apply_mode_info = QLabel("")
+        self.apply_mode_info.setStyleSheet("color: #555; font-size: 12px;")
+        self.apply_mode_info.setWordWrap(True)
+        self._reg(self._update_apply_mode_info)
 
         # --- Animation toggle ---
         anim_label = self._trlabel("lbl_anim_settings")
@@ -1115,37 +1591,32 @@ class IMGTransApp(QWidget):
         tabs.addTab(self._wrap_scroll(t1), tr("tab_setup"))
 
         # --- Tab 2: 画像生成 + 選択 (Images) ---
-        # 各セクション (Space/Time/Rate) は独立した QGroupBox にまとめる:
-        #   [Select / Auto Generate ボタン] + label + パラメータ + 専用ジェネレータ (パターン/波形/プレビュー)
+        # Space / Time / Rate を 3 カラム横並びで配置。
+        # 各カラム = QGroupBox: label + パラメータ + ジェネレータ (画像選択/生成設定)
         t2 = QWidget(); t2_l = QVBoxLayout(t2)
         t2_l.addWidget(self.gen_group)  # 共通サイズ設定
 
-        space_box = QGroupBox()
-        self._reg(lambda: space_box.setTitle(tr("grp_space_image")))
-        space_v = QVBoxLayout(space_box)
-        space_v.addLayout(self.space_btn_row)
-        space_v.addWidget(self.space_label)
-        space_v.addWidget(self.space_param_frame)
-        space_v.addWidget(self.space_gen_frame)
-        t2_l.addWidget(space_box)
+        cols = QHBoxLayout()
+        cols.setSpacing(8)
+        for type_name, title_key, label, param_frame, gen_frame in [
+            ('space', "grp_space_image", self.space_label,
+             self.space_param_frame, self.space_gen_frame),
+            ('time', "grp_time_image", self.time_label,
+             self.time_param_frame, self.time_gen_frame),
+            ('rate', "grp_rate_image", self.rate_label,
+             self.rate_param_frame, self.rate_gen_frame),
+        ]:
+            box = QGroupBox()
+            self._reg(lambda b=box, k=title_key: b.setTitle(tr(k)))
+            bv = QVBoxLayout(box)
+            bv.addWidget(label)
+            bv.addWidget(param_frame)
+            bv.addWidget(gen_frame)
+            bv.addStretch()
+            cols.addWidget(box, 1)
+        t2_l.addLayout(cols)
 
-        time_box = QGroupBox()
-        self._reg(lambda: time_box.setTitle(tr("grp_time_image")))
-        time_v = QVBoxLayout(time_box)
-        time_v.addLayout(self.time_btn_row)
-        time_v.addWidget(self.time_label)
-        time_v.addWidget(self.time_param_frame)
-        time_v.addWidget(self.time_gen_frame)
-        t2_l.addWidget(time_box)
-
-        rate_box = QGroupBox()
-        self._reg(lambda: rate_box.setTitle(tr("grp_rate_image")))
-        rate_v = QVBoxLayout(rate_box)
-        rate_v.addLayout(self.rate_btn_row)
-        rate_v.addWidget(self.rate_label)
-        rate_v.addWidget(self.rate_param_frame)
-        rate_v.addWidget(self.rate_gen_frame)
-        t2_l.addWidget(rate_box)
+        t2_l.addWidget(self.apply_mode_group)   # 適用方法 (必須) — タブ2の最下部
 
         t2_l.addStretch()
         tabs.addTab(self._wrap_scroll(t2), tr("tab_images"))
@@ -1169,7 +1640,7 @@ class IMGTransApp(QWidget):
 
         # --- Tab 4: 出力 (Render) ---
         t4 = QWidget(); t4_l = QVBoxLayout(t4)
-        for w in [mode_label, self.mode_select,
+        for w in [self.apply_mode_info,
                   anim_label, self.anim_toggle,
                   self.anim_settings_container]:
             t4_l.addWidget(w)
@@ -1231,24 +1702,84 @@ class IMGTransApp(QWidget):
                     for t in self._section_gens
                     if 'generate_btn' in self._section_gens.get(t, {})]
         if stage == "initial":
-            for b in [self.init_btn, self.space_btn, self.time_btn, self.rate_btn,
-                      self.mode_select, self.anim_toggle, self.start_btn,
+            for b in [self.init_btn,
+                      self.anim_toggle, self.start_btn,
                       self.animonly_btn, *gen_btns]:
                 b.setEnabled(False)
         elif stage == "video_selected":
             self.init_btn.setEnabled(True)
         elif stage == "initialized":
-            for b in [self.space_btn, self.time_btn, self.rate_btn,
-                      self.mode_select, *gen_btns]:
+            for b in gen_btns:
                 b.setEnabled(True)
             self.gen_group.setVisible(True)
+            self.apply_mode_group.setVisible(True)
             self.preview_group.setVisible(True)
-            self.preview_btn.setEnabled(False)  # 画像が揃うまで無効
+            self.preview_btn.setEnabled(False)  # 適用方法+画像が揃うまで無効
             self._apply_video_defaults()
+            self._update_preview_btn_state()
         elif stage == "rendered":
             self.animonly_btn.setEnabled(True)
             self.anim_settings_container.setVisible(True)
             self.log("Animation-only rendering is now available.")
+        self._update_tab_gating()
+
+    # --- Tab gating ---
+    # 段階制ワークフロー:
+    #   タブ1 (入力)     : 常に有効
+    #   タブ2 (画像)     : Initialize 完了で解放
+    #   タブ3/4 (プレビュー/出力):
+    #       適用方法 (time to data / rate to data) が選択され、かつ
+    #       Space + (Time または Rate) 画像が揃った時点で解放
+    def _selected_apply_mode(self):
+        """タブ2の適用方法 combo の選択。未選択なら None。"""
+        txt = self.preview_mode_select.currentText() if hasattr(self, "preview_mode_select") else ""
+        return txt if txt in ("time to data", "rate to data") else None
+
+    def _pipeline_ready(self):
+        """プレビュー/出力に進める状態か (初期化 + 適用方法 + 必要画像)。"""
+        if not self.dm:
+            return False
+        mode = self._selected_apply_mode()
+        if mode is None or not self.space_img_path:
+            return False
+        if mode == "time to data":
+            return bool(self.time_img_path)
+        return bool(self.rate_img_path)
+
+    def _update_tab_gating(self):
+        if not hasattr(self, "tabs"):
+            return
+        initialized = self.dm is not None
+        ready = self._pipeline_ready()
+        self.tabs.setTabEnabled(1, initialized)
+        self.tabs.setTabEnabled(2, ready)
+        self.tabs.setTabEnabled(3, ready)
+        # 出力操作も同じ条件でゲート (レンダリング可能条件と一致)
+        self.start_btn.setEnabled(ready)
+        self.anim_toggle.setEnabled(ready)
+        # 現在表示中のタブが無効化されたら、有効な直近のタブへ戻す
+        cur = self.tabs.currentIndex()
+        if not self.tabs.isTabEnabled(cur):
+            for i in range(cur, -1, -1):
+                if self.tabs.isTabEnabled(i):
+                    self.tabs.setCurrentIndex(i)
+                    break
+
+    def _update_apply_mode_info(self):
+        """タブ4上部の「適用方法」表示を更新 (選択はタブ2で行う)。"""
+        if not hasattr(self, "apply_mode_info"):
+            return
+        m = self._selected_apply_mode() or "—"
+        self.apply_mode_info.setText(tr("lbl_apply_mode_info", m=m))
+
+    def on_apply_mode_changed(self, *_):
+        mode = self._selected_apply_mode()
+        if mode:
+            self.log(f"Apply mode selected: {mode}")
+        self._update_apply_mode_info()
+        self._update_preview_btn_state()
+        self._mark_preview_stale()
+        self._update_tab_gating()
 
     def _apply_video_defaults(self):
         """drawManeuver 初期化直後に、スピンボックスの既定値を映像情報から賢く設定する"""
@@ -1257,15 +1788,27 @@ class IMGTransApp(QWidget):
         # 共通サイズ
         self.gen_scan_size.setValue(int(self.dm.scan_nums))
         self.gen_time_size.setValue(120)
+        # 出力FPS の既定は選択肢 (10/24/30/60/120) のうち元動画の実FPS に最も近いもの
+        try:
+            rec = float(self.dm.recfps)
+            choices = [self.gen_out_fps.itemData(i)
+                       for i in range(self.gen_out_fps.count())]
+            best = min(range(len(choices)), key=lambda i: abs(choices[i] - rec))
+            self.gen_out_fps.setCurrentIndex(best)
+        except Exception:
+            self.gen_out_fps.setCurrentIndex(2)   # 30
         # 各 type の既定パラメータ
         self.space_set_value.setValue(int(self.dm.scan_nums))
+        # Time 画像の既定レンジ: vmin=0, vmax=出力FPS×時間方向サイズ
         self.time_vmin_spin.setValue(0)
-        self.time_vmax_spin.setValue(int(self.dm.count))
+        self.time_vmax_spin.setValue(self._default_time_vmax())
+        self._last_time_default = (0, self._default_time_vmax())
         self.rate_baseline_spin.setValue(1.0)
         self.rate_maxdev_spin.setValue(0.5)
-        # 各セクションジェネレータの波形周期既定値 = 時間方向サイズ (= 全体で 1 周期)
+        # 各セクション全レイヤーの波形周期既定値 = 時間方向サイズ (= 全体で 1 周期)
         for t in self._section_gens:
-            self._section_gens[t]['wave_period'].setValue(120)
+            for lw in self._section_gens[t].get('layers', []):
+                lw.wave_period.setValue(120)
         # ヒントラベル更新 + マニューバプレビュー stale マーク用シグナル接続
         for sp in (self.space_set_value, self.time_vmin_spin, self.time_vmax_spin,
                    self.rate_maxdev_spin, self.rate_baseline_spin, self.rate_startpoint_spin):
@@ -1295,18 +1838,49 @@ class IMGTransApp(QWidget):
             pass
 
     def _update_gen_hint(self):
-        """共通サイズと、生成されるファイル形状/各セクションのファイル名を表示"""
+        """共通サイズと、生成されるファイル形状/出力尺を表示"""
         if not self.dm:
             self.gen_hint.setText("")
             return
         sd = int(getattr(self.dm, "scan_direction", 1))
         scan_size = self.gen_scan_size.value()
         time_size = self.gen_time_size.value()
+        out_fps = max(1, self._out_fps())
         if sd == 1:
             file_dim = f"{scan_size}(W) × {time_size}(H)  → Width=scan, Height=time"
         else:
             file_dim = f"{time_size}(W) × {scan_size}(H)  → Width=time, Height=scan"
-        self.gen_hint.setText(tr("gen_hint", dim=file_dim))
+        dur = time_size / out_fps
+        self.gen_hint.setText(
+            tr("gen_hint", dim=file_dim) + "\n" +
+            tr("gen_hint_dur", dur=f"{dur:.2f}", ts=time_size, fps=out_fps))
+
+    def _out_fps(self):
+        """出力FPS combo の現在値 (int)。"""
+        v = self.gen_out_fps.currentData()
+        return int(v) if v else 30
+
+    def _default_time_vmax(self):
+        """Time 画像 vmax の既定値 = 出力FPS × 時間方向サイズ"""
+        return self._out_fps() * self.gen_time_size.value()
+
+    def _maybe_update_time_defaults(self, *_):
+        """時間方向サイズ / 出力FPS 変更時、ユーザーが手で編集していなければ
+        Time の vmin/vmax 既定値 (0 .. FPS×時間方向サイズ) を追従させる。"""
+        if not self.dm:
+            return
+        new_default = (0, self._default_time_vmax())
+        cur = (self.time_vmin_spin.value(), self.time_vmax_spin.value())
+        if cur == getattr(self, "_last_time_default", None):
+            self.time_vmin_spin.setValue(new_default[0])
+            self.time_vmax_spin.setValue(new_default[1])
+        self._last_time_default = new_default
+
+    def _sync_rt_timeline(self, *_):
+        """時間方向サイズ / 出力FPS をリアルタイムプレビューのタイムラインへ反映"""
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.set_params(time_size=self.gen_time_size.value(),
+                                       out_fps=self._out_fps())
 
     # --- Events ---
     def select_video(self):
@@ -1333,6 +1907,9 @@ class IMGTransApp(QWidget):
             self.update_ui_state("initialized")
             if getattr(self, "rt_preview", None):
                 self.rt_preview.set_video(self.videopath)
+                # スリット方向をプレビューに同期 (縦=X リマップ / 横=Y リマップ)
+                self.rt_preview.set_params(sd=int(self.dm.scan_direction))
+                self._sync_rt_timeline()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.update_ui_state("video_selected")
@@ -1340,13 +1917,11 @@ class IMGTransApp(QWidget):
     def _build_section_gen(self, type_name):
         """セクション ({type_name}=space/time/rate) 専用のジェネレータパネルを生成。
 
-        含む widget:
-          - pattern (QComboBox)
-          - wave_frame (QFrame, 波形パターン選択時のみ表示)
-              * wave_dir / wave_amp / wave_period / wave_phase
-          - preview_label (240×140 サムネイル)
+        レイヤースタック方式: LayerWidget を何枚でも追加でき、上から順に
+        合成モード + 不透明度で合成した結果がプレビュー/生成される。
 
-        widget は self._section_gens[type_name] に dict として保存。
+        widget は self._section_gens[type_name] に dict として保存
+        (layers / layers_box / add_btn / preview_label / generate_btn)。
         Returns: 構築済の QFrame (Tab2 のセクション内に addWidget する用)
         """
         g = {}
@@ -1358,60 +1933,18 @@ class IMGTransApp(QWidget):
         head.setStyleSheet("font-weight: bold; color: #555; margin-top: 4px;")
         v.addWidget(head)
 
-        # Pattern (セクションごとに「通常再生」を先頭に並べ替えた選択肢)
-        g['pattern_ids'], pattern_labels = section_pattern_order(type_name)
-        pl = QHBoxLayout()
-        pl.addWidget(self._trlabel("lbl_pattern"))
-        g['pattern'] = QComboBox()
-        g['pattern'].addItems(pattern_labels)
-        # 既定は先頭 = そのセクションの「通常再生」パターン
-        g['pattern'].setCurrentIndex(0)
-        pl.addWidget(g['pattern'])
-        v.addLayout(pl)
+        # レイヤースタック
+        g['layers'] = []
+        g['layers_box'] = QVBoxLayout()
+        g['layers_box'].setSpacing(4)
+        v.addLayout(g['layers_box'])
 
-        # Wave editor (collapsed unless wave pattern selected)
-        g['wave_frame'] = QFrame()
-        g['wave_frame'].setFrameShape(QFrame.StyledPanel)
-        wv = QVBoxLayout(g['wave_frame'])
+        g['add_btn'] = QPushButton()
+        self._reg(lambda b=g['add_btn']: b.setText(tr("btn_add_layer")))
+        g['add_btn'].clicked.connect(lambda *_, t=type_name: self._add_layer(t))
+        v.addWidget(g['add_btn'])
 
-        wd = QHBoxLayout()
-        wd.addWidget(self._trlabel("lbl_wave_dir"))
-        g['wave_dir'] = QComboBox()
-        g['wave_dir'].addItems([tr("wave_dir_v"), tr("wave_dir_h")])
-        wd.addWidget(g['wave_dir'])
-        wv.addLayout(wd)
-
-        wa = QHBoxLayout()
-        wa.addWidget(self._trlabel("lbl_wave_amp"))
-        g['wave_amp'] = QDoubleSpinBox()
-        g['wave_amp'].setRange(0.0, 1.0)
-        g['wave_amp'].setDecimals(3); g['wave_amp'].setSingleStep(0.05)
-        g['wave_amp'].setValue(1.0)
-        wa.addWidget(g['wave_amp'])
-        wv.addLayout(wa)
-
-        wp = QHBoxLayout()
-        wp.addWidget(self._trlabel("lbl_wave_period"))
-        g['wave_period'] = QSpinBox()
-        g['wave_period'].setRange(1, 32768); g['wave_period'].setValue(120)
-        wp.addWidget(g['wave_period'])
-        wp.addWidget(QLabel("px"))
-        wv.addLayout(wp)
-
-        wph = QHBoxLayout()
-        wph.addWidget(self._trlabel("lbl_wave_phase"))
-        g['wave_phase'] = QDoubleSpinBox()
-        g['wave_phase'].setRange(-360.0, 720.0)
-        g['wave_phase'].setDecimals(1); g['wave_phase'].setSingleStep(15.0)
-        g['wave_phase'].setValue(0.0)
-        wph.addWidget(g['wave_phase'])
-        wph.addWidget(QLabel("°"))
-        wv.addLayout(wph)
-
-        g['wave_frame'].setVisible(False)
-        v.addWidget(g['wave_frame'])
-
-        # Preview (パターン編集中はパターン、画像読み込み後はその画像を表示)
+        # Preview (合成結果。画像読み込み後はその画像を表示)
         g['preview_label'] = QLabel(tr("preview_after_init"))
         g['preview_label'].setAlignment(Qt.AlignCenter)
         g['preview_label'].setMinimumSize(320, 180)
@@ -1426,25 +1959,35 @@ class IMGTransApp(QWidget):
                   b.setText(tr("btn_generate_apply", t=t.capitalize())))
         g['generate_btn'].clicked.connect(lambda *_, t=type_name: self.generate_sample_image_action(t))
         g['generate_btn'].setEnabled(False)  # Initialize 前は無効
-        v.addWidget(g['generate_btn'])
-
-        # Wire updates: pattern change → wave_frame 可視性 + preview 更新
-        def on_pattern(idx, t=type_name):
-            ids = self._section_gens[t]['pattern_ids']
-            pid = ids[idx] if 0 <= idx < len(ids) else ""
-            self._section_gens[t]['wave_frame'].setVisible(pid == "wave")
-            self._update_section_preview(t)
-        g['pattern'].currentIndexChanged.connect(on_pattern)
-        # 各パラメータ変更で preview 再描画
-        for spinbox in (g['wave_amp'], g['wave_period'], g['wave_phase']):
-            spinbox.valueChanged.connect(lambda *_, t=type_name: self._update_section_preview(t))
-        g['wave_dir'].currentIndexChanged.connect(lambda *_, t=type_name: self._update_section_preview(t))
 
         self._section_gens[type_name] = g
+        self._add_layer(type_name)   # ベースレイヤー
+        v.addWidget(g['generate_btn'])
         return frame
 
+    def _add_layer(self, type_name):
+        """セクションにレイヤーを 1 枚追加する。"""
+        g = self._section_gens[type_name]
+        lw = LayerWidget(type_name, len(g['layers']))
+        lw.changed.connect(lambda t=type_name: self._update_section_preview(t))
+        lw.remove_requested.connect(lambda w, t=type_name: self._remove_layer(t, w))
+        g['layers'].append(lw)
+        g['layers_box'].addWidget(lw)
+        self._update_section_preview(type_name)
+
+    def _remove_layer(self, type_name, widget):
+        g = self._section_gens[type_name]
+        if widget not in g['layers'] or len(g['layers']) <= 1:
+            return
+        g['layers'].remove(widget)
+        g['layers_box'].removeWidget(widget)
+        widget.deleteLater()
+        for i, lw in enumerate(g['layers']):
+            lw.set_index(i)
+        self._update_section_preview(type_name)
+
     def _make_preview_pixmap_for(self, type_name, max_w=240, max_h=160):
-        """セクション {type_name} の現在設定でプレビュー QPixmap を生成。"""
+        """セクション {type_name} の現在のレイヤースタックを合成してプレビュー QPixmap を生成。"""
         if not self.dm or type_name not in self._section_gens:
             return None
         g = self._section_gens[type_name]
@@ -1459,24 +2002,9 @@ class IMGTransApp(QWidget):
         scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
         ph = max(4, int(round(h * scale)))
         pw = max(4, int(round(w * scale)))
-        sH = ph / max(h, 1)
-        sW = pw / max(w, 1)
 
-        pattern_id = g['pattern_ids'][g['pattern'].currentIndex()]
-        wave_direction = "v" if g['wave_dir'].currentIndex() == 0 else "h"
-        user_period = g['wave_period'].value()
-        if wave_direction == "v":
-            preview_period = max(1.0, user_period * sH)
-        else:
-            preview_period = max(1.0, user_period * sW)
-
-        img16 = render_pattern(
-            ph, pw, pattern_id,
-            direction=wave_direction,
-            amplitude=g['wave_amp'].value(),
-            period=preview_period,
-            phase_deg=g['wave_phase'].value(),
-        )
+        layers = [lw.params() for lw in g['layers']]
+        img16 = composite_layers(ph, pw, layers, scale=scale)
         img8 = np.ascontiguousarray((img16 >> 8).astype(np.uint8))
         qimg = QImage(img8.tobytes(), pw, ph, pw, QImage.Format_Grayscale8)
         return QPixmap.fromImage(qimg)
@@ -1526,35 +2054,42 @@ class IMGTransApp(QWidget):
 
     # --- Maneuver preview (2D + 3D) ---
     def _selected_preview_mode(self):
-        """プレビューパネルで選択された生成方法を "time" / "rate" で返す。"""
-        sel = self.preview_mode_select.currentText() if hasattr(self, "preview_mode_select") else "time to data"
-        return "rate" if sel == "rate to data" else "time"
+        """適用方法 (タブ2) を "time" / "rate" で返す。未選択なら None。"""
+        m = self._selected_apply_mode()
+        if m == "rate to data":
+            return "rate"
+        if m == "time to data":
+            return "time"
+        return None
 
     def _can_preview_mode(self):
-        """選択された生成方法でプレビュー可能なら "time"/"rate"、不足があれば None。"""
+        """選択された適用方法でプレビュー可能なら "time"/"rate"、不足があれば None。"""
         if not self.dm or not self.space_img_path:
             return None
         mode = self._selected_preview_mode()
         if mode == "time":
             return "time" if self.time_img_path else None
-        else:
+        if mode == "rate":
             return "rate" if self.rate_img_path else None
+        return None
 
     def _update_preview_btn_state(self):
-        """選択された生成方法と画像セット状態に応じてボタンの有効/無効を切り替え"""
+        """選択された適用方法と画像セット状態に応じてボタンの有効/無効を切り替え"""
         if not hasattr(self, "preview_btn"):
             return
         mode = self._can_preview_mode()
         self.preview_btn.setEnabled(mode is not None)
-        if not self.dm or not self.space_img_path:
+        if self._selected_preview_mode() is None:
+            self.preview_status_label.setText(tr("status_need_mode"))
+        elif not self.dm or not self.space_img_path:
             self.preview_status_label.setText(tr("status_need_space"))
         elif mode is not None:
             self.preview_status_label.setText(tr("status_ready", m=mode))
         else:
             need = "Time" if self._selected_preview_mode() == "time" else "Rate"
             self.preview_status_label.setText(tr("status_need_img", need=need))
-        # リアルタイムプレビューのモードも同期
-        if getattr(self, "rt_preview", None):
+        # リアルタイムプレビューのモードも同期 (選択済みのときのみ)
+        if getattr(self, "rt_preview", None) and self._selected_preview_mode():
             self.rt_preview.set_params(mode=self._selected_preview_mode())
 
     def start_maneuver_preview(self):
@@ -1565,6 +2100,19 @@ class IMGTransApp(QWidget):
             return
         self.preview_btn.setEnabled(False)
         self.preview_status_label.setText("Status: running…")
+        # 生成中であることをプロット領域自体にも表示 (古い表示は消す)
+        if self._preview_movie is not None:
+            try:
+                self._preview_movie.stop()
+            except Exception:
+                pass
+            self.preview_3d_label.setMovie(None)
+            self._preview_movie = None
+        self.preview_2dplot_label.setPixmap(QPixmap())
+        self.preview_2dplot_label.setText(tr("processing_wait"))
+        self.preview_3d_label.setText(tr("processing_wait"))
+        self.preview_progress.setValue(0)
+        self.preview_progress.setVisible(True)
         self.log(f"[preview] starting in {mode} mode")
 
         self._preview_worker = ManeuverPreviewWorker(
@@ -1580,6 +2128,7 @@ class IMGTransApp(QWidget):
             anim_dpi=self.preview_dpi_spin.value(),
         )
         self._preview_worker.progress_signal.connect(self._on_preview_progress)
+        self._preview_worker.percent_signal.connect(self._on_preview_percent)
         self._preview_worker.done_signal.connect(self._on_preview_done)
         self._preview_worker.start()
 
@@ -1587,8 +2136,12 @@ class IMGTransApp(QWidget):
         self.preview_status_label.setText(f"Status: {msg}")
         self.log(f"[preview] {msg}")
 
+    def _on_preview_percent(self, pct):
+        self.preview_progress.setValue(int(pct))
+
     def _on_preview_done(self, success, plot2d, gif):
         self.preview_btn.setEnabled(True)
+        self.preview_progress.setVisible(False)
         if not success:
             self.preview_status_label.setText("Status: failed (see log)")
             return
@@ -1675,45 +2228,37 @@ class IMGTransApp(QWidget):
             return
 
         g = self._section_gens[type_name]
-        pattern_id = g['pattern_ids'][g['pattern'].currentIndex()]
         scan_size = self.gen_scan_size.value()
         time_size = self.gen_time_size.value()
         sd = int(getattr(self.dm, "scan_direction", 1))
         out_dir = os.path.dirname(self.videopath) or "."
 
-        # 波形パラメータ (このセクション固有)
-        wave_direction = "v" if g['wave_dir'].currentIndex() == 0 else "h"
-        wave_amp = g['wave_amp'].value()
-        wave_period = g['wave_period'].value()
-        wave_phase = g['wave_phase'].value()
+        # Slit 方向に応じてファイル形状を決定
+        if sd == 1:
+            h_pix, w_pix = int(time_size), int(scan_size)   # (time, scan)
+        else:
+            h_pix, w_pix = int(scan_size), int(time_size)   # (scan, time) — .T される
 
+        layers = [lw.params() for lw in g['layers']]
         try:
-            out_path = generate_sample_image(
-                out_dir=out_dir,
-                image_type=type_name,
-                pattern_id=pattern_id,
-                scan_size=scan_size,
-                time_size=time_size,
-                scan_direction=sd,
+            img16 = composite_layers(h_pix, w_pix, layers, scale=1.0)
+            fname = sample_filename(
+                type_name,
                 space_range=self.space_set_value.value(),
                 time_vmin=self.time_vmin_spin.value(),
                 time_vmax=self.time_vmax_spin.value(),
                 rate_maxdev=self.rate_maxdev_spin.value(),
-                wave_direction=wave_direction,
-                wave_amplitude=wave_amp,
-                wave_period=wave_period,
-                wave_phase_deg=wave_phase,
+                scan_size=scan_size,
             )
+            out_path = os.path.join(out_dir, fname)
+            cv2.imwrite(out_path, img16)
         except Exception as e:
             QMessageBox.critical(self, "Generate Error", str(e))
-            self.log(f"[ERROR] generate_sample_image: {e}")
+            self.log(f"[ERROR] generate composite: {e}")
             return
 
-        if pattern_id == "wave":
-            self.log(f"Sample {type_name} (wave dir={wave_direction} amp={wave_amp} "
-                     f"period={wave_period}px phase={wave_phase}°): {out_path}")
-        else:
-            self.log(f"Sample {type_name} ({pattern_id}): {out_path}")
+        pats = "+".join(p["pattern"] for p in layers)
+        self.log(f"Sample {type_name} ({len(layers)} layer(s): {pats}): {out_path}")
         setattr(self, f"{type_name}_img_path", out_path)
         self._wire_loaded_image(type_name, out_path)
 
@@ -1754,16 +2299,10 @@ class IMGTransApp(QWidget):
             except Exception as e:
                 self.log(f"[WARN] Could not extract params: {e}")
 
-        self.mode_select.blockSignals(True)
-        self.mode_select.setCurrentText("Select mode")
-        self.mode_select.blockSignals(False)
-        self.start_btn.setEnabled(False)
-        self.anim_toggle.setEnabled(False)
-        self.anim_settings_container.setVisible(False)
-
-        # マニューバプレビューボタンの有効/無効を更新 + stale マーク (画像が変わったため)
+        # マニューバプレビューボタン / タブゲートの更新 + stale マーク (画像が変わったため)
         self._update_preview_btn_state()
         self._mark_preview_stale()
+        self._update_tab_gating()
 
         # リアルタイムプレビューにも最新のマップ/パラメータを反映 (常駐済みなら即更新)
         if getattr(self, "rt_preview", None):
@@ -1777,32 +2316,12 @@ class IMGTransApp(QWidget):
                 maxdev=self.rate_maxdev_spin.value())
             self.rt_preview.refresh_maps()
 
-    def select_image(self, img_type):
-        path, _ = QFileDialog.getOpenFileName(
-            self, f"Select {img_type} image", "", "Images (*.png *.jpg *.bmp)")
-        if not path:
-            return
-        setattr(self, f"{img_type}_img_path", path)
-        self.log(f"{img_type} image selected: {path}")
-        self._wire_loaded_image(img_type, path)
-
-    def on_mode_selected(self, index):
-        mode = self.mode_select.currentText()
-        if mode in ["time to data", "rate to data"]:
-            self.start_btn.setEnabled(True)
-            self.anim_toggle.setEnabled(True)
-            self.log(f"Mode selected: {mode}")
-        else:
-            self.start_btn.setEnabled(False)
-            self.anim_toggle.setEnabled(False)
-            self.anim_settings_container.setVisible(False)
-
     def on_anim_toggle_changed(self, state):
         if state == Qt.Checked:
             self.anim_settings_container.setVisible(True)
         else:
             self.anim_settings_container.setVisible(False)
-        self.start_btn.setEnabled(True)
+        self._update_tab_gating()
 
     def update_slit_label(self):
         if self.slit_toggle.isChecked():
@@ -1821,12 +2340,20 @@ class IMGTransApp(QWidget):
             rt.stop()
 
     def start_rendering(self):
-        mode = self.mode_select.currentText()
-        if mode not in ["time to data", "rate to data"]:
-            QMessageBox.warning(self, "Error", "Please select a valid mode.")
+        mode = self._selected_apply_mode()
+        if mode is None:
+            QMessageBox.warning(self, "Error",
+                                "適用方法を「2. 画像」タブ下部で選択してください。")
             return
         animout = self.anim_toggle.isChecked()
         duration = self.duration_spin.value()
+
+        # 出力FPS を drawManeuver に反映 (最終尺 = 時間方向サイズ ÷ 出力FPS)
+        try:
+            self.dm.outfps = self._out_fps()
+            self.log(f"Output FPS: {self.dm.outfps}")
+        except Exception as e:
+            self.log(f"[WARN] could not set outfps: {e}")
 
         space_set = self.space_set_value.value()
         vmin = self.time_vmin_spin.value()
