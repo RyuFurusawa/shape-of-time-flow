@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QFileDialog,
     QComboBox, QTextEdit, QCheckBox, QMessageBox, QSpinBox, QHBoxLayout,
     QFrame, QDoubleSpinBox, QGroupBox, QTabWidget, QScrollArea, QSplitter,
-    QProgressBar
+    QProgressBar, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QTimer
 from PyQt5.QtGui import (QImage, QPixmap, QMovie, QImageReader,
@@ -1209,15 +1209,21 @@ class MapThumb(QLabel):
     - 横スリット (sd=0): マップの時間軸は横 → 垂直の赤ラインが左右に動く
     """
 
-    def __init__(self, caption=""):
+    def __init__(self, caption="", fixed_height=110):
         super().__init__()
         self._src = None            # 元画像 QPixmap
         self._base = None           # ラベルサイズに合わせた縮小キャッシュ
         self._frac = None           # 再生位置 [0,1) / None = 非表示
         self._time_vertical = True
         self.setAlignment(Qt.AlignCenter)
-        self.setFixedHeight(110)
-        self.setMinimumWidth(100)
+        if fixed_height is not None:
+            self.setFixedHeight(fixed_height)
+            self.setMinimumWidth(100)
+        else:
+            # 可変サイズ (レイアウトのストレッチに従う)。sizeHint 由来の
+            # 拡大ループを避けるため Ignored ポリシーにする。
+            self.setMinimumSize(160, 240)
+            self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.setStyleSheet(
             "QLabel { background: #222; border: 1px solid #555;"
             " color: #777; font-size: 10px; }")
@@ -1313,7 +1319,7 @@ class IMGTransApp(QWidget):
         self._i18n.append(lambda: (None if self.rate_img_path else self.rate_label.setText(tr("no_rate_image"))))
         # ライブプロットのプレースホルダ (未生成時のみ訳し直す)
         self._i18n.append(lambda: (None if self._live3d_movie else self.live3d_label.setText(tr("live3d_waiting"))))
-        self._i18n.append(lambda: (None if (self.live2d_label.pixmap() and not self.live2d_label.pixmap().isNull()) else self.live2d_label.setText(tr("live3d_waiting"))))
+        self._i18n.append(lambda: (None if (self.live2d_thumb.pixmap() and not self.live2d_thumb.pixmap().isNull()) else self.live2d_thumb.setText(tr("live3d_waiting"))))
 
         self.update_ui_state("initial")
 
@@ -1490,7 +1496,7 @@ class IMGTransApp(QWidget):
         sp_layout.addWidget(self.space_set_value)
 
         self.space_info_label = QLabel("")
-        self.space_info_label.setStyleSheet("color: gray; font-size: 12px;")
+        self.space_info_label.setStyleSheet("color: gray; font-size: 10px;")
 
         self.space_param_frame = QFrame()
         sp_vbox = QVBoxLayout(self.space_param_frame)
@@ -1516,7 +1522,7 @@ class IMGTransApp(QWidget):
         time_layout.addWidget(self.time_vmax_spin)
 
         self.time_info_label = QLabel("")
-        self.time_info_label.setStyleSheet("color: gray; font-size: 12px;")
+        self.time_info_label.setStyleSheet("color: gray; font-size: 10px;")
 
         self.time_param_frame = QFrame()
         time_vbox = QVBoxLayout(self.time_param_frame)
@@ -1548,7 +1554,7 @@ class IMGTransApp(QWidget):
         rate_layout.addWidget(self.rate_startpoint_spin)
 
         self.rate_info_label = QLabel("")
-        self.rate_info_label.setStyleSheet("color: gray; font-size: 12px;")
+        self.rate_info_label.setStyleSheet("color: gray; font-size: 10px;")
         self.rate_param_frame = QFrame()
         rate_vbox = QVBoxLayout(self.rate_param_frame)
         rate_vbox.addLayout(rate_layout)
@@ -1584,25 +1590,30 @@ class IMGTransApp(QWidget):
         # maneuver_3dplot (GIF) + maneuver_2dplot (PNG) を再生成して表示する。
         self.live3d_group = QGroupBox()
         self._reg(lambda: self.live3d_group.setTitle(tr("grp_live3d")))
+        # レイアウト: [2D プロット (左・幅2/5, 再生赤ライン付き)]
+        #             [右 3/5: 上=3D GIF / 下=Space・Time・Rate サムネイル]
+        # 全体は縦方向センタリング (下側の空白を防ぐ)
         l3_outer = QVBoxLayout(self.live3d_group)
+        l3_outer.addStretch(1)
         l3_cols = QHBoxLayout()
-        # 左: 2D プロット PNG (縦長のため幅比 1/5)
-        self.live2d_label = QLabel(tr("live3d_waiting"))
-        self.live2d_label.setAlignment(Qt.AlignCenter)
-        self.live2d_label.setMinimumSize(110, 240)
-        self.live2d_label.setStyleSheet(
-            "QLabel { background: #ffffff; color: #888; border: 1px solid #555;"
-            " font-size: 10px; }")
-        self.live2d_label.setWordWrap(True)
-        l3_cols.addWidget(self.live2d_label, 1)
-        # 右: 3D GIF (幅比 4/5)
+
+        # 左: 2D プロット (MapThumb — 赤ラインが常に左→右へスライド)
+        self.live2d_thumb = MapThumb("2D Plot", fixed_height=None)
+        self.live2d_thumb.set_time_vertical(False)   # 2D の時間軸は常に横
+        self.live2d_thumb.setStyleSheet(
+            "QLabel { background: #ffffff; border: 1px solid #555;"
+            " color: #888; font-size: 10px; }")
+        self.live2d_thumb.setText(tr("live3d_waiting"))
+        l3_cols.addWidget(self.live2d_thumb, 2)
+
+        # 右カラム: 3D GIF (上) + マップサムネイル3枚 (下)
+        right_col = QVBoxLayout()
         self.live3d_label = QLabel(tr("live3d_waiting"))
         self.live3d_label.setAlignment(Qt.AlignCenter)
         self.live3d_label.setMinimumSize(320, 240)
         self.live3d_label.setStyleSheet(
             "QLabel { background: #222; color: #888; border: 1px solid #555; }")
-        l3_cols.addWidget(self.live3d_label, 4)
-        l3_outer.addLayout(l3_cols)
+        right_col.addWidget(self.live3d_label, 1)
 
         # 適用済みマップ 3 枚のサムネイル (3D アニメの再生位置を赤ラインで表示)
         self._map_thumbs = {}
@@ -1619,11 +1630,14 @@ class IMGTransApp(QWidget):
             self._map_thumbs[t] = th
             col.addWidget(th)
             thumb_row.addLayout(col, 1)
-        l3_outer.addLayout(thumb_row)
+        right_col.addLayout(thumb_row)
+        l3_cols.addLayout(right_col, 3)
 
+        l3_outer.addLayout(l3_cols)
         self.live3d_status = QLabel("")
         self.live3d_status.setStyleSheet("color: gray; font-size: 11px;")
         l3_outer.addWidget(self.live3d_status)
+        l3_outer.addStretch(1)
         self.live3d_group.setVisible(False)      # Initialize 後に表示
 
         # ===== マニューバ プレビュー (Time+Space or Rate+Space 揃った時点で確認) =====
@@ -1761,18 +1775,25 @@ class IMGTransApp(QWidget):
 
         cols = QHBoxLayout()
         cols.setSpacing(8)
-        for type_name, title_key, label, param_frame, gen_frame in [
-            ('space', "grp_space_image", self.space_label,
+        # パス表示 (Selected: …) は冗長なため列に含めない (サムネイルで確認できる)。
+        # パラメータ枠はコンパクト化 (小さめフォント + 詰めたマージン)。
+        for type_name, title_key, param_frame, gen_frame in [
+            ('space', "grp_space_image",
              self.space_param_frame, self.space_gen_frame),
-            ('time', "grp_time_image", self.time_label,
+            ('time', "grp_time_image",
              self.time_param_frame, self.time_gen_frame),
-            ('rate', "grp_rate_image", self.rate_label,
+            ('rate', "grp_rate_image",
              self.rate_param_frame, self.rate_gen_frame),
         ]:
+            param_frame.setStyleSheet(
+                "QLabel { font-size: 11px; }"
+                " QSpinBox, QDoubleSpinBox { font-size: 11px; }")
+            if param_frame.layout() is not None:
+                param_frame.layout().setContentsMargins(2, 0, 2, 0)
+                param_frame.layout().setSpacing(2)
             box = QGroupBox()
             self._reg(lambda b=box, k=title_key: b.setTitle(tr(k)))
             bv = QVBoxLayout(box)
-            bv.addWidget(label)
             bv.addWidget(param_frame)
             bv.addWidget(gen_frame)
             bv.addStretch()
@@ -1833,7 +1854,7 @@ class IMGTransApp(QWidget):
             self.tabs.setTabText(2, tr("tab_render")),
         ))
 
-        # ===== ログは常時表示 (タブ外) =====
+        # ===== ログ (メインの入力・画像ページでは非表示、他タブで表示) =====
         log_label = self._trlabel("lbl_log")
         log_label.setStyleSheet("color: gray; font-size: 11px; margin-top: 4px;")
         self.log_window.setMinimumHeight(80)
@@ -1842,14 +1863,15 @@ class IMGTransApp(QWidget):
         # Splitter で「タブ」と「ログ」のサイズを可変に
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(tabs)
-        log_box = QWidget()
-        log_box_l = QVBoxLayout(log_box)
+        self.log_box = QWidget()
+        log_box_l = QVBoxLayout(self.log_box)
         log_box_l.setContentsMargins(0, 0, 0, 0)
         log_box_l.addWidget(log_label)
         log_box_l.addWidget(self.log_window)
-        splitter.addWidget(log_box)
+        splitter.addWidget(self.log_box)
         splitter.setStretchFactor(0, 5)  # tabs 側を広く
         splitter.setStretchFactor(1, 1)
+        self.log_box.setVisible(False)   # 起動時はメインページ (index 0)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(6, 6, 6, 6)
@@ -2441,14 +2463,9 @@ class IMGTransApp(QWidget):
 
     def _on_live3d_done(self, success, plot2d, gif):
         self._live3d_busy = False
-        # 2D プロット (右カラム)
+        # 2D プロット (左カラム・赤ライン付きサムネイル)
         if success and plot2d and os.path.exists(plot2d):
-            pix = QPixmap()
-            pix.load(plot2d)
-            if not pix.isNull():
-                self.live2d_label.setPixmap(pix.scaled(
-                    self.live2d_label.width(), self.live2d_label.height(),
-                    Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.live2d_thumb.set_map(plot2d)
         if success and gif and os.path.exists(gif):
             if self._live3d_movie is not None:
                 try:
@@ -2488,6 +2505,8 @@ class IMGTransApp(QWidget):
         frac = (frame_idx + 0.5) / n
         for th in getattr(self, "_map_thumbs", {}).values():
             th.set_playhead(frac)
+        # 2D プロットにも赤ラインを左→右へスライド表示
+        self.live2d_thumb.set_playhead(frac)
 
     def generate_sample_image_action(self, type_name):
         """セクション {type_name} のジェネレータ設定でサンプル画像を生成 → 自動セット"""
@@ -2607,7 +2626,10 @@ class IMGTransApp(QWidget):
             self.slit_label.setText(tr("slit_h"))
 
     def _on_tab_changed(self, idx):
-        """プレビュータブ (index 1) を表示中だけリアルタイムプレビューを再生。"""
+        """プレビュータブ (index 1) を表示中だけリアルタイムプレビューを再生。
+        ログはメインの入力・画像ページ (index 0) では非表示。"""
+        if getattr(self, "log_box", None):
+            self.log_box.setVisible(idx != 0)
         rt = getattr(self, "rt_preview", None)
         if not rt:
             return
