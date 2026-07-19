@@ -157,15 +157,23 @@ def load_map01(path, ow, oh, default="gray", transpose=False):
 # sd: 1=縦スリット (space で X をリマップ) / 0=横スリット (space で Y をリマップ)
 _PARAMS_DTYPE = np.dtype({
     "names": ["F", "OW", "OH", "srcW", "mode", "playhead", "span",
-              "baseline", "maxdev", "sd", "srcH", "_p2"],
+              "baseline", "maxdev", "sd", "srcH", "ph01",
+              "vr0", "vr1", "_p0", "_p1"],
     "formats": ["<u4", "<u4", "<u4", "<u4", "<u4", "<f4", "<f4",
-                "<f4", "<f4", "<u4", "<u4", "<f4"],
+                "<f4", "<f4", "<u4", "<u4", "<f4",
+                "<f4", "<f4", "<f4", "<f4"],
 })
 
 _WGSL = """
+// 書き出し (img_to_maneuver) と同じ意味論:
+//   マップの定義域は (出力時間 × スキャン位置)。
+//   出力タイムライン上の現在位置 ph01 がマップの時間軸を消費し、
+//   1 フレーム内の変化はスキャン軸に沿ってのみ現れる。
+//   time マップ値は vrange [vr0, vr1] の絶対入力フレーム (常駐単位)。
 struct P { F:u32, OW:u32, OH:u32, srcW:u32, mode:u32,
            playhead:f32, span:f32, baseline:f32, maxdev:f32,
-           sd:u32, srcH:u32, _p2:f32 };
+           sd:u32, srcH:u32, ph01:f32,
+           vr0:f32, vr1:f32, _p0:f32, _p1:f32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var vol: texture_2d_array<f32>;
 @group(0) @binding(2) var smap: texture_2d<f32>;
@@ -176,32 +184,46 @@ struct P { F:u32, OW:u32, OH:u32, srcW:u32, mode:u32,
 @compute @workgroup_size(8,8,1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= p.OW || gid.y >= p.OH) { return; }
-  let xy = vec2<i32>(i32(gid.x), i32(gid.y));
-  let s = clamp(textureLoad(smap, xy, 0).r, 0.0, 1.0);
+
+  // マップ参照座標: 時間軸 = ph01 (再生ヘッド)、スキャン軸 = 画素のスキャン座標。
+  // マップはビデオ座標系でアップロード済み:
+  //   縦スリット(sd=1): 時間軸=縦(y), スキャン軸=横(x)
+  //   横スリット(sd=0): 時間軸=横(x), スキャン軸=縦(y)
+  var muv: vec2<i32>;
+  if (p.sd == 1u) {
+    muv = vec2<i32>(i32(gid.x), i32(p.ph01 * f32(p.OH - 1u)));
+  } else {
+    muv = vec2<i32>(i32(p.ph01 * f32(p.OW - 1u)), i32(gid.y));
+  }
+
+  let s = clamp(textureLoad(smap, muv, 0).r, 0.0, 1.0);
   var sx: i32;
   var sy: i32;
   if (p.sd == 1u) {
-    // 縦スリット: スリット=縦線。space は水平位置をリマップ、Y は素通し
+    // 縦スリット: space はスリットの水平位置をリマップ、Y は素通し
     sx = i32(s * f32(p.srcW - 1u));
-    sy = xy.y;
+    sy = i32(gid.y);
   } else {
-    // 横スリット: スリット=横線。space は垂直位置をリマップ、X は素通し
-    sx = xy.x;
+    // 横スリット: space はスリットの垂直位置をリマップ、X は素通し
+    sx = i32(gid.x);
     sy = i32(s * f32(p.srcH - 1u));
   }
+
   var srcF: f32;
   if (p.mode == 0u) {
-    let t = textureLoad(tmap, xy, 0).r;
-    srcF = p.playhead - t * p.span;
+    // time マップ = vrange の絶対入力フレーム (常駐単位に換算済み)
+    let t = clamp(textureLoad(tmap, muv, 0).r, 0.0, 1.0);
+    srcF = p.vr0 + t * (p.vr1 - p.vr0);
   } else {
-    let r = textureLoad(rmap, xy, 0).r;
+    let r = textureLoad(rmap, muv, 0).r;
     let rate = p.baseline + (r - 0.5) * 2.0 * p.maxdev;
     srcF = p.playhead * rate;
+    let Ff = f32(p.F);
+    srcF = srcF - floor(srcF / Ff) * Ff;        // rate はループ再生
   }
-  let Ff = f32(p.F);
-  srcF = srcF - floor(srcF / Ff) * Ff;          // positive modulo
+  srcF = clamp(srcF, 0.0, f32(p.F - 1u));
   let f0 = i32(floor(srcF));
-  let f1 = (f0 + 1) % i32(p.F);
+  let f1 = min(f0 + 1, i32(p.F) - 1);
   let fr = srcF - floor(srcF);
   let c0 = textureLoad(vol, vec2<i32>(sx, sy), f0, 0);
   let c1 = textureLoad(vol, vec2<i32>(sx, sy), f1, 0);
@@ -338,25 +360,37 @@ class _NumpyBackend:
         vol = self._vol
         F, H, W, _ = vol.shape
         ow, oh = self._dims
-        s = np.clip(self._maps["space"], 0.0, 1.0)
-        if int(params["sd"]) == 1:
-            # 縦スリット: X をリマップ、Y 素通し
-            ix = (s * (W - 1)).astype(np.int32)
+        sd = int(params["sd"])
+        ph01 = float(params["ph01"])
+        # マップは (出力時間 × スキャン) 定義域。時間軸は ph01 でスライスし、
+        # スキャン軸のみ画素に展開する (書き出しと同じ意味論)。
+        if sd == 1:
+            row = int(round(ph01 * (oh - 1)))
+            s_line = np.clip(self._maps["space"][row, :], 0.0, 1.0)   # (ow,)
+            t_line = np.clip(self._maps["time"][row, :], 0.0, 1.0)
+            r_line = self._maps["rate"][row, :]
+            ix = np.broadcast_to((s_line * (W - 1)).astype(np.int32)[None, :], (oh, ow))
             iy = np.broadcast_to(self._yy, (oh, ow))
+            t01 = np.broadcast_to(t_line[None, :], (oh, ow))
+            r01 = np.broadcast_to(r_line[None, :], (oh, ow))
         else:
-            # 横スリット: Y をリマップ、X 素通し
+            col = int(round(ph01 * (ow - 1)))
+            s_line = np.clip(self._maps["space"][:, col], 0.0, 1.0)   # (oh,)
+            t_line = np.clip(self._maps["time"][:, col], 0.0, 1.0)
+            r_line = self._maps["rate"][:, col]
             ix = np.broadcast_to(np.arange(ow)[None, :], (oh, ow))
-            iy = (s * (H - 1)).astype(np.int32)
+            iy = np.broadcast_to((s_line * (H - 1)).astype(np.int32)[:, None], (oh, ow))
+            t01 = np.broadcast_to(t_line[:, None], (oh, ow))
+            r01 = np.broadcast_to(r_line[:, None], (oh, ow))
         if int(params["mode"]) == 0:
-            t = self._maps["time"]
-            srcF = float(params["playhead"]) - t * float(params["span"])
+            vr0 = float(params["vr0"]); vr1 = float(params["vr1"])
+            srcF = vr0 + t01 * (vr1 - vr0)
         else:
-            r = self._maps["rate"]
-            rate = float(params["baseline"]) + (r - 0.5) * 2.0 * float(params["maxdev"])
-            srcF = float(params["playhead"]) * rate
-        srcF = np.mod(srcF, F)
+            rate = float(params["baseline"]) + (r01 - 0.5) * 2.0 * float(params["maxdev"])
+            srcF = np.mod(float(params["playhead"]) * rate, F)
+        srcF = np.clip(srcF, 0, F - 1)
         f0 = np.floor(srcF).astype(np.int32)
-        f1 = (f0 + 1) % F
+        f1 = np.minimum(f0 + 1, F - 1)
         fr = (srcF - f0)[..., None]
         c0 = vol[f0, iy, ix, :3].astype(np.float32)
         c1 = vol[f1, iy, ix, :3].astype(np.float32)
@@ -673,6 +707,7 @@ class RealtimePreviewWidget(QWidget):
         ow, oh = sw, sh
         self._F = F
         self._srcW, self._srcH = sw, sh
+        self._total_in = max(1, total)     # vrange→常駐単位の換算に使用
         self._dims = (ow, oh)
         self._loaded = 0
         self._vol_mb = sw * sh * 4 * F / 1e6
@@ -789,6 +824,12 @@ class RealtimePreviewWidget(QWidget):
         p["maxdev"] = float(self.maxdev)
         p["sd"] = int(self.scan_direction)
         p["srcH"] = self._srcH
+        # 出力タイムライン上の正規化再生位置 (マップの時間軸スライスに使用)
+        p["ph01"] = float(self._t_out) / max(1, self.time_size)
+        # vrange [vmin, vmax] (入力フレーム) → 常駐ボリューム単位に換算
+        total = max(1, getattr(self, "_total_in", 1))
+        p["vr0"] = float(self.vmin) / total * F
+        p["vr1"] = float(self.vmax) / total * F
         return p
 
     def _tick(self):
