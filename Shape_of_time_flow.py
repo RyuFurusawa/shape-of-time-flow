@@ -573,8 +573,16 @@ class LayerWidget(QFrame):
         self.head_label.setStyleSheet("font-weight: bold; color: #557;")
         head.addWidget(self.head_label)
         head.addStretch()
+        # 削除ボタン: はっきり見える ✕ (赤系・ホバーで強調)
         self.remove_btn = QPushButton("✕")
-        self.remove_btn.setFixedSize(24, 22)
+        self.remove_btn.setFixedSize(30, 26)
+        self.remove_btn.setCursor(Qt.PointingHandCursor)
+        self.remove_btn.setToolTip("このレイヤーを削除 / Delete this layer")
+        self.remove_btn.setStyleSheet(
+            "QPushButton { background: #fbe9e9; color: #c0392b; border: 1px solid #d98880;"
+            " border-radius: 5px; font-size: 14px; font-weight: bold; padding: 0; }"
+            "QPushButton:hover { background: #e74c3c; color: white; border-color: #c0392b; }"
+            "QPushButton:disabled { background: transparent; color: #bbb; border-color: #ddd; }")
         self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
         head.addWidget(self.remove_btn)
         v.addLayout(head)
@@ -1501,20 +1509,22 @@ class IMGTransApp(QWidget):
         self._reg(lambda: self.live3d_group.setTitle(tr("grp_live3d")))
         l3_outer = QVBoxLayout(self.live3d_group)
         l3_cols = QHBoxLayout()
-        # 左: 3D GIF
-        self.live3d_label = QLabel(tr("live3d_waiting"))
-        self.live3d_label.setAlignment(Qt.AlignCenter)
-        self.live3d_label.setMinimumSize(320, 220)
-        self.live3d_label.setStyleSheet(
-            "QLabel { background: #222; color: #888; border: 1px solid #555; }")
-        l3_cols.addWidget(self.live3d_label, 1)
-        # 右: 2D プロット PNG
+        # 左: 2D プロット PNG (縦長のため幅比 1/5)
         self.live2d_label = QLabel(tr("live3d_waiting"))
         self.live2d_label.setAlignment(Qt.AlignCenter)
-        self.live2d_label.setMinimumSize(320, 220)
+        self.live2d_label.setMinimumSize(110, 240)
         self.live2d_label.setStyleSheet(
-            "QLabel { background: #ffffff; color: #888; border: 1px solid #555; }")
+            "QLabel { background: #ffffff; color: #888; border: 1px solid #555;"
+            " font-size: 10px; }")
+        self.live2d_label.setWordWrap(True)
         l3_cols.addWidget(self.live2d_label, 1)
+        # 右: 3D GIF (幅比 4/5)
+        self.live3d_label = QLabel(tr("live3d_waiting"))
+        self.live3d_label.setAlignment(Qt.AlignCenter)
+        self.live3d_label.setMinimumSize(320, 240)
+        self.live3d_label.setStyleSheet(
+            "QLabel { background: #222; color: #888; border: 1px solid #555; }")
+        l3_cols.addWidget(self.live3d_label, 4)
         l3_outer.addLayout(l3_cols)
         self.live3d_status = QLabel("")
         self.live3d_status.setStyleSheet("color: gray; font-size: 11px;")
@@ -1643,8 +1653,16 @@ class IMGTransApp(QWidget):
         # Space / Time / Rate を 3 カラム横並びで配置。
         # 各カラム = QGroupBox: label + パラメータ + ジェネレータ (画像選択/生成設定)
         t2 = QWidget(); t2_l = QVBoxLayout(t2)
-        t2_l.addWidget(self.apply_mode_group)   # 適用方法 (必須) — 画像操作の上
-        t2_l.addWidget(self.gen_group)          # 共通サイズ設定
+        # 上段 2 カラム: 左 = 適用方法 + 共通サイズ設定 / 右 = 軌道プロット (2D|3D)
+        # → 下の画像編集と同時に全状況を見ながら操作できる
+        top_row = QHBoxLayout()
+        top_left = QVBoxLayout()
+        top_left.addWidget(self.apply_mode_group)
+        top_left.addWidget(self.gen_group)
+        top_left.addStretch()
+        top_row.addLayout(top_left, 1)
+        top_row.addWidget(self.live3d_group, 1)
+        t2_l.addLayout(top_row)
 
         cols = QHBoxLayout()
         cols.setSpacing(8)
@@ -1666,8 +1684,6 @@ class IMGTransApp(QWidget):
             cols.addWidget(box, 1)
         t2_l.addLayout(cols)
 
-        # 軌道プロット ライブプレビュー (3D | 2D) — タブ2の最下部
-        t2_l.addWidget(self.live3d_group)
 
         t2_l.addStretch()
         tabs.addTab(self._wrap_scroll(t2), tr("tab_images"))
@@ -1921,9 +1937,14 @@ class IMGTransApp(QWidget):
                 self.log(f"[WARN] auto-apply {t}: {e}")
 
     def _default_time_vmax(self):
-        """Time 画像 vmax の既定値 = 出力FPS × 時間方向サイズ。
-        ただし入力映像の総フレーム数を超える場合は総フレーム数に制限する。"""
-        v = self._out_fps() * self.gen_time_size.value()
+        """Time 画像 vmax の既定値 = 出力フレーム数 (時間方向サイズ)。
+
+        通常再生では出力1フレーム = 入力1フレームを参照するため、時間マップの
+        レンジは出力フレーム数そのもの (= 出力FPS × 出力秒数)。
+        入力映像の総フレーム数を超える場合は総フレーム数に制限する。
+        (旧実装は出力FPS×フレーム数で一桁大きかった)
+        """
+        v = self.gen_time_size.value()
         if self.dm is not None:
             v = min(v, int(self.dm.count))
         return v
