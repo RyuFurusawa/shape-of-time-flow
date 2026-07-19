@@ -61,10 +61,10 @@ if LANG not in ("ja", "en"):
 TR = {
     # Window / tabs
     "window_title": {"ja": "Shape of Time Flow", "en": "Shape of Time Flow"},
-    "tab_setup":   {"ja": "1. 入力 / Setup",     "en": "1. Setup"},
-    "tab_images":  {"ja": "2. 画像 / Images",     "en": "2. Images"},
-    "tab_preview": {"ja": "3. プレビュー / Preview", "en": "3. Preview"},
-    "tab_render":  {"ja": "4. 出力 / Render",     "en": "4. Render"},
+    "tab_main":    {"ja": "1. 入力・画像 / Setup & Images", "en": "1. Setup & Images"},
+    "tab_preview": {"ja": "2. プレビュー / Preview", "en": "2. Preview"},
+    "tab_render":  {"ja": "3. 出力 / Render",     "en": "3. Render"},
+    "grp_setup":   {"ja": "入力 (Setup)", "en": "Setup"},
     # Language selector
     "lang_label":  {"ja": "言語 / Language:",     "en": "Language / 言語:"},
     # Setup tab
@@ -138,7 +138,7 @@ TR = {
         "ja": "画像データをどう適用するかを選択してください:\n"
               "  time to data = Time 画像を「時間マップ」として適用\n"
               "  rate to data = Rate 画像を「再生レートマップ」として適用\n"
-              "選択して必要な画像が揃うと「3. プレビュー」「4. 出力」タブが使えるようになります。",
+              "選択して必要な画像が揃うと「2. プレビュー」「3. 出力」タブが使えるようになります。",
         "en": "Choose how the image data is applied:\n"
               "  time to data = apply the Time image as a time map\n"
               "  rate to data = apply the Rate image as a playback-rate map\n"
@@ -149,10 +149,10 @@ TR = {
     "live3d_waiting": {"ja": "(画像と適用方法が揃うと自動生成されます)",
                         "en": "(auto-generates once images & apply mode are set)"},
     "live3d_updating": {"ja": "更新中…", "en": "updating…"},
-    "lbl_apply_mode_info": {"ja": "適用方法: {m}   (変更は「2. 画像」タブ下部で)",
-                             "en": "Apply mode: {m}   (change at the bottom of the Images tab)"},
-    "status_need_mode": {"ja": "Status: 適用方法が未選択です (「2. 画像」タブ下部で選択)",
-                          "en": "Status: choose an apply mode (bottom of the Images tab)"},
+    "lbl_apply_mode_info": {"ja": "適用方法: {m}   (変更は「1. 入力・画像」タブで)",
+                             "en": "Apply mode: {m}   (change on the Setup & Images tab)"},
+    "status_need_mode": {"ja": "Status: 適用方法が未選択です (「1. 入力・画像」タブで選択)",
+                          "en": "Status: choose an apply mode (Setup & Images tab)"},
     "processing_wait": {"ja": "⏳ 演算中です — しばらくお待ちください…",
                          "en": "⏳ Processing — please wait…"},
     # Maneuver preview panel
@@ -1639,24 +1639,24 @@ class IMGTransApp(QWidget):
         self.tabs = QTabWidget()
         tabs = self.tabs
 
-        # --- Tab 1: 入力 (Setup) ---
-        t1 = QWidget(); t1_l = QVBoxLayout(t1)
-        t1_l.addLayout(self.lang_row)
+        # --- Tab 1: 入力 + 画像 (Setup & Images 統合) ---
+        # 上段 2 カラム: 左 = 入力(Setup) + 適用方法 + 共通サイズ設定 /
+        #               右 = 軌道プロット ライブプレビュー (2D|3D)
+        # 下段: Space / Time / Rate の 3 カラム。
+        # 1 画面で入力から画像編集まで全状況を見ながら操作できる。
+        setup_group = QGroupBox()
+        self._reg(lambda b=setup_group: b.setTitle(tr("grp_setup")))
+        sg_l = QVBoxLayout(setup_group)
+        sg_l.addLayout(self.lang_row)
         for w in [self.video_btn, self.video_label,
                   self.slit_toggle, self.slit_label,
                   self.init_btn, self.info_label]:
-            t1_l.addWidget(w)
-        t1_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t1), tr("tab_setup"))
+            sg_l.addWidget(w)
 
-        # --- Tab 2: 画像生成 + 選択 (Images) ---
-        # Space / Time / Rate を 3 カラム横並びで配置。
-        # 各カラム = QGroupBox: label + パラメータ + ジェネレータ (画像選択/生成設定)
         t2 = QWidget(); t2_l = QVBoxLayout(t2)
-        # 上段 2 カラム: 左 = 適用方法 + 共通サイズ設定 / 右 = 軌道プロット (2D|3D)
-        # → 下の画像編集と同時に全状況を見ながら操作できる
         top_row = QHBoxLayout()
         top_left = QVBoxLayout()
+        top_left.addWidget(setup_group)
         top_left.addWidget(self.apply_mode_group)
         top_left.addWidget(self.gen_group)
         top_left.addStretch()
@@ -1686,9 +1686,9 @@ class IMGTransApp(QWidget):
 
 
         t2_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t2), tr("tab_images"))
+        tabs.addTab(self._wrap_scroll(t2), tr("tab_main"))
 
-        # --- Tab 3: マニューバ プレビュー (Preview) ---
+        # --- Tab 2: リアルタイムプレビュー (Preview) ---
         t3 = QWidget(); t3_l = QVBoxLayout(t3)
         # リアルタイム GPU プレビュー (最上部に配置)
         if _HAS_RT_PREVIEW:
@@ -1707,7 +1707,7 @@ class IMGTransApp(QWidget):
         tabs.addTab(self._wrap_scroll(t3), tr("tab_preview"))
         tabs.currentChanged.connect(self._on_tab_changed)
 
-        # --- Tab 4: 出力 (Render) ---
+        # --- Tab 3: 出力 (Render) ---
         t4 = QWidget(); t4_l = QVBoxLayout(t4)
         for w in [self.apply_mode_info,
                   anim_label, self.anim_toggle,
@@ -1733,10 +1733,9 @@ class IMGTransApp(QWidget):
 
         # タブ見出しの再翻訳を登録
         self._reg(lambda: (
-            self.tabs.setTabText(0, tr("tab_setup")),
-            self.tabs.setTabText(1, tr("tab_images")),
-            self.tabs.setTabText(2, tr("tab_preview")),
-            self.tabs.setTabText(3, tr("tab_render")),
+            self.tabs.setTabText(0, tr("tab_main")),
+            self.tabs.setTabText(1, tr("tab_preview")),
+            self.tabs.setTabText(2, tr("tab_render")),
         ))
 
         # ===== ログは常時表示 (タブ外) =====
@@ -1819,11 +1818,9 @@ class IMGTransApp(QWidget):
     def _update_tab_gating(self):
         if not hasattr(self, "tabs"):
             return
-        initialized = self.dm is not None
         ready = self._pipeline_ready()
-        self.tabs.setTabEnabled(1, initialized)
-        self.tabs.setTabEnabled(2, ready)
-        self.tabs.setTabEnabled(3, ready)
+        self.tabs.setTabEnabled(1, ready)   # プレビュー
+        self.tabs.setTabEnabled(2, ready)   # 出力
         # 出力操作も同じ条件でゲート (レンダリング可能条件と一致)
         self.start_btn.setEnabled(ready)
         self.anim_toggle.setEnabled(ready)
@@ -2497,11 +2494,11 @@ class IMGTransApp(QWidget):
             self.slit_label.setText(tr("slit_h"))
 
     def _on_tab_changed(self, idx):
-        """プレビュータブ (index 2) を表示中だけリアルタイムプレビューを再生。"""
+        """プレビュータブ (index 1) を表示中だけリアルタイムプレビューを再生。"""
         rt = getattr(self, "rt_preview", None)
         if not rt:
             return
-        if idx == 2:
+        if idx == 1:
             rt.start()
         else:
             rt.stop()
@@ -2510,7 +2507,7 @@ class IMGTransApp(QWidget):
         mode = self._selected_apply_mode()
         if mode is None:
             QMessageBox.warning(self, "Error",
-                                "適用方法を「2. 画像」タブ下部で選択してください。")
+                                "適用方法を「1. 入力・画像」タブで選択してください。")
             return
         # ライブ3D生成が走っていたら完了を待つ (dm 共有のため並走させない)
         if self._live3d_busy and self._live3d_worker is not None:
