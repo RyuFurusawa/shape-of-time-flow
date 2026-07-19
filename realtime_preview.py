@@ -23,7 +23,7 @@ import cv2
 
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QDoubleSpinBox, QSlider, QProgressBar,
+    QDoubleSpinBox, QSlider, QProgressBar, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent
 from PyQt5.QtGui import QImage, QPixmap
@@ -464,6 +464,10 @@ class RealtimePreviewWidget(QWidget):
         self.view = QLabel(self._t("placeholder"))
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setMinimumSize(480, 270)
+        # sizeHint を無視させ「pixmap サイズ → レイアウト拡大 → 更に大きく描画」の
+        # フィードバックループを断つ (縦長映像で画面が少しずつ伸びる問題の対策)。
+        # 表示領域は固定で、縦長映像はサイドに黒みが入るレターボックス表示になる。
+        self.view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.view.setStyleSheet(
             "QLabel { background: #111; color: #888; border: 1px solid #555; }")
         v.addWidget(self.view, 1)

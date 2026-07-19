@@ -144,8 +144,8 @@ TR = {
               "  rate to data = apply the Rate image as a playback-rate map\n"
               "Selecting this (with the required images set) unlocks the Preview / Render tabs.",
     },
-    "grp_live3d": {"ja": "3D軌道 ライブプレビュー (自動更新)",
-                    "en": "3D Trajectory Live Preview (auto)"},
+    "grp_live3d": {"ja": "軌道プロット ライブプレビュー (3D / 2D 自動更新)",
+                    "en": "Trajectory Plots Live Preview (3D / 2D, auto)"},
     "live3d_waiting": {"ja": "(画像と適用方法が揃うと自動生成されます)",
                         "en": "(auto-generates once images & apply mode are set)"},
     "live3d_updating": {"ja": "更新中…", "en": "updating…"},
@@ -1231,6 +1231,9 @@ class IMGTransApp(QWidget):
         self._i18n.append(lambda: (None if self.space_img_path else self.space_label.setText(tr("no_space_image"))))
         self._i18n.append(lambda: (None if self.time_img_path else self.time_label.setText(tr("no_time_image"))))
         self._i18n.append(lambda: (None if self.rate_img_path else self.rate_label.setText(tr("no_rate_image"))))
+        # ライブプロットのプレースホルダ (未生成時のみ訳し直す)
+        self._i18n.append(lambda: (None if self._live3d_movie else self.live3d_label.setText(tr("live3d_waiting"))))
+        self._i18n.append(lambda: (None if (self.live2d_label.pixmap() and not self.live2d_label.pixmap().isNull()) else self.live2d_label.setText(tr("live3d_waiting"))))
 
         self.update_ui_state("initial")
 
@@ -1491,21 +1494,31 @@ class IMGTransApp(QWidget):
         am_v.addLayout(am_row)
         self.apply_mode_group.setVisible(False)  # Initialize 後に表示
 
-        # ===== 3D軌道 ライブプレビュー (適用方法の横・自動更新) =====
+        # ===== 軌道プロット ライブプレビュー (3D | 2D の2カラム・自動更新) =====
         # 画像/パラメータ/適用方法を編集するたびにデバウンス後、軽量設定で
-        # maneuver_3dplot → GIF を再生成して表示する。
+        # maneuver_3dplot (GIF) + maneuver_2dplot (PNG) を再生成して表示する。
         self.live3d_group = QGroupBox()
         self._reg(lambda: self.live3d_group.setTitle(tr("grp_live3d")))
-        l3_v = QVBoxLayout(self.live3d_group)
+        l3_outer = QVBoxLayout(self.live3d_group)
+        l3_cols = QHBoxLayout()
+        # 左: 3D GIF
         self.live3d_label = QLabel(tr("live3d_waiting"))
         self.live3d_label.setAlignment(Qt.AlignCenter)
-        self.live3d_label.setMinimumSize(320, 200)
+        self.live3d_label.setMinimumSize(320, 220)
         self.live3d_label.setStyleSheet(
             "QLabel { background: #222; color: #888; border: 1px solid #555; }")
-        l3_v.addWidget(self.live3d_label)
+        l3_cols.addWidget(self.live3d_label, 1)
+        # 右: 2D プロット PNG
+        self.live2d_label = QLabel(tr("live3d_waiting"))
+        self.live2d_label.setAlignment(Qt.AlignCenter)
+        self.live2d_label.setMinimumSize(320, 220)
+        self.live2d_label.setStyleSheet(
+            "QLabel { background: #ffffff; color: #888; border: 1px solid #555; }")
+        l3_cols.addWidget(self.live2d_label, 1)
+        l3_outer.addLayout(l3_cols)
         self.live3d_status = QLabel("")
         self.live3d_status.setStyleSheet("color: gray; font-size: 11px;")
-        l3_v.addWidget(self.live3d_status)
+        l3_outer.addWidget(self.live3d_status)
         self.live3d_group.setVisible(False)      # Initialize 後に表示
 
         # ===== マニューバ プレビュー (Time+Space or Rate+Space 揃った時点で確認) =====
@@ -1630,7 +1643,8 @@ class IMGTransApp(QWidget):
         # Space / Time / Rate を 3 カラム横並びで配置。
         # 各カラム = QGroupBox: label + パラメータ + ジェネレータ (画像選択/生成設定)
         t2 = QWidget(); t2_l = QVBoxLayout(t2)
-        t2_l.addWidget(self.gen_group)  # 共通サイズ設定
+        t2_l.addWidget(self.apply_mode_group)   # 適用方法 (必須) — 画像操作の上
+        t2_l.addWidget(self.gen_group)          # 共通サイズ設定
 
         cols = QHBoxLayout()
         cols.setSpacing(8)
@@ -1652,11 +1666,8 @@ class IMGTransApp(QWidget):
             cols.addWidget(box, 1)
         t2_l.addLayout(cols)
 
-        # 適用方法 (必須) + 3D軌道ライブプレビュー — タブ2の最下部に横並び
-        bottom_row = QHBoxLayout()
-        bottom_row.addWidget(self.apply_mode_group, 1)
-        bottom_row.addWidget(self.live3d_group, 1)
-        t2_l.addLayout(bottom_row)
+        # 軌道プロット ライブプレビュー (3D | 2D) — タブ2の最下部
+        t2_l.addWidget(self.live3d_group)
 
         t2_l.addStretch()
         tabs.addTab(self._wrap_scroll(t2), tr("tab_images"))
@@ -1673,7 +1684,9 @@ class IMGTransApp(QWidget):
             t3_l.addWidget(self.rt_group)
         else:
             self.rt_preview = None
-        t3_l.addWidget(self.preview_group)
+        # 2D/3D 軌道プロットは「2. 画像」タブのライブプレビューへ完全移行。
+        # このタブは動画のリアルタイムプレビュー専用 (preview_group は非表示のまま
+        # 保持し、内部ロジック互換のためウィジェットだけ残す)。
         t3_l.addStretch()
         tabs.addTab(self._wrap_scroll(t3), tr("tab_preview"))
         tabs.currentChanged.connect(self._on_tab_changed)
@@ -1754,9 +1767,9 @@ class IMGTransApp(QWidget):
             self.gen_group.setVisible(True)
             self.apply_mode_group.setVisible(True)
             self.live3d_group.setVisible(True)
-            self.preview_group.setVisible(True)
             self.preview_btn.setEnabled(False)  # 適用方法+画像が揃うまで無効
             self._apply_video_defaults()
+            self._auto_apply_normal_maps()
             self._update_preview_btn_state()
         elif stage == "rendered":
             self.animonly_btn.setEnabled(True)
@@ -1894,21 +1907,33 @@ class IMGTransApp(QWidget):
         v = self.gen_out_fps.currentData()
         return int(v) if v else 30
 
+    def _auto_apply_normal_maps(self):
+        """Initialize 直後、通常再生グラデーションを Space/Time/Rate に自動適用する。
+
+        以後レイヤーを編集してもプレビューが変わるだけで、Generate & Apply を
+        押すまで適用画像は上書きされない (適用されれば 3D/2D ライブプロットも
+        自動更新される)。
+        """
+        for t in ("space", "time", "rate"):
+            try:
+                self.generate_sample_image_action(t)
+            except Exception as e:
+                self.log(f"[WARN] auto-apply {t}: {e}")
+
     def _default_time_vmax(self):
-        """Time 画像 vmax の既定値 = 出力FPS × 時間方向サイズ"""
-        return self._out_fps() * self.gen_time_size.value()
+        """Time 画像 vmax の既定値 = 出力FPS × 時間方向サイズ。
+        ただし入力映像の総フレーム数を超える場合は総フレーム数に制限する。"""
+        v = self._out_fps() * self.gen_time_size.value()
+        if self.dm is not None:
+            v = min(v, int(self.dm.count))
+        return v
 
     def _maybe_update_time_defaults(self, *_):
-        """時間方向サイズ / 出力FPS 変更時、ユーザーが手で編集していなければ
-        Time の vmin/vmax 既定値 (0 .. FPS×時間方向サイズ) を追従させる。"""
+        """時間方向サイズ / 出力FPS の変更を Time の vmin/vmax に即座に反映する。"""
         if not self.dm:
             return
-        new_default = (0, self._default_time_vmax())
-        cur = (self.time_vmin_spin.value(), self.time_vmax_spin.value())
-        if cur == getattr(self, "_last_time_default", None):
-            self.time_vmin_spin.setValue(new_default[0])
-            self.time_vmax_spin.setValue(new_default[1])
-        self._last_time_default = new_default
+        self.time_vmin_spin.setValue(0)
+        self.time_vmax_spin.setValue(self._default_time_vmax())
 
     def _sync_rt_timeline(self, *_):
         """時間方向サイズ / 出力FPS をリアルタイムプレビューのタイムラインへ反映"""
@@ -2292,13 +2317,21 @@ class IMGTransApp(QWidget):
             self.rate_baseline_spin.value(),
             self.rate_startpoint_spin.value(),
             anim_frames=10, anim_fps=8, anim_dpi=55,
-            skip_2d=True,
+            skip_2d=False,   # 2D プロットもライブ表示する (タブ2へ完全移行)
         )
         self._live3d_worker.done_signal.connect(self._on_live3d_done)
         self._live3d_worker.start()
 
-    def _on_live3d_done(self, success, _plot2d, gif):
+    def _on_live3d_done(self, success, plot2d, gif):
         self._live3d_busy = False
+        # 2D プロット (右カラム)
+        if success and plot2d and os.path.exists(plot2d):
+            pix = QPixmap()
+            pix.load(plot2d)
+            if not pix.isNull():
+                self.live2d_label.setPixmap(pix.scaled(
+                    self.live2d_label.width(), self.live2d_label.height(),
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation))
         if success and gif and os.path.exists(gif):
             if self._live3d_movie is not None:
                 try:
