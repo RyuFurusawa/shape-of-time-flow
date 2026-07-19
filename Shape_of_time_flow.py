@@ -26,7 +26,8 @@ from PyQt5.QtWidgets import (
     QProgressBar
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QMovie, QImageReader
+from PyQt5.QtGui import (QImage, QPixmap, QMovie, QImageReader,
+                         QPainter, QPen, QColor)
 
 # 動画の内蔵再生 (QtMultimedia) は環境により無い場合があるため防御的に import
 try:
@@ -1199,6 +1200,77 @@ class ManeuverPreviewWorker(QThread):
             self.done_signal.emit(False, "", "")
 
 
+# ======== 適用済みマップのサムネイル (再生位置の赤ライン付き) ========
+class MapThumb(QLabel):
+    """適用済みの space/time/rate マップを小さく表示し、3D アニメの再生位置を
+    赤いラインで重ねるサムネイル。
+
+    - 縦スリット (sd=1): マップの時間軸は縦 → 水平の赤ラインが上下に動く
+    - 横スリット (sd=0): マップの時間軸は横 → 垂直の赤ラインが左右に動く
+    """
+
+    def __init__(self, caption=""):
+        super().__init__()
+        self._src = None            # 元画像 QPixmap
+        self._base = None           # ラベルサイズに合わせた縮小キャッシュ
+        self._frac = None           # 再生位置 [0,1) / None = 非表示
+        self._time_vertical = True
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedHeight(110)
+        self.setMinimumWidth(100)
+        self.setStyleSheet(
+            "QLabel { background: #222; border: 1px solid #555;"
+            " color: #777; font-size: 10px; }")
+        self.setText(caption)
+
+    def set_time_vertical(self, vertical):
+        self._time_vertical = bool(vertical)
+        self._recompose()
+
+    def set_map(self, path):
+        pm = QPixmap()
+        if path and os.path.exists(path) and pm.load(path):
+            self._src = pm
+        else:
+            self._src = None
+        self._rescale()
+
+    def set_playhead(self, frac):
+        self._frac = frac
+        self._recompose()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._rescale()
+
+    def _rescale(self):
+        if self._src is None:
+            self._base = None
+            return
+        self._base = self._src.scaled(
+            max(10, self.width() - 2), max(10, self.height() - 2),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._recompose()
+
+    def _recompose(self):
+        if self._base is None:
+            return
+        pm = QPixmap(self._base)
+        if self._frac is not None:
+            p = QPainter(pm)
+            pen = QPen(QColor(255, 40, 40))
+            pen.setWidth(2)
+            p.setPen(pen)
+            if self._time_vertical:
+                y = int(self._frac * (pm.height() - 1))
+                p.drawLine(0, y, pm.width(), y)
+            else:
+                x = int(self._frac * (pm.width() - 1))
+                p.drawLine(x, 0, x, pm.height())
+            p.end()
+        self.setPixmap(pm)
+
+
 # ======== Main GUI ========
 class IMGTransApp(QWidget):
     def __init__(self):
@@ -1322,7 +1394,10 @@ class IMGTransApp(QWidget):
         self.lang_row = lang_row
 
         # --- Video file ---
+        # パス表示は小さめ (左カラムを圧迫しないように)
         self.video_label = QLabel(tr("no_video"))
+        self.video_label.setWordWrap(True)
+        self.video_label.setStyleSheet("color: gray; font-size: 10px;")
         self.video_btn = QPushButton()
         self._reg(lambda: self.video_btn.setText(tr("btn_select_video")))
         self.video_btn.clicked.connect(self.select_video)
@@ -1339,6 +1414,8 @@ class IMGTransApp(QWidget):
         self._reg(lambda: self.init_btn.setText(tr("btn_initialize")))
         self.init_btn.clicked.connect(self.initialize_drawmaneuver)
         self.info_label = QLabel(tr("video_not_init"))
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("color: gray; font-size: 10px;")
 
         # ===== 共通サイズ設定 (Space/Time/Rate で共有) =====
         # img_to_maneuver は space と time/rate 画像の形状一致を要求するため、サイズは共有。
@@ -1526,6 +1603,24 @@ class IMGTransApp(QWidget):
             "QLabel { background: #222; color: #888; border: 1px solid #555; }")
         l3_cols.addWidget(self.live3d_label, 4)
         l3_outer.addLayout(l3_cols)
+
+        # 適用済みマップ 3 枚のサムネイル (3D アニメの再生位置を赤ラインで表示)
+        self._map_thumbs = {}
+        thumb_row = QHBoxLayout()
+        thumb_row.setSpacing(6)
+        for t, cap in (("space", "Space"), ("time", "Time"), ("rate", "Rate")):
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            cap_lbl = QLabel(cap)
+            cap_lbl.setStyleSheet("color: gray; font-size: 10px;")
+            cap_lbl.setAlignment(Qt.AlignCenter)
+            col.addWidget(cap_lbl)
+            th = MapThumb(cap)
+            self._map_thumbs[t] = th
+            col.addWidget(th)
+            thumb_row.addLayout(col, 1)
+        l3_outer.addLayout(thumb_row)
+
         self.live3d_status = QLabel("")
         self.live3d_status.setStyleSheet("color: gray; font-size: 11px;")
         l3_outer.addWidget(self.live3d_status)
@@ -1661,7 +1756,7 @@ class IMGTransApp(QWidget):
         top_left.addWidget(self.gen_group)
         top_left.addStretch()
         top_row.addLayout(top_left, 1)
-        top_row.addWidget(self.live3d_group, 1)
+        top_row.addWidget(self.live3d_group, 3)   # シミュレーション側を幅 3/4 に
         t2_l.addLayout(top_row)
 
         cols = QHBoxLayout()
@@ -1852,6 +1947,10 @@ class IMGTransApp(QWidget):
         """drawManeuver 初期化直後に、スピンボックスの既定値を映像情報から賢く設定する"""
         if not self.dm:
             return
+        # マップサムネイルの時間軸向き (縦スリット=縦 / 横スリット=横)
+        sd = int(getattr(self.dm, "scan_direction", 1))
+        for th in getattr(self, "_map_thumbs", {}).values():
+            th.set_time_vertical(sd == 1)
         # 共通サイズ
         self.gen_scan_size.setValue(int(self.dm.scan_nums))
         self.gen_time_size.setValue(900)
@@ -2369,6 +2468,7 @@ class IMGTransApp(QWidget):
                         max(1, int(native.width() * scale)),
                         max(1, int(native.height() * scale))))
                 self.live3d_label.setMovie(movie)
+                movie.frameChanged.connect(self._on_live3d_frame)
                 movie.start()
                 self._live3d_movie = movie
             self.live3d_status.setText("")
@@ -2378,6 +2478,16 @@ class IMGTransApp(QWidget):
         if self._live3d_pending:
             self._live3d_pending = False
             self._schedule_live3d()
+
+    def _on_live3d_frame(self, frame_idx):
+        """3D アニメの再生位置をマップサムネイルの赤ラインに同期させる。"""
+        movie = self._live3d_movie
+        if movie is None:
+            return
+        n = max(1, movie.frameCount())
+        frac = (frame_idx + 0.5) / n
+        for th in getattr(self, "_map_thumbs", {}).values():
+            th.set_playhead(frac)
 
     def generate_sample_image_action(self, type_name):
         """セクション {type_name} のジェネレータ設定でサンプル画像を生成 → 自動セット"""
@@ -2429,6 +2539,9 @@ class IMGTransApp(QWidget):
     def _wire_loaded_image(self, img_type, path):
         """select_image() の "画像情報表示 + パラメータ抽出 + プレビュー" 共通処理"""
         getattr(self, f"{img_type}_label").setText(f"Selected: {path}")
+        # ライブプロット下の適用済みマップサムネイルを更新
+        if img_type in getattr(self, "_map_thumbs", {}):
+            self._map_thumbs[img_type].set_map(path)
         try:
             with Image.open(path) as img:
                 width, height = img.size
