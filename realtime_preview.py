@@ -127,30 +127,36 @@ def decode_volume_progressive(video_path, sw, sh, F, batch_cb,
     cap.release()
 
 
-def load_map01(path, ow, oh, default="gray", transpose=False):
-    """マップ PNG を出力解像度 (ow, oh) の float32 [0,1] にして返す。
+MAP_T_RES = 512   # マップの時間軸解像度 (行)
+MAP_S_RES = 512   # マップのスキャン軸解像度 (列)
 
-    transpose=True: 横スリット (sd=0) 用。マップファイルは (scan, time) 形状で
-    保存されているため (img_to_maneuver が .T で読む規約)、ビデオ座標系に
-    合わせて転置してからリサイズする。default のランプはビデオ座標系で
-    直接生成するので転置しない。
+
+def load_map_data(path, sd, kind, t_res=MAP_T_RES, s_res=MAP_S_RES):
+    """マップ PNG を img_to_maneuver と同一のデータ座標系で返す (0..1 float32)。
+
+    データ座標系 = (time 行 × scan 列)。
+    ファイル形状は sd=1: (time, scan) → そのまま / sd=0: (scan, time) → .T
+    (img_to_maneuver の読み込み規約と完全に一致させる)。
+    ファイルが無い場合は「通常再生」をデータ座標系で直接生成する:
+        space = scan 軸ランプ (列方向 0→1) / time = 時間軸ランプ (行方向 0→1)
+        rate  = 0.5 均一
     """
     m = None
     if path and os.path.exists(path):
         m = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if m is None:
-        if default == "h":       # 左→右 ramp
-            return np.tile(np.linspace(0, 1, ow, dtype=np.float32), (oh, 1))
-        if default == "v":       # 上→下 ramp
-            return np.tile(np.linspace(0, 1, oh, dtype=np.float32)[:, None], (1, ow))
-        return np.full((oh, ow), 0.5, np.float32)   # gray (rate normal)
-    if m.ndim == 3:
-        m = m[..., 0]
-    if transpose:
-        m = m.T
-    m = cv2.resize(m, (ow, oh), interpolation=cv2.INTER_LINEAR)
-    mx = 65535.0 if m.dtype == np.uint16 else 255.0
-    return np.ascontiguousarray(m.astype(np.float32) / mx)
+    if m is not None:
+        if m.ndim == 3:
+            m = m[..., 0]
+        if int(sd) == 0:
+            m = m.T
+        m = cv2.resize(m, (s_res, t_res), interpolation=cv2.INTER_LINEAR)
+        mx = 65535.0 if m.dtype == np.uint16 else 255.0
+        return np.ascontiguousarray(m.astype(np.float32) / mx)
+    if kind == "space":
+        return np.tile(np.linspace(0, 1, s_res, dtype=np.float32), (t_res, 1))
+    if kind == "time":
+        return np.tile(np.linspace(0, 1, t_res, dtype=np.float32)[:, None], (1, s_res))
+    return np.full((t_res, s_res), 0.5, np.float32)
 
 
 # ---- uniform 構造 (16byte 整列) ----
@@ -158,22 +164,25 @@ def load_map01(path, ow, oh, default="gray", transpose=False):
 _PARAMS_DTYPE = np.dtype({
     "names": ["F", "OW", "OH", "srcW", "mode", "playhead", "span",
               "baseline", "maxdev", "sd", "srcH", "ph01",
-              "vr0", "vr1", "_p0", "_p1"],
+              "sscale", "mapW", "mapH", "_p2"],
     "formats": ["<u4", "<u4", "<u4", "<u4", "<u4", "<f4", "<f4",
                 "<f4", "<f4", "<u4", "<u4", "<f4",
-                "<f4", "<f4", "<f4", "<f4"],
+                "<f4", "<u4", "<u4", "<f4"],
 })
 
 _WGSL = """
 // 書き出し (img_to_maneuver) と同じ意味論:
-//   マップの定義域は (出力時間 × スキャン位置)。
-//   出力タイムライン上の現在位置 ph01 がマップの時間軸を消費し、
-//   1 フレーム内の変化はスキャン軸に沿ってのみ現れる。
-//   time マップ値は vrange [vr0, vr1] の絶対入力フレーム (常駐単位)。
+//   マップは img_to_maneuver と同一のデータ座標系 (time 行 × scan 列)。
+//   出力タイムライン上の現在位置 ph01 が時間軸 (行) を消費し、
+//   1 フレーム内の変化はスキャン軸 (列) に沿ってのみ現れる。
+//   time / rate マップは CPU 側で「絶対入力フレーム→常駐単位」に変換済み
+//   (rate は書き出しと同じ累積積分 + zPointCheck 再現込み)。
+//   sscale = (space_set-1)/(スキャン軸の元解像度-1)。
+//   書き出しは最近傍フレーム参照なので補間も最近傍。
 struct P { F:u32, OW:u32, OH:u32, srcW:u32, mode:u32,
            playhead:f32, span:f32, baseline:f32, maxdev:f32,
            sd:u32, srcH:u32, ph01:f32,
-           vr0:f32, vr1:f32, _p0:f32, _p1:f32 };
+           sscale:f32, mapW:u32, mapH:u32, _p2:f32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var vol: texture_2d_array<f32>;
 @group(0) @binding(2) var smap: texture_2d<f32>;
@@ -185,18 +194,20 @@ struct P { F:u32, OW:u32, OH:u32, srcW:u32, mode:u32,
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= p.OW || gid.y >= p.OH) { return; }
 
-  // マップ参照座標: 時間軸 = ph01 (再生ヘッド)、スキャン軸 = 画素のスキャン座標。
-  // マップはビデオ座標系でアップロード済み:
-  //   縦スリット(sd=1): 時間軸=縦(y), スキャン軸=横(x)
-  //   横スリット(sd=0): 時間軸=横(x), スキャン軸=縦(y)
-  var muv: vec2<i32>;
+  // 画素のスキャン座標 (0..1): 縦スリット=横位置 / 横スリット=縦位置
+  var scan01: f32;
   if (p.sd == 1u) {
-    muv = vec2<i32>(i32(gid.x), i32(p.ph01 * f32(p.OH - 1u)));
+    scan01 = f32(gid.x) / f32(max(p.OW - 1u, 1u));
   } else {
-    muv = vec2<i32>(i32(p.ph01 * f32(p.OW - 1u)), i32(gid.y));
+    scan01 = f32(gid.y) / f32(max(p.OH - 1u, 1u));
   }
+  // マップ参照: 列 = スキャン座標, 行 = ph01 (出力時間)
+  let muv = vec2<i32>(
+      i32(scan01 * f32(p.mapW - 1u)),
+      i32(p.ph01 * f32(p.mapH - 1u)));
 
-  let s = clamp(textureLoad(smap, muv, 0).r, 0.0, 1.0);
+  // space: 0..1 → space_set スケール (書き出しの s01*(space_range-1) 相当)
+  let s = clamp(clamp(textureLoad(smap, muv, 0).r, 0.0, 1.0) * p.sscale, 0.0, 1.0);
   var sx: i32;
   var sy: i32;
   if (p.sd == 1u) {
@@ -209,25 +220,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     sy = i32(s * f32(p.srcH - 1u));
   }
 
+  // time / rate とも「常駐単位の絶対入力フレーム」がそのまま入っている
   var srcF: f32;
   if (p.mode == 0u) {
-    // time マップ = vrange の絶対入力フレーム (常駐単位に換算済み)
-    let t = clamp(textureLoad(tmap, muv, 0).r, 0.0, 1.0);
-    srcF = p.vr0 + t * (p.vr1 - p.vr0);
+    srcF = textureLoad(tmap, muv, 0).r;
   } else {
-    let r = textureLoad(rmap, muv, 0).r;
-    let rate = p.baseline + (r - 0.5) * 2.0 * p.maxdev;
-    srcF = p.playhead * rate;
-    let Ff = f32(p.F);
-    srcF = srcF - floor(srcF / Ff) * Ff;        // rate はループ再生
+    srcF = textureLoad(rmap, muv, 0).r;
   }
   srcF = clamp(srcF, 0.0, f32(p.F - 1u));
-  let f0 = i32(floor(srcF));
-  let f1 = min(f0 + 1, i32(p.F) - 1);
-  let fr = srcF - floor(srcF);
-  let c0 = textureLoad(vol, vec2<i32>(sx, sy), f0, 0);
-  let c1 = textureLoad(vol, vec2<i32>(sx, sy), f1, 0);
-  let c = mix(c0, c1, fr);
+  let f0 = i32(round(srcF));      // 最近傍 (書き出しと同じ)
+  let c = textureLoad(vol, vec2<i32>(sx, sy), f0, 0);
   outbuf[gid.y * p.OW + gid.x] = pack4x8unorm(vec4<f32>(c.rgb, 1.0));
 }
 """
@@ -362,39 +364,28 @@ class _NumpyBackend:
         ow, oh = self._dims
         sd = int(params["sd"])
         ph01 = float(params["ph01"])
-        # マップは (出力時間 × スキャン) 定義域。時間軸は ph01 でスライスし、
-        # スキャン軸のみ画素に展開する (書き出しと同じ意味論)。
+        sscale = float(params["sscale"])
+        # マップはデータ座標系 (time 行 × scan 列)。行 = ph01 でスライスし、
+        # 列 (スキャン軸) を画素のスキャン座標へ展開する (書き出しと同じ意味論)。
+        zmap = self._maps["time"] if int(params["mode"]) == 0 else self._maps["rate"]
+        mh, mw = zmap.shape
+        row = int(round(ph01 * (mh - 1)))
+        s_row = self._maps["space"][row, :]
+        z_row = zmap[row, :]
         if sd == 1:
-            row = int(round(ph01 * (oh - 1)))
-            s_line = np.clip(self._maps["space"][row, :], 0.0, 1.0)   # (ow,)
-            t_line = np.clip(self._maps["time"][row, :], 0.0, 1.0)
-            r_line = self._maps["rate"][row, :]
+            cols = (np.arange(ow) * (mw - 1) / max(1, ow - 1)).astype(np.int32)
+            s_line = np.clip(np.clip(s_row[cols], 0.0, 1.0) * sscale, 0.0, 1.0)
             ix = np.broadcast_to((s_line * (W - 1)).astype(np.int32)[None, :], (oh, ow))
             iy = np.broadcast_to(self._yy, (oh, ow))
-            t01 = np.broadcast_to(t_line[None, :], (oh, ow))
-            r01 = np.broadcast_to(r_line[None, :], (oh, ow))
+            srcF = np.broadcast_to(z_row[cols][None, :], (oh, ow))
         else:
-            col = int(round(ph01 * (ow - 1)))
-            s_line = np.clip(self._maps["space"][:, col], 0.0, 1.0)   # (oh,)
-            t_line = np.clip(self._maps["time"][:, col], 0.0, 1.0)
-            r_line = self._maps["rate"][:, col]
+            cols = (np.arange(oh) * (mw - 1) / max(1, oh - 1)).astype(np.int32)
+            s_line = np.clip(np.clip(s_row[cols], 0.0, 1.0) * sscale, 0.0, 1.0)
             ix = np.broadcast_to(np.arange(ow)[None, :], (oh, ow))
             iy = np.broadcast_to((s_line * (H - 1)).astype(np.int32)[:, None], (oh, ow))
-            t01 = np.broadcast_to(t_line[:, None], (oh, ow))
-            r01 = np.broadcast_to(r_line[:, None], (oh, ow))
-        if int(params["mode"]) == 0:
-            vr0 = float(params["vr0"]); vr1 = float(params["vr1"])
-            srcF = vr0 + t01 * (vr1 - vr0)
-        else:
-            rate = float(params["baseline"]) + (r01 - 0.5) * 2.0 * float(params["maxdev"])
-            srcF = np.mod(float(params["playhead"]) * rate, F)
-        srcF = np.clip(srcF, 0, F - 1)
-        f0 = np.floor(srcF).astype(np.int32)
-        f1 = np.minimum(f0 + 1, F - 1)
-        fr = (srcF - f0)[..., None]
-        c0 = vol[f0, iy, ix, :3].astype(np.float32)
-        c1 = vol[f1, iy, ix, :3].astype(np.float32)
-        return (c0 * (1 - fr) + c1 * fr).astype(np.uint8)
+            srcF = np.broadcast_to(z_row[cols][:, None], (oh, ow))
+        f0 = np.clip(np.round(srcF), 0, F - 1).astype(np.int32)   # 最近傍 (書き出しと同じ)
+        return vol[f0, iy, ix, :3].copy()
 
 
 class _DecodeWorker(threading.Thread):
@@ -439,6 +430,7 @@ class RealtimePreviewWidget(QWidget):
         self.vmax = 100
         self.baseline = 1.0
         self.maxdev = 0.5
+        self.rec_fps = 30.0    # 入力動画の実FPS (rate 累積積分の frame_step 用)
 
         self._backend = None
         self._gpu = None       # _WgpuBackend のキャッシュ (device 再利用)
@@ -617,7 +609,9 @@ class RealtimePreviewWidget(QWidget):
 
     def set_params(self, mode=None, space_set=None, vmin=None, vmax=None,
                    baseline=None, maxdev=None, time_size=None, out_fps=None,
-                   sd=None):
+                   sd=None, rec_fps=None):
+        if rec_fps is not None and float(rec_fps) > 0:
+            self.rec_fps = float(rec_fps)
         if sd is not None and int(sd) in (0, 1) and int(sd) != self.scan_direction:
             self.scan_direction = int(sd)
             # マップの向き (転置/デフォルトランプ) が変わるため再アップロード
@@ -708,6 +702,7 @@ class RealtimePreviewWidget(QWidget):
         self._F = F
         self._srcW, self._srcH = sw, sh
         self._total_in = max(1, total)     # vrange→常駐単位の換算に使用
+        self._in_w, self._in_h = in_w, in_h   # space_set スケールの基準解像度
         self._dims = (ow, oh)
         self._loaded = 0
         self._vol_mb = sw * sh * 4 * F / 1e6
@@ -770,21 +765,67 @@ class RealtimePreviewWidget(QWidget):
             "ready", sw=self._srcW, sh=self._srcH, F=self._F,
             mb=self._vol_mb, kind=self._backend_kind()))
 
-    def _upload_maps(self, be, ow, oh):
-        """3 マップをスリット方向に応じた向きでバックエンドへ転送する。
+    def _z_adjust_array(self, z):
+        """zPointCheck (書き出し側) と同じ範囲調整を再現する。
 
-        縦スリット (sd=1): ファイル形状 (time, scan) がビデオ座標と一致 → そのまま。
-            通常再生の既定: space=左→右 ramp, time=上→下 ramp
-        横スリット (sd=0): ファイル形状 (scan, time) → ビデオ座標へ転置が必要。
-            通常再生の既定: space=上→下 ramp, time=左→右 ramp
+        - 最小値 < 0 → 0 までスライド
+        - 最大値 > 総フレーム数 → (差分 < 最小値ならスライド / それ以外は
+          最小値を 0 に寄せてから最大値=総フレーム数になるようスケーリング)
         """
-        vertical = (self.scan_direction == 1)
-        tp = not vertical
-        sp_def = "h" if vertical else "v"
-        tm_def = "v" if vertical else "h"
-        be.set_map("space", load_map01(self.space_path, ow, oh, default=sp_def, transpose=tp))
-        be.set_map("time", load_map01(self.time_path, ow, oh, default=tm_def, transpose=tp))
-        be.set_map("rate", load_map01(self.rate_path, ow, oh, default="gray", transpose=tp))
+        count = float(max(1, getattr(self, "_total_in", 1)))
+        mn, mx = float(z.min()), float(z.max())
+        if mn < 0:
+            z = z - mn
+            mx -= mn
+            mn = 0.0
+        if mx > count:
+            diff = mx - count
+            if diff < mn:
+                z = z - diff
+            else:
+                z = z - mn
+                mx2 = mx - mn
+                if mx2 > 0:
+                    z = z * (count / mx2)
+        return z
+
+    def _resident_scale(self):
+        """絶対入力フレーム → 常駐ボリューム index への換算係数。"""
+        F = self._F or 1
+        total = max(2, getattr(self, "_total_in", 1))
+        return (F - 1) / (total - 1)
+
+    def _upload_maps(self, be, ow, oh):
+        """3 マップをバックエンドへ転送する。
+
+        すべて img_to_maneuver と同一のデータ座標系 (time 行 × scan 列) で保持し、
+        書き出しと同じ式で time / rate を「絶対入力フレームのマップ」へ変換して
+        から常駐単位に換算する。シェーダは (scan, ph01) でマップを引くだけになり、
+        軌道・タイミングが書き出しと一致する。
+        """
+        sd = self.scan_direction
+        scale = self._resident_scale()
+
+        # space は 0..1 のまま (space_set スケールはシェーダ側 sscale で適用)
+        be.set_map("space", load_map_data(self.space_path, sd, "space"))
+
+        # time: 値 = vmin + t01*(vmax-vmin) の絶対入力フレーム → zPointCheck → 常駐単位
+        t01 = load_map_data(self.time_path, sd, "time")
+        t_abs = self.vmin + t01 * (self.vmax - self.vmin)
+        t_abs = self._z_adjust_array(t_abs)
+        be.set_map("time", (t_abs * scale).astype(np.float32))
+
+        # rate: 書き出しと同じ累積積分
+        #   cumulative[t] = Σ_{k<t} rate[k] * (recfps/outfps)
+        # を時間軸 (行) に沿って再現 (行数差は time_size/n で補正)
+        r01 = load_map_data(self.rate_path, sd, "rate")
+        rates = self.baseline + (r01 - 0.5) * 2.0 * self.maxdev
+        frame_step = float(self.rec_fps) / max(1, self.out_fps)
+        n = rates.shape[0]
+        cum = np.cumsum(rates, axis=0) * frame_step * (self.time_size / max(1, n))
+        cum = np.vstack([np.zeros((1, cum.shape[1]), cum.dtype), cum[:-1]])
+        cum = self._z_adjust_array(cum)
+        be.set_map("rate", (cum * scale).astype(np.float32))
 
     def refresh_maps(self):
         """マップだけ差し替え (ボリューム再デコードなし)。"""
@@ -825,11 +866,18 @@ class RealtimePreviewWidget(QWidget):
         p["sd"] = int(self.scan_direction)
         p["srcH"] = self._srcH
         # 出力タイムライン上の正規化再生位置 (マップの時間軸スライスに使用)
-        p["ph01"] = float(self._t_out) / max(1, self.time_size)
-        # vrange [vmin, vmax] (入力フレーム) → 常駐ボリューム単位に換算
-        total = max(1, getattr(self, "_total_in", 1))
-        p["vr0"] = float(self.vmin) / total * F
-        p["vr1"] = float(self.vmax) / total * F
+        # 出力フレーム t_out はマップの行 t_out に対応 → 正規化は (time_size-1)
+        p["ph01"] = min(1.0, float(self._t_out) / max(1, self.time_size - 1))
+        # space_set スケール: 書き出しの s01*(space_range-1) を元スキャン解像度
+        # 基準の 0..1 に直した係数
+        sd = int(self.scan_direction)
+        scan_full = getattr(self, "_in_w" if sd == 1 else "_in_h", None)
+        if self.space_set and scan_full and scan_full > 1:
+            p["sscale"] = (float(self.space_set) - 1.0) / (float(scan_full) - 1.0)
+        else:
+            p["sscale"] = 1.0
+        p["mapW"] = MAP_S_RES
+        p["mapH"] = MAP_T_RES
         return p
 
     def _tick(self):

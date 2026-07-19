@@ -252,15 +252,32 @@ SECTION_NORMAL_PATTERN = {
 }
 
 
-def section_pattern_order(type_name, lang=None):
+def normal_pattern_for(section, sd=1):
+    """スリット方向 sd に応じた「通常再生」パターン id を返す。
+
+    マップファイルの形状は sd=1: (time, scan) / sd=0: (scan, time)。
+    space は常に「スキャン軸に沿ったランプ」、time は常に「時間軸に沿った
+    ランプ」が通常再生なので、ファイル上の向きは sd で入れ替わる:
+        sd=1: space=h_b2w (横=scan), time=v_b2w (縦=time)
+        sd=0: space=v_b2w (縦=scan), time=h_b2w (横=time)
+    """
+    if section == "rate":
+        return "solid_gray"
+    if int(sd) == 1:
+        return "h_b2w" if section == "space" else "v_b2w"
+    return "v_b2w" if section == "space" else "h_b2w"
+
+
+def section_pattern_order(type_name, lang=None, sd=1):
     """セクション {type_name} 用の (pattern_ids, labels) を現在の言語で返す。
 
     並び順は全セクション共通の PATTERN_IDS 固定順 (並べ替えなし)。
-    「通常再生」に相当する pattern のラベル末尾にだけサフィックスを付与する。
+    「通常再生」に相当する pattern (スリット方向 sd に依存) のラベル末尾に
+    だけサフィックスを付与する。
     """
     lang = lang or LANG
     pattern_labels = PATTERN_LABELS_BY_LANG.get(lang, PATTERN_LABELS_BY_LANG["ja"])
-    normal = SECTION_NORMAL_PATTERN.get(type_name, PATTERN_IDS[0])
+    normal = normal_pattern_for(type_name, sd)
     labels = []
     for pid, base in zip(PATTERN_IDS, pattern_labels):
         if pid == normal:
@@ -347,9 +364,9 @@ BLEND_LABELS = {
 }
 
 
-def layer_pattern_order(type_name, lang=None):
+def layer_pattern_order(type_name, lang=None, sd=1):
     """レイヤー用: 基本パターン + perlin + 画像ファイル の (ids, labels)。"""
-    ids, labels = section_pattern_order(type_name, lang)
+    ids, labels = section_pattern_order(type_name, lang, sd=sd)
     lang = lang or LANG
     extra = EXTRA_PATTERN_LABELS.get(lang, EXTRA_PATTERN_LABELS["ja"])
     return ids + list(EXTRA_PATTERN_IDS), labels + list(extra)
@@ -556,10 +573,11 @@ class LayerWidget(QFrame):
     changed = pyqtSignal()
     remove_requested = pyqtSignal(object)
 
-    def __init__(self, section, index):
+    def __init__(self, section, index, sd=1):
         super().__init__()
         self.section = section
         self.index = index
+        self.sd = int(sd)          # スリット方向 (通常再生パターンの判定に使用)
         self._image_path = None
         self.pattern_ids = []
         self.setFrameShape(QFrame.StyledPanel)
@@ -708,8 +726,8 @@ class LayerWidget(QFrame):
 
         # 初期テキスト/combo 構築
         self.retranslate()
-        # 既定パターン: ベースレイヤーはセクションの通常再生、追加レイヤーはグレー
-        default_pid = SECTION_NORMAL_PATTERN.get(section) if index == 0 else "solid_gray"
+        # 既定パターン: ベースレイヤーはセクションの通常再生 (sd 依存)、追加レイヤーはグレー
+        default_pid = normal_pattern_for(section, self.sd) if index == 0 else "solid_gray"
         if default_pid in self.pattern_ids:
             self.pattern.setCurrentIndex(self.pattern_ids.index(default_pid))
         self.set_index(index)
@@ -791,7 +809,7 @@ class LayerWidget(QFrame):
         if not self._image_path:
             self.image_label.setText(tr("no_layer_image"))
         # pattern combo (選択保持)
-        ids, labels = layer_pattern_order(self.section)
+        ids, labels = layer_pattern_order(self.section, sd=self.sd)
         idx = self.pattern.currentIndex() if self.pattern.count() else 0
         self.pattern.blockSignals(True)
         self.pattern.clear()
@@ -1973,6 +1991,19 @@ class IMGTransApp(QWidget):
         sd = int(getattr(self.dm, "scan_direction", 1))
         for th in getattr(self, "_map_thumbs", {}).values():
             th.set_time_vertical(sd == 1)
+        # レイヤーの「通常再生」パターンをスリット方向に合わせて更新
+        # (ラベルの（通常再生）表記も sd 依存なので combo を再構築し、
+        #  ベースレイヤーは sd に応じた通常再生パターンへリセットする)
+        for sec, g in self._section_gens.items():
+            for li, lw in enumerate(g.get('layers', [])):
+                lw.sd = sd
+                lw.retranslate()
+                if li == 0:
+                    pid = normal_pattern_for(sec, sd)
+                    if pid in lw.pattern_ids:
+                        lw.pattern.blockSignals(True)
+                        lw.pattern.setCurrentIndex(lw.pattern_ids.index(pid))
+                        lw.pattern.blockSignals(False)
         # 共通サイズ
         self.gen_scan_size.setValue(int(self.dm.scan_nums))
         self.gen_time_size.setValue(900)
@@ -2075,10 +2106,12 @@ class IMGTransApp(QWidget):
         self.time_vmax_spin.setValue(self._default_time_vmax())
 
     def _sync_rt_timeline(self, *_):
-        """時間方向サイズ / 出力FPS をリアルタイムプレビューのタイムラインへ反映"""
+        """時間方向サイズ / 出力FPS をリアルタイムプレビューのタイムラインへ反映。
+        rate の累積積分が fps/時間方向サイズに依存するためマップも再構築する。"""
         if getattr(self, "rt_preview", None):
             self.rt_preview.set_params(time_size=self.gen_time_size.value(),
                                        out_fps=self._out_fps())
+            self.rt_preview.refresh_maps()
 
     # --- Events ---
     def select_video(self):
@@ -2105,8 +2138,9 @@ class IMGTransApp(QWidget):
             self.update_ui_state("initialized")
             if getattr(self, "rt_preview", None):
                 self.rt_preview.set_video(self.videopath)
-                # スリット方向をプレビューに同期 (縦=X リマップ / 横=Y リマップ)
-                self.rt_preview.set_params(sd=int(self.dm.scan_direction))
+                # スリット方向と入力実FPS をプレビューに同期
+                self.rt_preview.set_params(sd=int(self.dm.scan_direction),
+                                           rec_fps=float(self.dm.recfps))
                 self._sync_rt_timeline()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -2163,10 +2197,16 @@ class IMGTransApp(QWidget):
         v.addWidget(g['generate_btn'])
         return frame
 
+    def _current_sd(self):
+        """現在のスリット方向 (dm 初期化前はチェックボックスから)。"""
+        if self.dm is not None:
+            return int(getattr(self.dm, "scan_direction", 1))
+        return 1 if self.slit_toggle.isChecked() else 0
+
     def _add_layer(self, type_name):
         """セクションにレイヤーを 1 枚追加する。"""
         g = self._section_gens[type_name]
-        lw = LayerWidget(type_name, len(g['layers']))
+        lw = LayerWidget(type_name, len(g['layers']), sd=self._current_sd())
         lw.changed.connect(lambda t=type_name: self._update_section_preview(t))
         lw.remove_requested.connect(lambda w, t=type_name: self._remove_layer(t, w))
         g['layers'].append(lw)
