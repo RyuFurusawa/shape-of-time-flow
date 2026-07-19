@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QFrame, QDoubleSpinBox, QGroupBox, QTabWidget, QScrollArea, QSplitter,
     QProgressBar
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QMovie, QImageReader
 
 # 動画の内蔵再生 (QtMultimedia) は環境により無い場合があるため防御的に import
@@ -144,6 +144,11 @@ TR = {
               "  rate to data = apply the Rate image as a playback-rate map\n"
               "Selecting this (with the required images set) unlocks the Preview / Render tabs.",
     },
+    "grp_live3d": {"ja": "3D軌道 ライブプレビュー (自動更新)",
+                    "en": "3D Trajectory Live Preview (auto)"},
+    "live3d_waiting": {"ja": "(画像と適用方法が揃うと自動生成されます)",
+                        "en": "(auto-generates once images & apply mode are set)"},
+    "live3d_updating": {"ja": "更新中…", "en": "updating…"},
     "lbl_apply_mode_info": {"ja": "適用方法: {m}   (変更は「2. 画像」タブ下部で)",
                              "en": "Apply mode: {m}   (change at the bottom of the Images tab)"},
     "status_need_mode": {"ja": "Status: 適用方法が未選択です (「2. 画像」タブ下部で選択)",
@@ -1074,10 +1079,12 @@ class ManeuverPreviewWorker(QThread):
     def __init__(self, dm, mode, space_img, time_img, rate_img,
                  space_set, time_vmin, time_vmax,
                  rate_maxdev, rate_baseline, rate_startpoint,
-                 anim_frames=20, anim_fps=10, anim_dpi=80):
+                 anim_frames=20, anim_fps=10, anim_dpi=80,
+                 skip_2d=False):
         super().__init__()
         self.dm = dm
         self.mode = mode  # "time" or "rate"
+        self.skip_2d = skip_2d   # ライブ3Dプレビュー用: 2D プロット生成を省略
         self.space_img = space_img
         self.time_img = time_img
         self.rate_img = rate_img
@@ -1141,11 +1148,13 @@ class ManeuverPreviewWorker(QThread):
 
             # 2D プロット生成: mtime で「呼び出し後に変更されたファイル」を検出
             # (同じファイル名で上書きされるケースに対応するため set 差分は使わない)
-            ts_2d = time.time() - 0.5  # 小さなクロックスラックを許容
-            self.progress_signal.emit("maneuver_2dplot: 2D プロット生成中…")
-            self.percent_signal.emit(35)
-            self.dm.maneuver_2dplot()
-            plot2d = self._latest_file(cwd, (".png",), ts_2d)
+            plot2d = ""
+            if not self.skip_2d:
+                ts_2d = time.time() - 0.5  # 小さなクロックスラックを許容
+                self.progress_signal.emit("maneuver_2dplot: 2D プロット生成中…")
+                self.percent_signal.emit(35)
+                self.dm.maneuver_2dplot()
+                plot2d = self._latest_file(cwd, (".png",), ts_2d)
 
             # 3D アニメ生成: 同じく mtime で検出
             ts_3d = time.time() - 0.5
@@ -1198,6 +1207,16 @@ class IMGTransApp(QWidget):
         self.worker = None
         self.render_completed = False
         self._preview_stale = False
+
+        # 3D軌道ライブプレビュー (タブ2) の状態
+        self._live3d_worker = None
+        self._live3d_busy = False
+        self._live3d_pending = False
+        self._live3d_movie = None
+        self._live3d_timer = QTimer(self)
+        self._live3d_timer.setSingleShot(True)
+        self._live3d_timer.setInterval(800)     # 編集のデバウンス
+        self._live3d_timer.timeout.connect(self._run_live3d)
 
         # i18n: 再翻訳用コールバックの登録簿。各エントリは呼ぶと現在の LANG で
         # 対応 widget のテキストを更新する。
@@ -1330,7 +1349,7 @@ class IMGTransApp(QWidget):
         t2_layout.addWidget(self._trlabel("lbl_time_size"))
         self.gen_time_size = QSpinBox()
         self.gen_time_size.setRange(2, 32768)
-        self.gen_time_size.setValue(120)
+        self.gen_time_size.setValue(900)
         t2_layout.addWidget(self.gen_time_size)
         t2_layout.addWidget(self._trlabel("hint_time_any"))
         gen_v.addLayout(t2_layout)
@@ -1471,6 +1490,23 @@ class IMGTransApp(QWidget):
         am_row.addStretch()
         am_v.addLayout(am_row)
         self.apply_mode_group.setVisible(False)  # Initialize 後に表示
+
+        # ===== 3D軌道 ライブプレビュー (適用方法の横・自動更新) =====
+        # 画像/パラメータ/適用方法を編集するたびにデバウンス後、軽量設定で
+        # maneuver_3dplot → GIF を再生成して表示する。
+        self.live3d_group = QGroupBox()
+        self._reg(lambda: self.live3d_group.setTitle(tr("grp_live3d")))
+        l3_v = QVBoxLayout(self.live3d_group)
+        self.live3d_label = QLabel(tr("live3d_waiting"))
+        self.live3d_label.setAlignment(Qt.AlignCenter)
+        self.live3d_label.setMinimumSize(320, 200)
+        self.live3d_label.setStyleSheet(
+            "QLabel { background: #222; color: #888; border: 1px solid #555; }")
+        l3_v.addWidget(self.live3d_label)
+        self.live3d_status = QLabel("")
+        self.live3d_status.setStyleSheet("color: gray; font-size: 11px;")
+        l3_v.addWidget(self.live3d_status)
+        self.live3d_group.setVisible(False)      # Initialize 後に表示
 
         # ===== マニューバ プレビュー (Time+Space or Rate+Space 揃った時点で確認) =====
         self.preview_group = QGroupBox()
@@ -1616,7 +1652,11 @@ class IMGTransApp(QWidget):
             cols.addWidget(box, 1)
         t2_l.addLayout(cols)
 
-        t2_l.addWidget(self.apply_mode_group)   # 適用方法 (必須) — タブ2の最下部
+        # 適用方法 (必須) + 3D軌道ライブプレビュー — タブ2の最下部に横並び
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(self.apply_mode_group, 1)
+        bottom_row.addWidget(self.live3d_group, 1)
+        t2_l.addLayout(bottom_row)
 
         t2_l.addStretch()
         tabs.addTab(self._wrap_scroll(t2), tr("tab_images"))
@@ -1713,6 +1753,7 @@ class IMGTransApp(QWidget):
                 b.setEnabled(True)
             self.gen_group.setVisible(True)
             self.apply_mode_group.setVisible(True)
+            self.live3d_group.setVisible(True)
             self.preview_group.setVisible(True)
             self.preview_btn.setEnabled(False)  # 適用方法+画像が揃うまで無効
             self._apply_video_defaults()
@@ -1787,16 +1828,9 @@ class IMGTransApp(QWidget):
             return
         # 共通サイズ
         self.gen_scan_size.setValue(int(self.dm.scan_nums))
-        self.gen_time_size.setValue(120)
-        # 出力FPS の既定は選択肢 (10/24/30/60/120) のうち元動画の実FPS に最も近いもの
-        try:
-            rec = float(self.dm.recfps)
-            choices = [self.gen_out_fps.itemData(i)
-                       for i in range(self.gen_out_fps.count())]
-            best = min(range(len(choices)), key=lambda i: abs(choices[i] - rec))
-            self.gen_out_fps.setCurrentIndex(best)
-        except Exception:
-            self.gen_out_fps.setCurrentIndex(2)   # 30
+        self.gen_time_size.setValue(900)
+        # 出力FPS の既定は 30 固定 (900 frames ÷ 30 fps = 30 秒)
+        self.gen_out_fps.setCurrentIndex(2)   # 30
         # 各 type の既定パラメータ
         self.space_set_value.setValue(int(self.dm.scan_nums))
         # Time 画像の既定レンジ: vmin=0, vmax=出力FPS×時間方向サイズ
@@ -2098,6 +2132,9 @@ class IMGTransApp(QWidget):
             QMessageBox.warning(self, "Error",
                                 "Space + (Time または Rate) 画像が必要です")
             return
+        # ライブ3D生成が走っていたら完了を待つ (dm 共有のため並走させない)
+        if self._live3d_busy and self._live3d_worker is not None:
+            self._live3d_worker.wait(8000)
         self.preview_btn.setEnabled(False)
         self.preview_status_label.setText("Status: running…")
         # 生成中であることをプロット領域自体にも表示 (古い表示は消す)
@@ -2204,6 +2241,8 @@ class IMGTransApp(QWidget):
         """
         if not hasattr(self, "preview_btn"):
             return
+        # 3D軌道ライブプレビューは編集のたびにデバウンス再生成
+        self._schedule_live3d()
         if not self.preview_btn.isEnabled():
             return
         # 既に "running" 中などはスキップ
@@ -2214,6 +2253,80 @@ class IMGTransApp(QWidget):
             "Status: ⚠ 設定が変更されました — 「プレビュー生成」を再実行してください"
         )
         self._preview_stale = True
+
+    # --- 3D軌道 ライブプレビュー (タブ2・自動更新) ---
+    def _schedule_live3d(self):
+        """編集イベントを800msデバウンスして _run_live3d を起動する。"""
+        if not self.dm or not getattr(self, "live3d_group", None):
+            return
+        self._live3d_timer.start()      # 連続編集中はタイマーが巻き戻る
+
+    def _live3d_prereq_mode(self):
+        """ライブ3D生成が可能なら "time"/"rate"、不可なら None。"""
+        return self._can_preview_mode()
+
+    def _run_live3d(self):
+        if self._live3d_busy:
+            self._live3d_pending = True
+            return
+        # 重い処理 (レンダリング / 手動プレビュー) の実行中は後回し
+        if (self.worker is not None and self.worker.isRunning()) or \
+           (getattr(self, "_preview_worker", None) is not None
+                and self._preview_worker.isRunning()):
+            self._live3d_timer.start(1500)
+            return
+        mode = self._live3d_prereq_mode()
+        if mode is None:
+            self.live3d_status.setText("")
+            if self._live3d_movie is None:
+                self.live3d_label.setText(tr("live3d_waiting"))
+            return
+        self._live3d_busy = True
+        self.live3d_status.setText(tr("live3d_updating"))
+        self._live3d_worker = ManeuverPreviewWorker(
+            self.dm, mode,
+            self.space_img_path, self.time_img_path, self.rate_img_path,
+            self.space_set_value.value(),
+            self.time_vmin_spin.value(), self.time_vmax_spin.value(),
+            self.rate_maxdev_spin.value(),
+            self.rate_baseline_spin.value(),
+            self.rate_startpoint_spin.value(),
+            anim_frames=10, anim_fps=8, anim_dpi=55,
+            skip_2d=True,
+        )
+        self._live3d_worker.done_signal.connect(self._on_live3d_done)
+        self._live3d_worker.start()
+
+    def _on_live3d_done(self, success, _plot2d, gif):
+        self._live3d_busy = False
+        if success and gif and os.path.exists(gif):
+            if self._live3d_movie is not None:
+                try:
+                    self._live3d_movie.stop()
+                except Exception:
+                    pass
+                self.live3d_label.setMovie(None)
+            movie = QMovie(gif)
+            movie.setCacheMode(QMovie.CacheNone)
+            if movie.isValid():
+                native = QImageReader(gif).size()
+                box = self.live3d_label.size()
+                if native.width() > 0 and native.height() > 0:
+                    scale = min(box.width() / native.width(),
+                                box.height() / native.height())
+                    movie.setScaledSize(QSize(
+                        max(1, int(native.width() * scale)),
+                        max(1, int(native.height() * scale))))
+                self.live3d_label.setMovie(movie)
+                movie.start()
+                self._live3d_movie = movie
+            self.live3d_status.setText("")
+        else:
+            self.live3d_status.setText("")
+        # 実行中に編集が入っていたら追いかけ再生成
+        if self._live3d_pending:
+            self._live3d_pending = False
+            self._schedule_live3d()
 
     def generate_sample_image_action(self, type_name):
         """セクション {type_name} のジェネレータ設定でサンプル画像を生成 → 自動セット"""
@@ -2345,6 +2458,9 @@ class IMGTransApp(QWidget):
             QMessageBox.warning(self, "Error",
                                 "適用方法を「2. 画像」タブ下部で選択してください。")
             return
+        # ライブ3D生成が走っていたら完了を待つ (dm 共有のため並走させない)
+        if self._live3d_busy and self._live3d_worker is not None:
+            self._live3d_worker.wait(8000)
         animout = self.anim_toggle.isChecked()
         duration = self.duration_spin.value()
 
