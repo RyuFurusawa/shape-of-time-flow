@@ -1823,22 +1823,23 @@ class IMGTransApp(QWidget):
         tabs.addTab(self._wrap_scroll(t2), tr("tab_main"))
 
         # --- Tab 2: リアルタイムプレビュー (Preview) ---
+        # 映像ビューをタブ領域いっぱいに拡大させるため、ストレッチ係数 1 で
+        # 追加し余白 stretch は置かない (スクロールにも包まない)。
         t3 = QWidget(); t3_l = QVBoxLayout(t3)
-        # リアルタイム GPU プレビュー (最上部に配置)
         if _HAS_RT_PREVIEW:
             self.rt_group = QGroupBox()
             self._reg(lambda: self.rt_group.setTitle(tr("grp_realtime")))
             rt_v = QVBoxLayout(self.rt_group)
             self.rt_preview = RealtimePreviewWidget(lang=LANG)
             rt_v.addWidget(self.rt_preview)
-            t3_l.addWidget(self.rt_group)
+            t3_l.addWidget(self.rt_group, 1)
         else:
             self.rt_preview = None
-        # 2D/3D 軌道プロットは「2. 画像」タブのライブプレビューへ完全移行。
+            t3_l.addStretch()
+        # 2D/3D 軌道プロットは「1. 入力・画像」タブのライブプレビューへ完全移行。
         # このタブは動画のリアルタイムプレビュー専用 (preview_group は非表示のまま
         # 保持し、内部ロジック互換のためウィジェットだけ残す)。
-        t3_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t3), tr("tab_preview"))
+        tabs.addTab(t3, tr("tab_preview"))
         tabs.currentChanged.connect(self._on_tab_changed)
 
         # --- Tab 3: 出力 (Render) ---
@@ -2667,9 +2668,10 @@ class IMGTransApp(QWidget):
 
     def _on_tab_changed(self, idx):
         """プレビュータブ (index 1) を表示中だけリアルタイムプレビューを再生。
-        ログはメインの入力・画像ページ (index 0) では非表示。"""
+        ログはレンダリング進捗を見る出力タブ (index 2) のみ表示
+        (入力・画像/プレビューでは映像領域を最大化するため非表示)。"""
         if getattr(self, "log_box", None):
-            self.log_box.setVisible(idx != 0)
+            self.log_box.setVisible(idx == 2)
         rt = getattr(self, "rt_preview", None)
         if not rt:
             return
