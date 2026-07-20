@@ -759,7 +759,7 @@ class RealtimePreviewWidget(QWidget):
         v = QVBoxLayout(self)
         self.view = QLabel(self._t("placeholder"))
         self.view.setAlignment(Qt.AlignCenter)
-        self.view.setMinimumSize(480, 270)
+        self.view.setMinimumSize(480, 200)
         # sizeHint を無視させ「pixmap サイズ → レイアウト拡大 → 更に大きく描画」の
         # フィードバックループを断つ (縦長映像で画面が少しずつ伸びる問題の対策)。
         # 表示領域は固定で、縦長映像はサイドに黒みが入るレターボックス表示になる。

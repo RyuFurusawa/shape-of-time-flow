@@ -63,8 +63,10 @@ TR = {
     # Window / tabs
     "window_title": {"ja": "Shape of Time Flow", "en": "Shape of Time Flow"},
     "tab_main":    {"ja": "1. 入力・画像 / Setup & Images", "en": "1. Setup & Images"},
-    "tab_preview": {"ja": "2. プレビュー / Preview", "en": "2. Preview"},
-    "tab_render":  {"ja": "3. 出力 / Render",     "en": "3. Render"},
+    "tab_preview": {"ja": "2. プレビュー・出力 / Preview & Render",
+                     "en": "2. Preview & Render"},
+    "chk_video_only": {"ja": "映像ビューのみ表示",
+                        "en": "Video view only"},
     "grp_setup":   {"ja": "入力 (Setup)", "en": "Setup"},
     # Language selector
     "lang_label":  {"ja": "言語 / Language:",     "en": "Language / 言語:"},
@@ -1221,6 +1223,43 @@ class ManeuverPreviewWorker(QThread):
             self.done_signal.emit(False, "", "")
 
 
+# ======== stdout の進捗% 検出 (レンダリング進捗バー用) ========
+class StdoutPercentTee:
+    """sys.stdout を透過しつつ「NN%」を検出してコールバックする。
+
+    imgtrans のレンダリングは進捗バーを stdout に print するため、
+    レンダリング中だけ差し込んで GUI のプログレスバーへ転送する。
+    "57.9%" のような小数 (メモリ表示等) は除外する。
+    """
+    _PCT_RE = re.compile(r"(?<![\d.])(\d{1,3})%")
+
+    def __init__(self, orig, cb):
+        self._orig = orig
+        self._cb = cb
+
+    def write(self, s):
+        try:
+            self._orig.write(s)
+        except Exception:
+            pass
+        m = None
+        for m in self._PCT_RE.finditer(s):
+            pass
+        if m is not None:
+            try:
+                v = int(m.group(1))
+                if 0 <= v <= 100:
+                    self._cb(v)
+            except Exception:
+                pass
+
+    def flush(self):
+        try:
+            self._orig.flush()
+        except Exception:
+            pass
+
+
 # ======== 適用済みマップのサムネイル (再生位置の赤ライン付き) ========
 class MapThumb(QLabel):
     """適用済みの space/time/rate マップを小さく表示し、3D アニメの再生位置を
@@ -1243,7 +1282,7 @@ class MapThumb(QLabel):
         else:
             # 可変サイズ (レイアウトのストレッチに従う)。sizeHint 由来の
             # 拡大ループを避けるため Ignored ポリシーにする。
-            self.setMinimumSize(160, 240)
+            self.setMinimumSize(160, 180)
             self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.setStyleSheet(
             "QLabel { background: #222; border: 1px solid #555;"
@@ -1300,8 +1339,12 @@ class MapThumb(QLabel):
 
 # ======== Main GUI ========
 class IMGTransApp(QWidget):
+    _render_pct = pyqtSignal(int)   # レンダリング進捗% (stdout 検出 → バー)
+
     def __init__(self):
         super().__init__()
+        self._orig_stdout = None
+        self._render_pct.connect(lambda v: self.render_progress.setValue(v))
         self.setWindowTitle(tr("window_title"))
         self.resize(1360, 900)   # 3カラム (Space/Time/Rate) を横並びで収める幅
         self.setMinimumSize(640, 480)
@@ -1631,7 +1674,7 @@ class IMGTransApp(QWidget):
         right_col = QVBoxLayout()
         self.live3d_label = QLabel(tr("live3d_waiting"))
         self.live3d_label.setAlignment(Qt.AlignCenter)
-        self.live3d_label.setMinimumSize(320, 240)
+        self.live3d_label.setMinimumSize(320, 200)
         self.live3d_label.setStyleSheet(
             "QLabel { background: #222; color: #888; border: 1px solid #555; }")
         right_col.addWidget(self.live3d_label, 1)
@@ -1733,34 +1776,24 @@ class IMGTransApp(QWidget):
         self.apply_mode_info.setWordWrap(True)
         self._reg(self._update_apply_mode_info)
 
-        # --- Animation toggle ---
-        anim_label = self._trlabel("lbl_anim_settings")
+        # --- Animation 系 UI (アニメーション書き出しは一旦 UI から撤去。
+        #     内部ロジック互換のためウィジェットは生成のみ・レイアウト非配置) ---
         self.anim_toggle = QCheckBox()
-        self._reg(lambda: self.anim_toggle.setText(tr("chk_enable_anim")))
         self.anim_toggle.stateChanged.connect(self.on_anim_toggle_changed)
-
         self.anim_settings_container = QFrame()
         anim_settings_layout = QVBoxLayout(self.anim_settings_container)
-        duration_layout = QHBoxLayout()
-        duration_label = self._trlabel("lbl_anim_duration")
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(1, 120)
         self.duration_spin.setValue(10)
-        duration_layout.addWidget(duration_label)
-        duration_layout.addWidget(self.duration_spin)
-        anim_settings_layout.addLayout(duration_layout)
+        anim_settings_layout.addWidget(self.duration_spin)
         self.anim_settings_container.setVisible(False)
+        self.animonly_btn = QPushButton()
+        self.animonly_btn.clicked.connect(self.start_animation_only)
 
-        # --- Buttons ---
-        btn_layout = QHBoxLayout()
+        # --- Start Rendering ボタン (統合タブの出力行に配置) ---
         self.start_btn = QPushButton()
         self._reg(lambda: self.start_btn.setText(tr("btn_start_render")))
         self.start_btn.clicked.connect(self.start_rendering)
-        self.animonly_btn = QPushButton()
-        self._reg(lambda: self.animonly_btn.setText(tr("btn_anim_only")))
-        self.animonly_btn.clicked.connect(self.start_animation_only)
-        btn_layout.addWidget(self.start_btn)
-        btn_layout.addWidget(self.animonly_btn)
 
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
@@ -1792,6 +1825,7 @@ class IMGTransApp(QWidget):
         top_left.addStretch()
         top_row.addLayout(top_left, 1)
         top_row.addWidget(self.live3d_group, 3)   # シミュレーション側を幅 3/4 に
+        self._t2_top_row = top_row   # live3d_group をタブ間で移動するための帰り先
         t2_l.addLayout(top_row)
 
         cols = QHBoxLayout()
@@ -1825,55 +1859,60 @@ class IMGTransApp(QWidget):
         t2_l.addStretch()
         tabs.addTab(self._wrap_scroll(t2), tr("tab_main"))
 
-        # --- Tab 2: リアルタイムプレビュー (Preview) ---
-        # 映像ビューをタブ領域いっぱいに拡大させるため、ストレッチ係数 1 で
-        # 追加し余白 stretch は置かない (スクロールにも包まない)。
+        # --- Tab 2: プレビュー・出力 (Preview & Render 統合) ---
+        # スクロール無しで「映像ビュー + 軌道プロットライブビュー + 出力操作」を
+        # 1 画面に収める。アニメーション書き出し UI はこのタブには置かない。
         t3 = QWidget(); t3_l = QVBoxLayout(t3)
+
+        # 上段バー: 適用方法表示 + 「映像ビューのみ表示」チェック
+        pv_top = QHBoxLayout()
+        pv_top.addWidget(self.apply_mode_info, 1)
+        self.video_only_chk = QCheckBox()
+        self._reg(lambda: self.video_only_chk.setText(tr("chk_video_only")))
+        self.video_only_chk.toggled.connect(self._on_video_only_toggled)
+        pv_top.addWidget(self.video_only_chk)
+        t3_l.addLayout(pv_top)
+
+        # 映像エリア: GPU リアルタイムプレビュー ⇄ レンダリング結果を差し替え
         if _HAS_RT_PREVIEW:
             self.rt_group = QGroupBox()
             self._reg(lambda: self.rt_group.setTitle(tr("grp_realtime")))
             rt_v = QVBoxLayout(self.rt_group)
             self.rt_preview = RealtimePreviewWidget(lang=LANG)
             rt_v.addWidget(self.rt_preview)
-            t3_l.addWidget(self.rt_group, 1)
+            t3_l.addWidget(self.rt_group, 3)
+            # Rebuild / 構築ボタンで GPU ビューへ戻す
+            self.rt_preview.rebuild_btn.clicked.connect(self._show_gpu_view)
+            self.rt_preview.center_btn.clicked.connect(self._show_gpu_view)
         else:
             self.rt_preview = None
-            t3_l.addStretch()
-        # 2D/3D 軌道プロットは「1. 入力・画像」タブのライブプレビューへ完全移行。
-        # このタブは動画のリアルタイムプレビュー専用 (preview_group は非表示のまま
-        # 保持し、内部ロジック互換のためウィジェットだけ残す)。
+        self.rendered_preview = VideoPreview(tr("rendered_video_title"))
+        self._reg(lambda: self.rendered_preview.set_base_title(tr("rendered_video_title")))
+        self.rendered_preview.setVisible(False)
+        t3_l.addWidget(self.rendered_preview, 3)
+
+        # 軌道プロットライブビューの受け皿 (このタブ表示中は live3d_group を
+        # タブ1からここへ移動して併置する)
+        self._live3d_slot = QVBoxLayout()
+        t3_l.addLayout(self._live3d_slot, 2)
+
+        # 出力行: Start Rendering + 進捗バー
+        render_row = QHBoxLayout()
+        render_row.addWidget(self.start_btn, 1)
+        self.render_progress = QProgressBar()
+        self.render_progress.setRange(0, 100)
+        self.render_progress.setValue(0)
+        self.render_progress.setTextVisible(True)
+        render_row.addWidget(self.render_progress, 2)
+        t3_l.addLayout(render_row)
+
         tabs.addTab(t3, tr("tab_preview"))
         tabs.currentChanged.connect(self._on_tab_changed)
-
-        # --- Tab 3: 出力 (Render) ---
-        t4 = QWidget(); t4_l = QVBoxLayout(t4)
-        for w in [self.apply_mode_info,
-                  anim_label, self.anim_toggle,
-                  self.anim_settings_container]:
-            t4_l.addWidget(w)
-        t4_l.addLayout(btn_layout)
-
-        # レンダリング結果プレビュー (完了後に動画を上下に並べて再生)
-        self.result_group = QGroupBox()
-        self._reg(lambda: self.result_group.setTitle(tr("grp_rendered_preview")))
-        result_v = QVBoxLayout(self.result_group)
-        self.rendered_preview = VideoPreview(tr("rendered_video_title"))
-        self.anim_preview = VideoPreview(tr("anim_title"))
-        self._reg(lambda: self.rendered_preview.set_base_title(tr("rendered_video_title")))
-        self._reg(lambda: self.anim_preview.set_base_title(tr("anim_title")))
-        result_v.addWidget(self.rendered_preview)
-        result_v.addWidget(self.anim_preview)
-        self.result_group.setVisible(False)
-        t4_l.addWidget(self.result_group)
-
-        t4_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t4), tr("tab_render"))
 
         # タブ見出しの再翻訳を登録
         self._reg(lambda: (
             self.tabs.setTabText(0, tr("tab_main")),
             self.tabs.setTabText(1, tr("tab_preview")),
-            self.tabs.setTabText(2, tr("tab_render")),
         ))
 
         # ===== ログ (メインの入力・画像ページでは非表示、他タブで表示) =====
@@ -1927,8 +1966,6 @@ class IMGTransApp(QWidget):
             self._update_preview_btn_state()
         elif stage == "rendered":
             self.animonly_btn.setEnabled(True)
-            self.anim_settings_container.setVisible(True)
-            self.log("Animation-only rendering is now available.")
         self._update_generate_gates()
         self._update_tab_gating()
 
@@ -1959,11 +1996,9 @@ class IMGTransApp(QWidget):
         if not hasattr(self, "tabs"):
             return
         ready = self._pipeline_ready()
-        self.tabs.setTabEnabled(1, ready)   # プレビュー
-        self.tabs.setTabEnabled(2, ready)   # 出力
+        self.tabs.setTabEnabled(1, ready)   # プレビュー・出力 (統合)
         # 出力操作も同じ条件でゲート (レンダリング可能条件と一致)
         self.start_btn.setEnabled(ready)
-        self.anim_toggle.setEnabled(ready)
         # 現在表示中のタブが無効化されたら、有効な直近のタブへ戻す
         cur = self.tabs.currentIndex()
         if not self.tabs.isTabEnabled(cur):
@@ -2781,16 +2816,49 @@ class IMGTransApp(QWidget):
         else:
             self.slit_label.setText(tr("slit_h"))
 
+    def _move_live3d(self, to_preview):
+        """軌道プロットライブビュー (live3d_group) をタブ間で移動する。
+
+        タブ1 (入力・画像) では設定の右 3/4 に、統合タブ (プレビュー・出力)
+        では映像ビューの下に「そのまま」併置する (ウィジェットは単一)。
+        """
+        g = getattr(self, "live3d_group", None)
+        if g is None:
+            return
+        if to_preview:
+            self._t2_top_row.removeWidget(g)
+            self._live3d_slot.addWidget(g)
+            g.setVisible(self.dm is not None and
+                         not self.video_only_chk.isChecked())
+        else:
+            self._live3d_slot.removeWidget(g)
+            self._t2_top_row.insertWidget(1, g, 3)
+            g.setVisible(self.dm is not None)
+
+    def _on_video_only_toggled(self, checked):
+        """「映像ビューのみ表示」: 統合タブで軌道プロットを隠し映像を最大化。"""
+        if self.tabs.currentIndex() == 1:
+            self.live3d_group.setVisible(self.dm is not None and not checked)
+
+    def _show_gpu_view(self, *_):
+        """レンダリング結果表示から GPU リアルタイムプレビューへ戻す。"""
+        if getattr(self, "rendered_preview", None):
+            self.rendered_preview.stop()
+            self.rendered_preview.setVisible(False)
+        if getattr(self, "rt_group", None):
+            self.rt_group.setVisible(True)
+
     def _on_tab_changed(self, idx):
-        """プレビュータブ (index 1) を表示中だけリアルタイムプレビューを再生。
-        ログはレンダリング進捗を見る出力タブ (index 2) のみ表示
-        (入力・画像/プレビューでは映像領域を最大化するため非表示)。"""
+        """統合タブ (index 1) 表示中だけ RT 再生 + ログ表示。
+        軌道プロットライブビューはタブに合わせて移動する。"""
         if getattr(self, "log_box", None):
-            self.log_box.setVisible(idx == 2)
+            self.log_box.setVisible(idx == 1)
+        self._move_live3d(idx == 1)
         rt = getattr(self, "rt_preview", None)
         if not rt:
             return
-        if idx == 1:
+        if idx == 1 and (not getattr(self, "rt_group", None)
+                         or self.rt_group.isVisible()):
             rt.start()
         else:
             rt.stop()
@@ -2806,6 +2874,13 @@ class IMGTransApp(QWidget):
             self._live3d_worker.wait(8000)
         animout = self.anim_toggle.isChecked()
         duration = self.duration_spin.value()
+
+        # stdout に流れる imgtrans の進捗% をプログレスバーへ転送
+        self.render_progress.setValue(0)
+        if self._orig_stdout is None:
+            self._orig_stdout = sys.stdout
+            sys.stdout = StdoutPercentTee(self._orig_stdout,
+                                          self._render_pct.emit)
 
         # 出力FPS を drawManeuver に反映 (最終尺 = 時間方向サイズ ÷ 出力FPS)
         try:
@@ -2854,36 +2929,33 @@ class IMGTransApp(QWidget):
         self.worker.start()
 
     def on_render_done(self, success, video_path="", anim_path=""):
+        # stdout の進捗検出を解除
+        if getattr(self, "_orig_stdout", None) is not None:
+            sys.stdout = self._orig_stdout
+            self._orig_stdout = None
+        self.render_progress.setValue(100 if success else 0)
         if success:
             self.render_completed = True
             self.log(" Rendering completed.")
             self.update_ui_state("rendered")
-            self._show_rendered_preview(video_path, anim_path)
-            if hasattr(self.dm, "data") and self.dm.data is not None:
-                self.animonly_btn.setEnabled(True)
-                self.log("Animation-only rendering is now available.")
-            else:
-                self.log("[WARN] No data found in drawManeuver; Animation Only disabled.")
-                self.animonly_btn.setEnabled(False)
+            self._show_rendered_preview(video_path)
         else:
             self.log("Rendering failed.")
 
-    def _show_rendered_preview(self, video_path, anim_path):
-        """レンダリング結果 (本編動画 / アニメーション) をプレビュー領域に読み込み再生。
-        空パスの枠は既存表示を維持する (例: Animation Only は本編動画を残す)。
-        """
-        if video_path and os.path.exists(video_path):
-            self.rendered_preview.stop()
-            self.rendered_preview.load(video_path)
-            self.log(f"[preview] rendered video: {os.path.basename(video_path)}")
-        if anim_path and os.path.exists(anim_path):
-            self.anim_preview.stop()
-            self.anim_preview.load(anim_path)
-            self.log(f"[preview] animation: {os.path.basename(anim_path)}")
-        any_shown = self.rendered_preview.loaded or self.anim_preview.loaded
-        self.result_group.setVisible(any_shown)
-        if not any_shown:
+    def _show_rendered_preview(self, video_path):
+        """本レンダリング完了後、映像エリアを GPU プレビューから
+        書き出し結果のプレイヤーへ差し替える (Rebuild で GPU ビューに戻る)。"""
+        if not (video_path and os.path.exists(video_path)):
             self.log("[preview] no output video found to preview.")
+            return
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.stop()
+        if getattr(self, "rt_group", None):
+            self.rt_group.setVisible(False)
+        self.rendered_preview.stop()
+        self.rendered_preview.load(video_path)
+        self.rendered_preview.setVisible(True)
+        self.log(f"[preview] rendered video: {os.path.basename(video_path)}")
 
     def log(self, text):
         self.log_window.append(str(text))
