@@ -95,21 +95,21 @@ def _frame_to_rgba(fr, sw, sh):
     return rgba
 
 
-def decode_volume_progressive(video_path, sw, sh, F, batch_cb,
+def decode_volume_progressive(video_path, sw, sh, idxs, batch_cb,
                               cancel=None, batch=16):
-    """動画から等間隔サンプリングした F フレームを batch ごとに
+    """指定した入力フレーム番号列 idxs (昇順) を batch ごとに
     batch_cb(start_index, frames_array) で通知する (プログレッシブ供給源)。
 
-    サンプル間隔に応じて 2 方式を自動選択:
-    - 間隔小 (短いクリップ): grab() で順次読み進め、必要フレームのみ retrieve()。
-      シークごとのキーフレーム再デコードを避ける。
-    - 間隔大 (長尺/高解像度): フレーム位置シーク。全フレームデコードを避ける
-      (37万フレームの 4K 10bit で 36分 → 30秒台)。
+    idxs は軌道データが実際に参照する時間範囲 [z0, z1] を等分したもの
+    (imgtrans レンダリングコアと同じ「必要範囲だけ読む」方式)。
+    範囲先頭へ 1 回だけシークし、以後は grab() で連続読み込みする。
+    範囲内でもサンプル間隔が大きい場合のみフレームシークに切り替える。
     """
     cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or F
-    idxs = np.linspace(0, max(0, total - 1), F).astype(int)
-    step = total / max(1, F)
+    idxs = np.asarray(idxs, dtype=np.int64)
+    F = len(idxs)
+    z0 = int(idxs[0])
+    step = (int(idxs[-1]) - z0) / max(1, F - 1)
     buf = []
     start = 0
 
@@ -121,7 +121,7 @@ def decode_volume_progressive(video_path, sw, sh, F, batch_cb,
             buf = []
 
     if step > SEEK_STEP_THRESHOLD:
-        # --- シーク方式 ---
+        # --- 範囲内でも疎な場合: フレームシーク方式 ---
         # 注: 並列シークは各 HEVC デコーダが内部でマルチスレッドなため
         # CPU 競合で逆に遅くなる (実測 131s→178s)。単線が最速。
         seek_batch = max(4, batch // 2)
@@ -135,9 +135,11 @@ def decode_volume_progressive(video_path, sw, sh, F, batch_cb,
             if len(buf) >= seek_batch:
                 flush()
     else:
-        # --- 順次方式 ---
+        # --- 順次方式: 範囲先頭 z0 へ 1 回シーク → 連続読み込み ---
+        if z0 > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, z0)
         j = 0
-        src_i = 0
+        src_i = z0
         while j < F:
             if cancel is not None and cancel.is_set():
                 break
@@ -424,9 +426,9 @@ class _NumpyBackend:
 class _DecodeWorker(threading.Thread):
     """順次デコード + バッチ通知のワーカー。cancel イベントで途中停止できる。"""
 
-    def __init__(self, video, sw, sh, F, batch_cb, done_cb):
+    def __init__(self, video, sw, sh, idxs, batch_cb, done_cb):
         super().__init__(daemon=True)
-        self.video, self.sw, self.sh, self.F = video, sw, sh, F
+        self.video, self.sw, self.sh, self.idxs = video, sw, sh, idxs
         self.batch_cb = batch_cb
         self.done_cb = done_cb
         self.cancel = threading.Event()
@@ -434,7 +436,7 @@ class _DecodeWorker(threading.Thread):
     def run(self):
         try:
             decode_volume_progressive(
-                self.video, self.sw, self.sh, self.F,
+                self.video, self.sw, self.sh, self.idxs,
                 batch_cb=self.batch_cb, cancel=self.cancel)
             if not self.cancel.is_set():
                 self.done_cb(None)
@@ -730,12 +732,23 @@ class RealtimePreviewWidget(QWidget):
             self._worker.cancel.set()
         self._gen += 1
 
-        sw, sh, F = plan_volume(in_w, in_h, total)
+        self._total_in = max(1, total)     # zPointCheck 再現に使用
+        self._in_w, self._in_h = in_w, in_h   # space_set スケールの基準解像度
+
+        # 軌道が実際に参照する時間範囲 [z0, z1] を絶対マップから求める
+        # (imgtrans レンダリングコアと同じ「必要範囲だけ読む」方式)。
+        self._maps_abs = self._build_abs_maps()
+        active = self._maps_abs["time"] if self.mode == "time" else self._maps_abs["rate"]
+        z0 = int(max(0, np.floor(float(active.min()))))
+        z1 = int(min(total - 1, np.ceil(float(active.max()))))
+        z1 = max(z1, z0)
+        self._z0, self._z1 = float(z0), float(z1)
+        range_len = z1 - z0 + 1
+
+        sw, sh, F = plan_volume(in_w, in_h, range_len)
         ow, oh = sw, sh
         self._F = F
         self._srcW, self._srcH = sw, sh
-        self._total_in = max(1, total)     # vrange→常駐単位の換算に使用
-        self._in_w, self._in_h = in_w, in_h   # space_set スケールの基準解像度
         self._dims = (ow, oh)
         self._loaded = 0
         self._vol_mb = sw * sh * 4 * F / 1e6
@@ -749,7 +762,7 @@ class RealtimePreviewWidget(QWidget):
             be = _NumpyBackend()
         self._backend = be
         be.alloc_volume(F, sh, sw)      # ゼロ初期化 = 黒
-        self._upload_maps(be, ow, oh)
+        self._upload_maps(be)
         be.finalize(ow, oh)
 
         # 即再生開始 (黒画面から始まり、デコード済み領域から色が付く)
@@ -766,8 +779,9 @@ class RealtimePreviewWidget(QWidget):
         self.start()
 
         gen = self._gen
+        idxs = np.round(np.linspace(z0, z1, F)).astype(np.int64)
         self._worker = _DecodeWorker(
-            self.video_path, sw, sh, F,
+            self.video_path, sw, sh, idxs,
             batch_cb=lambda s, fr, g=gen: self._batch_decoded.emit(g, s, fr),
             done_cb=lambda err, g=gen: self._decode_finished.emit(g, err))
         self._worker.start()
@@ -822,50 +836,50 @@ class RealtimePreviewWidget(QWidget):
                     z = z * (count / mx2)
         return z
 
-    def _resident_scale(self):
-        """絶対入力フレーム → 常駐ボリューム index への換算係数。"""
-        F = self._F or 1
-        total = max(2, getattr(self, "_total_in", 1))
-        return (F - 1) / (total - 1)
+    def _build_abs_maps(self):
+        """3 マップを「絶対入力フレーム」単位のデータ座標系配列で構築する。
 
-    def _upload_maps(self, be, ow, oh):
-        """3 マップをバックエンドへ転送する。
-
-        すべて img_to_maneuver と同一のデータ座標系 (time 行 × scan 列) で保持し、
-        書き出しと同じ式で time / rate を「絶対入力フレームのマップ」へ変換して
-        から常駐単位に換算する。シェーダは (scan, ph01) でマップを引くだけになり、
-        軌道・タイミングが書き出しと一致する。
+        すべて img_to_maneuver と同一のデータ座標系 (time 行 × scan 列)。
+        time: vmin + t01*(vmax-vmin) → zPointCheck 再現
+        rate: 書き出しと同じ累積積分 Σ rate×(recfps/outfps) → zPointCheck 再現
+        space: 0..1 のまま (space_set スケールはシェーダ側 sscale で適用)
         """
         sd = self.scan_direction
-        scale = self._resident_scale()
+        maps = {"space": load_map_data(self.space_path, sd, "space")}
 
-        # space は 0..1 のまま (space_set スケールはシェーダ側 sscale で適用)
-        be.set_map("space", load_map_data(self.space_path, sd, "space"))
-
-        # time: 値 = vmin + t01*(vmax-vmin) の絶対入力フレーム → zPointCheck → 常駐単位
         t01 = load_map_data(self.time_path, sd, "time")
         t_abs = self.vmin + t01 * (self.vmax - self.vmin)
-        t_abs = self._z_adjust_array(t_abs)
-        be.set_map("time", (t_abs * scale).astype(np.float32))
+        maps["time"] = self._z_adjust_array(t_abs)
 
-        # rate: 書き出しと同じ累積積分
-        #   cumulative[t] = Σ_{k<t} rate[k] * (recfps/outfps)
-        # を時間軸 (行) に沿って再現 (行数差は time_size/n で補正)
         r01 = load_map_data(self.rate_path, sd, "rate")
         rates = self.baseline + (r01 - 0.5) * 2.0 * self.maxdev
         frame_step = float(self.rec_fps) / max(1, self.out_fps)
         n = rates.shape[0]
         cum = np.cumsum(rates, axis=0) * frame_step * (self.time_size / max(1, n))
         cum = np.vstack([np.zeros((1, cum.shape[1]), cum.dtype), cum[:-1]])
-        cum = self._z_adjust_array(cum)
-        be.set_map("rate", (cum * scale).astype(np.float32))
+        maps["rate"] = self._z_adjust_array(cum)
+        return maps
+
+    def _upload_maps(self, be):
+        """絶対マップを常駐単位 (ボリューム範囲 [z0, z1] 基準) に換算して転送する。"""
+        z0 = getattr(self, "_z0", 0.0)
+        z1 = getattr(self, "_z1", 1.0)
+        F = self._F or 1
+        scale = (F - 1) / max(1e-6, z1 - z0)
+        be.set_map("space", self._maps_abs["space"].astype(np.float32))
+        be.set_map("time", ((self._maps_abs["time"] - z0) * scale).astype(np.float32))
+        be.set_map("rate", ((self._maps_abs["rate"] - z0) * scale).astype(np.float32))
 
     def refresh_maps(self):
-        """マップだけ差し替え (ボリューム再デコードなし)。"""
+        """マップだけ差し替え (ボリューム再デコードなし)。
+
+        注: 新しいマップが現在の常駐範囲 [z0, z1] を超える場合、超過分は
+        範囲端へクランプされる。正確に反映するには Rebuild する。
+        """
         if not self._backend or not self._dims:
             return
-        ow, oh = self._dims
-        self._upload_maps(self._backend, ow, oh)
+        self._maps_abs = self._build_abs_maps()
+        self._upload_maps(self._backend)
         self._render_once()
 
     # ---- 再生 ----
