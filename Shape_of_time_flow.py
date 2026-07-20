@@ -1386,10 +1386,16 @@ class IMGTransApp(QWidget):
         self._live3d_busy = False
         self._live3d_pending = False
         self._live3d_movie = None
+        self._live3d_frames = None   # 同期表示用の先読み GIF フレーム
         self._live3d_timer = QTimer(self)
         self._live3d_timer.setSingleShot(True)
         self._live3d_timer.setInterval(800)     # 編集のデバウンス
         self._live3d_timer.timeout.connect(self._run_live3d)
+        # プロット同期タイマ: GPU 映像の再生位置 → 赤ライン/3D GIF フレーム
+        self._plot_sync_timer = QTimer(self)
+        self._plot_sync_timer.setInterval(100)   # 10fps で十分滑らか
+        self._plot_sync_timer.timeout.connect(self._sync_plots_tick)
+        self._plot_sync_timer.start()
 
         # i18n: 再翻訳用コールバックの登録簿。各エントリは呼ぶと現在の LANG で
         # 対応 widget のテキストを更新する。
@@ -2606,21 +2612,46 @@ class IMGTransApp(QWidget):
                 except Exception:
                     pass
                 self.live3d_label.setMovie(None)
+            # スケール寸法の決定 (ラベル枠内・アスペクト比保持)
+            native = QImageReader(gif).size()
+            box = self.live3d_label.size()
+            if native.width() > 0 and native.height() > 0:
+                scale = min(box.width() / native.width(),
+                            box.height() / native.height())
+                scaled = QSize(max(1, int(native.width() * scale)),
+                               max(1, int(native.height() * scale)))
+            else:
+                scaled = box
+            # 同期表示用に全フレームを先読み (QMovie の jumpToFrame は GIF で
+            # 任意フレームへ飛べないため、setPixmap による直接表示で同期する)
+            frames = []
+            reader = QImageReader(gif)
+            while True:
+                img = reader.read()
+                if img.isNull():
+                    break
+                frames.append(QPixmap.fromImage(img).scaled(
+                    scaled, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                if not reader.supportsAnimation() or len(frames) > 400:
+                    break
+            self._live3d_frames = frames
+            self._last_sync_frac = -1.0     # 新 GIF で強制再同期
+
             movie = QMovie(gif)
             movie.setCacheMode(QMovie.CacheNone)
             if movie.isValid():
-                native = QImageReader(gif).size()
-                box = self.live3d_label.size()
-                if native.width() > 0 and native.height() > 0:
-                    scale = min(box.width() / native.width(),
-                                box.height() / native.height())
-                    movie.setScaledSize(QSize(
-                        max(1, int(native.width() * scale)),
-                        max(1, int(native.height() * scale))))
-                self.live3d_label.setMovie(movie)
-                movie.frameChanged.connect(self._on_live3d_frame)
-                movie.start()
+                movie.setScaledSize(scaled)
                 self._live3d_movie = movie
+                rt = getattr(self, "rt_preview", None)
+                if rt is not None and rt._F and frames:
+                    # 同期モード: GIF は自走させず、次の sync tick が
+                    # 再生位置に対応するフレームを setPixmap する
+                    pass
+                else:
+                    # 自走モード (RT 未構築): 従来どおり QMovie 再生
+                    self.live3d_label.setMovie(movie)
+                    movie.frameChanged.connect(self._on_live3d_frame)
+                    movie.start()
             self.live3d_status.setText("")
         else:
             self.live3d_status.setText("")
@@ -2630,7 +2661,15 @@ class IMGTransApp(QWidget):
             self._schedule_live3d()
 
     def _on_live3d_frame(self, frame_idx):
-        """3D アニメの再生位置をマップサムネイルの赤ラインに同期させる。"""
+        """[RT未構築時のみ] GIF 自走に合わせて赤ラインを動かすフォールバック。
+
+        GPU リアルタイムプレビューのボリューム構築後は、再生位置を
+        マスタークロックとする _sync_plots_tick が権限を持つ (GIF は
+        jumpToFrame で従属させるため、ここでは何もしない)。
+        """
+        rt = getattr(self, "rt_preview", None)
+        if rt is not None and rt._F:
+            return
         movie = self._live3d_movie
         if movie is None:
             return
@@ -2640,6 +2679,34 @@ class IMGTransApp(QWidget):
             th.set_playhead(frac)
         # 2D プロットにも赤ラインを左→右へスライド表示
         self.live2d_thumb.set_playhead(frac)
+
+    def _sync_plots_tick(self):
+        """GPU 映像の再生位置をマスタークロックとして、2D/3D プロットと
+        グレー画像の赤ラインを同期させる (映像のゆっくりした時間進行に追従)。
+
+        - 赤ライン (2D プロット + Space/Time/Rate サムネイル): 再生位置の割合で移動
+        - 3D GIF: 一時停止して再生位置に対応するフレームへ jumpToFrame
+          (速度変更・スクラブ・一時停止もすべて追従する)
+        """
+        rt = getattr(self, "rt_preview", None)
+        if rt is None or not rt._F or not getattr(self, "live3d_group", None):
+            return
+        frac = min(1.0, rt._t_out / max(1, rt.time_size - 1))
+        if abs(frac - getattr(self, "_last_sync_frac", -1.0)) <= 1e-4:
+            return
+        self._last_sync_frac = frac
+        for th in getattr(self, "_map_thumbs", {}).values():
+            th.set_playhead(frac)
+        self.live2d_thumb.set_playhead(frac)
+        # 3D GIF: 自走 QMovie を止め、先読みフレームを直接表示して同期
+        frames = getattr(self, "_live3d_frames", None)
+        if frames:
+            if self._live3d_movie is not None and \
+                    self._live3d_movie.state() != QMovie.NotRunning:
+                self._live3d_movie.stop()
+                self.live3d_label.setMovie(None)
+            target = int(round(frac * (len(frames) - 1)))
+            self.live3d_label.setPixmap(frames[target])
 
     def generate_sample_image_action(self, type_name):
         """セクション {type_name} のジェネレータ設定でサンプル画像を生成 → 自動セット"""
