@@ -67,6 +67,9 @@ TR = {
                      "en": "2. Preview & Render"},
     "chk_video_only": {"ja": "映像ビューのみ表示",
                         "en": "Video view only"},
+    "chk_audio": {"ja": "音声を適用", "en": "Apply audio"},
+    "audio_mode_play": {"ja": "play (可変速再生)", "en": "play (varispeed)"},
+    "audio_mode_grain": {"ja": "grain (グラニュラー)", "en": "grain (granular)"},
     "grp_setup":   {"ja": "入力 (Setup)", "en": "Setup"},
     # Language selector
     "lang_label":  {"ja": "言語 / Language:",     "en": "Language / 言語:"},
@@ -957,7 +960,8 @@ class RenderWorker(QThread):
                  space_img, time_img, rate_img,
                  duration,
                  space_set=None, time_vmin=None, time_vmax=None, rate_maxdev=None,
-                 anim_only=False, rate_baseline=None, rate_startpoint=None):
+                 anim_only=False, rate_baseline=None, rate_startpoint=None,
+                 audio_out=False, audio_mode="play"):
         super().__init__()
         self.dm = dm
         self.mode = mode
@@ -973,6 +977,8 @@ class RenderWorker(QThread):
         self.rate_baseline = rate_baseline
         self.rate_startpoint = rate_startpoint
         self.anim_only = anim_only
+        self.audio_out = audio_out      # 音声を適用して最終出力を作る
+        self.audio_mode = audio_mode    # "play"=可変速再生 / "grain"=グラニュラー
 
     def run(self):
         try:
@@ -1033,6 +1039,23 @@ class RenderWorker(QThread):
             else:
                 bm.new_transprocess(del_data=False)
                 video_path = self._resolve_video_path(bm)
+
+            # 音声適用: new_transprocess の出力 (out_videopath) に対して
+            # audio_render (mode=play/grain) → mux した動画を最終出力にする。
+            # del_data=False で self.data が残っているため音声レンダリング可能。
+            if self.audio_out and video_path:
+                try:
+                    self.emit(f"=== audio_video_out (mode={self.audio_mode}) ===")
+                    audio_final = bm.audio_video_out(mode=self.audio_mode)
+                    if audio_final and os.path.exists(audio_final):
+                        video_path = audio_final
+                        self.emit(f"audio applied: {os.path.basename(audio_final)}")
+                    else:
+                        self.emit("[WARN] audio_video_out returned no file; "
+                                  "using video-only output.")
+                except Exception as e:
+                    self.emit(f"[WARN] audio_video_out failed: {e} — "
+                              "音声なしの出力を使用します")
 
             self.done_signal.emit(True, video_path, anim_path)
 
@@ -1896,8 +1919,21 @@ class IMGTransApp(QWidget):
         self._live3d_slot = QVBoxLayout()
         t3_l.addLayout(self._live3d_slot, 2)
 
-        # 出力行: Start Rendering + 進捗バー
+        # 出力行: 音声適用 + Start Rendering + 進捗バー
         render_row = QHBoxLayout()
+        self.audio_chk = QCheckBox()
+        self._reg(lambda: self.audio_chk.setText(tr("chk_audio")))
+        render_row.addWidget(self.audio_chk)
+        self.audio_mode_combo = QComboBox()
+        self.audio_mode_combo.addItem(tr("audio_mode_play"), "play")
+        self.audio_mode_combo.addItem(tr("audio_mode_grain"), "grain")
+        self._reg(lambda: (
+            self.audio_mode_combo.setItemText(0, tr("audio_mode_play")),
+            self.audio_mode_combo.setItemText(1, tr("audio_mode_grain")),
+        ))
+        self.audio_mode_combo.setEnabled(False)
+        self.audio_chk.toggled.connect(self.audio_mode_combo.setEnabled)
+        render_row.addWidget(self.audio_mode_combo)
         render_row.addWidget(self.start_btn, 1)
         self.render_progress = QProgressBar()
         self.render_progress.setRange(0, 100)
@@ -2901,7 +2937,9 @@ class IMGTransApp(QWidget):
             self.space_img_path, self.time_img_path, self.rate_img_path,
             duration,
             space_set=space_set, time_vmin=vmin, time_vmax=vmax,
-            rate_maxdev=maxdev, rate_baseline=baseline, rate_startpoint=startpoint
+            rate_maxdev=maxdev, rate_baseline=baseline, rate_startpoint=startpoint,
+            audio_out=self.audio_chk.isChecked(),
+            audio_mode=self.audio_mode_combo.currentData() or "play",
         )
         self.worker.log_signal.connect(self.log)
         self.worker.done_signal.connect(self.on_render_done)
