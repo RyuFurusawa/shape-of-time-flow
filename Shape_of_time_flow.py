@@ -1979,6 +1979,8 @@ class IMGTransApp(QWidget):
         mode = self._selected_apply_mode()
         if mode:
             self.log(f"Apply mode selected: {mode}")
+            # 選択された基準画像から対になるマップを即導出
+            self._sync_derived_maps()
         self._update_apply_mode_info()
         self._update_preview_btn_state()
         self._mark_preview_stale()
@@ -2595,6 +2597,95 @@ class IMGTransApp(QWidget):
         self.log(f"Sample {type_name} ({len(layers)} layer(s): {pats}): {out_path}")
         setattr(self, f"{type_name}_img_path", out_path)
         self._wire_loaded_image(type_name, out_path)
+
+        # 適用方法に応じて相互に導出:
+        #   time to data で time を適用 → rate を time から自動生成
+        #   rate to data で rate を適用 → time を rate から自動生成
+        mode = self._selected_apply_mode()
+        if (type_name == "time" and mode == "time to data") or \
+           (type_name == "rate" and mode == "rate to data"):
+            self._sync_derived_maps()
+
+    # --- time ⇄ rate の相互導出 ---
+    def _load_map_datacoords(self, path):
+        """マップ PNG をデータ座標系 (time行 × scan列) の float 0..1 で返す。"""
+        m = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if m is None:
+            return None
+        if m.ndim == 3:
+            m = m[..., 0]
+        mx = 65535.0 if m.dtype == np.uint16 else 255.0
+        m = m.astype(np.float64) / mx
+        if self._current_sd() == 0:
+            m = m.T
+        return m
+
+    def _save_map_datacoords(self, arr01, fname):
+        """データ座標系 0..1 配列を 16bit PNG としてファイル規約の向きで保存。"""
+        img16 = (np.clip(arr01, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        if self._current_sd() == 0:
+            img16 = img16.T
+        out_path = os.path.join(os.path.dirname(self.videopath) or ".", fname)
+        cv2.imwrite(out_path, img16)
+        return out_path
+
+    def _sync_derived_maps(self):
+        """適用方法の基準画像から、対になるマップを書き出しと同じ式で導出する。
+
+        time to data: rate = ΔTime / (recfps/outfps)  (時間マップの微分)
+        rate to data: time = Σ rate × (recfps/outfps) (レートマップの累積積分)
+        導出結果は sample_*.png として保存し、通常の適用フローに乗せる
+        (サムネイル/ライブプロット/RTプレビューも自動更新される)。
+        """
+        if getattr(self, "_syncing_maps", False) or not self.dm:
+            return
+        mode = self._selected_apply_mode()
+        if mode is None:
+            return
+        self._syncing_maps = True
+        try:
+            frame_step = float(self.dm.recfps) / max(1, self._out_fps())
+            if mode == "time to data" and self.time_img_path:
+                t01 = self._load_map_datacoords(self.time_img_path)
+                if t01 is None or t01.shape[0] < 2:
+                    return
+                vmin = self.time_vmin_spin.value()
+                vmax = self.time_vmax_spin.value()
+                T = vmin + t01 * (vmax - vmin)
+                r = np.diff(T, axis=0) / frame_step
+                r = np.vstack([r, r[-1:]])
+                rmin, rmax = float(r.min()), float(r.max())
+                baseline = round((rmax + rmin) / 2.0, 3)
+                maxdev = max(round((rmax - rmin) / 2.0, 3), 0.001)
+                r01 = (r - (baseline - maxdev)) / (2.0 * maxdev)
+                path = self._save_map_datacoords(r01, f"sample_rate_{maxdev}.png")
+                self.rate_baseline_spin.setValue(baseline)
+                self.rate_img_path = path
+                self._wire_loaded_image("rate", path)
+                self.log(f"[sync] rate を time から自動生成 "
+                         f"(baseline={baseline}, max_dev={maxdev})")
+            elif mode == "rate to data" and self.rate_img_path:
+                r01 = self._load_map_datacoords(self.rate_img_path)
+                if r01 is None or r01.shape[0] < 1:
+                    return
+                baseline = self.rate_baseline_spin.value()
+                maxdev = self.rate_maxdev_spin.value()
+                rates = baseline + (r01 - 0.5) * 2.0 * maxdev
+                cum = np.cumsum(rates, axis=0) * frame_step
+                cum = np.vstack([np.zeros((1, cum.shape[1])), cum[:-1]])
+                vmin_i = int(np.floor(cum.min()))
+                vmax_i = int(np.ceil(cum.max()))
+                span = max(1, vmax_i - vmin_i)
+                t01 = (cum - vmin_i) / span
+                path = self._save_map_datacoords(
+                    t01, f"sample_time_{vmin_i}-{vmax_i}.png")
+                self.time_img_path = path
+                self._wire_loaded_image("time", path)
+                self.log(f"[sync] time を rate から自動生成 (vrange {vmin_i}-{vmax_i})")
+        except Exception as e:
+            self.log(f"[WARN] map sync failed: {e}")
+        finally:
+            self._syncing_maps = False
 
     def _wire_loaded_image(self, img_type, path):
         """select_image() の "画像情報表示 + パラメータ抽出 + プレビュー" 共通処理"""

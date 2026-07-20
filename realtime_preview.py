@@ -78,52 +78,85 @@ def plan_volume(in_w, in_h, total_frames, budget_mb=DEFAULT_BUDGET_MB):
     return sw, sh, F
 
 
+# サンプル間隔がこの値より大きければシーク方式に切り替える。
+#   順次方式のコスト ≈ 全フレームデコード / シーク方式 ≈ F × (GOP/2)
+# 間隔が十数フレーム程度なら順次が速く、間隔が大きい長尺・高解像度
+# (例: 4K 10bit 51分 = 37万フレームから 123 枚) ではシークが圧倒的に速い。
+SEEK_STEP_THRESHOLD = 40
+
+
+def _frame_to_rgba(fr, sw, sh):
+    fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+    if (fr.shape[1], fr.shape[0]) != (sw, sh):
+        fr = cv2.resize(fr, (sw, sh), interpolation=cv2.INTER_AREA)
+    rgba = np.empty((sh, sw, 4), np.uint8)
+    rgba[..., :3] = fr
+    rgba[..., 3] = 255
+    return rgba
+
+
 def decode_volume_progressive(video_path, sw, sh, F, batch_cb,
                               cancel=None, batch=16):
-    """動画を先頭から順次デコードし、等間隔サンプリングした F フレームを
-    batch ごとに batch_cb(start_index, frames_array) で通知する。
+    """動画から等間隔サンプリングした F フレームを batch ごとに
+    batch_cb(start_index, frames_array) で通知する (プログレッシブ供給源)。
 
-    以前のランダムシーク方式 (cap.set POS_FRAMES) は HEVC 等ではシークごとに
-    キーフレームから再デコードが走り極端に遅かった。ここでは grab() で
-    順次読み進め、必要なフレームだけ retrieve() する (入力映像の前半から
-    座標変換が進行していくプログレッシブ表示の供給源)。
+    サンプル間隔に応じて 2 方式を自動選択:
+    - 間隔小 (短いクリップ): grab() で順次読み進め、必要フレームのみ retrieve()。
+      シークごとのキーフレーム再デコードを避ける。
+    - 間隔大 (長尺/高解像度): フレーム位置シーク。全フレームデコードを避ける
+      (37万フレームの 4K 10bit で 36分 → 30秒台)。
     """
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or F
     idxs = np.linspace(0, max(0, total - 1), F).astype(int)
+    step = total / max(1, F)
     buf = []
     start = 0
-    j = 0
-    src_i = 0
-    while j < F:
-        if cancel is not None and cancel.is_set():
-            break
-        if not cap.grab():
-            break
-        if src_i == idxs[j]:
-            ok, fr = cap.retrieve()
-            if ok:
-                fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-                if (fr.shape[1], fr.shape[0]) != (sw, sh):
-                    fr = cv2.resize(fr, (sw, sh), interpolation=cv2.INTER_AREA)
-                rgba = np.empty((sh, sw, 4), np.uint8)
-                rgba[..., :3] = fr
-                rgba[..., 3] = 255
-            else:
-                rgba = np.zeros((sh, sw, 4), np.uint8)
+
+    def flush():
+        nonlocal buf, start
+        if buf:
+            batch_cb(start, np.stack(buf))
+            start += len(buf)
+            buf = []
+
+    if step > SEEK_STEP_THRESHOLD:
+        # --- シーク方式 ---
+        # 注: 並列シークは各 HEVC デコーダが内部でマルチスレッドなため
+        # CPU 競合で逆に遅くなる (実測 131s→178s)。単線が最速。
+        seek_batch = max(4, batch // 2)
+        for j in range(F):
+            if cancel is not None and cancel.is_set():
+                break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idxs[j]))
+            ok, fr = cap.read()
+            rgba = _frame_to_rgba(fr, sw, sh) if ok else np.zeros((sh, sw, 4), np.uint8)
             buf.append(rgba)
-            j += 1
-            # linspace の丸めで同一 src インデックスが連続するケース
-            while j < F and idxs[j] == src_i:
+            if len(buf) >= seek_batch:
+                flush()
+    else:
+        # --- 順次方式 ---
+        j = 0
+        src_i = 0
+        while j < F:
+            if cancel is not None and cancel.is_set():
+                break
+            if not cap.grab():
+                break
+            if src_i == idxs[j]:
+                ok, fr = cap.retrieve()
+                rgba = _frame_to_rgba(fr, sw, sh) if ok else np.zeros((sh, sw, 4), np.uint8)
                 buf.append(rgba)
                 j += 1
-            if len(buf) >= batch:
-                batch_cb(start, np.stack(buf))
-                start += len(buf)
-                buf = []
-        src_i += 1
-    if buf and not (cancel is not None and cancel.is_set()):
-        batch_cb(start, np.stack(buf))
+                # linspace の丸めで同一 src インデックスが連続するケース
+                while j < F and idxs[j] == src_i:
+                    buf.append(rgba)
+                    j += 1
+                if len(buf) >= batch:
+                    flush()
+            src_i += 1
+    if not (cancel is not None and cancel.is_set()):
+        flush()
     cap.release()
 
 
