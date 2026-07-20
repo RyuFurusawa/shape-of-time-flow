@@ -15,7 +15,9 @@ playhead をループさせることでプレビューが「動く」。
 """
 
 import os
+import sys
 import threading
+import subprocess
 import time
 
 import numpy as np
@@ -95,6 +97,217 @@ def _frame_to_rgba(fr, sw, sh):
     return rgba
 
 
+def _probe_video(video_path):
+    """ffprobe で (pix_fmt, fps) を返す。失敗時は (None, None)。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt,r_frame_rate",
+             "-of", "csv=p=0", video_path],
+            capture_output=True, timeout=10).stdout.decode().strip()
+        pix_fmt, rate = out.split(",")[:2]
+        num, den = rate.split("/")
+        return pix_fmt, float(num) / float(den)
+    except Exception:
+        return None, None
+
+
+def _decode_ffmpeg_vt(video_path, sw, sh, idxs, batch_cb,
+                      cancel=None, batch=16, keyframes_only=False):
+    """macOS: VideoToolbox 一貫パイプラインでデコードする最速パス。
+
+    GPU デコード → scale_vt (GPU 縮小) → 小フレームのみ hwdownload → rgb24。
+    4K 10bit の巨大フレームを CPU に下ろさないのが要点 (実測: キーフレーム
+    966枚で PyAV 70s / CPUスケール 45s → 6.9s)。
+
+    keyframes_only=True: -skip_frame nokey でキーフレームだけデコードし、
+    各スロットに最近傍キーフレームを割り当てる (疎サンプリング用)。
+    フレーム番号は showinfo フィルタの pts_time から復元する。
+    """
+    pix_fmt, fps = _probe_video(video_path)
+    if not fps:
+        raise RuntimeError("ffprobe failed")
+    # hwdownload はサーフェス形式と一致する明示指定が必要 (自動交渉は nv12 固定で失敗する)
+    if pix_fmt and "10le" in pix_fmt:
+        dlfmt = "p210le" if "422" in pix_fmt else "p010le"
+    else:
+        dlfmt = "nv12"
+
+    idxs = np.asarray(idxs, dtype=np.int64)
+    F = len(idxs)
+    z0, z1 = int(idxs[0]), int(idxs[-1])
+    ss = z0 / fps
+    dur = (z1 - z0) / fps + 2.0     # GOP ぶんのマージン
+
+    vf = (f"scale_vt=w={sw}:h={sh},hwdownload,format={dlfmt},"
+          f"format=rgb24,showinfo")
+    cmd = ["ffmpeg", "-v", "info", "-nostats",
+           "-hwaccel", "videotoolbox",
+           "-hwaccel_output_format", "videotoolbox_vld"]
+    if keyframes_only:
+        cmd += ["-skip_frame", "nokey"]
+    cmd += ["-ss", f"{ss:.6f}", "-t", f"{dur:.6f}", "-i", video_path,
+            "-vf", vf, "-fps_mode", "passthrough",
+            "-f", "rawvideo", "pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, bufsize=10 ** 7)
+
+    import queue as _queue
+    import re as _re
+    pts_q = _queue.Queue()
+    pts_re = _re.compile(rb"pts_time:([0-9]+(?:\.[0-9]+)?)")
+
+    def read_stderr():
+        for line in proc.stderr:
+            m = pts_re.search(line)
+            if m:
+                pts_q.put(float(m.group(1)))
+        pts_q.put(None)     # EOF マーカー
+
+    threading.Thread(target=read_stderr, daemon=True).start()
+
+    frame_bytes = sw * sh * 3
+    buf = []
+    start = 0
+    j = 0
+    prev_rgba = None
+    prev_fi = None
+    got_any = False
+
+    def flush():
+        nonlocal buf, start
+        if buf:
+            batch_cb(start, np.stack(buf))
+            start += len(buf)
+            buf = []
+
+    try:
+        while j < F:
+            if cancel is not None and cancel.is_set():
+                return
+            data = proc.stdout.read(frame_bytes)
+            if not data or len(data) < frame_bytes:
+                break
+            pts = pts_q.get(timeout=15)
+            if pts is None:
+                break
+            got_any = True
+            fi = z0 + int(round(pts * fps))
+            arr = np.frombuffer(data, np.uint8).reshape(sh, sw, 3)
+            rgba = np.empty((sh, sw, 4), np.uint8)
+            rgba[..., :3] = arr
+            rgba[..., 3] = 255
+            while j < F and idxs[j] <= fi:
+                if prev_fi is not None and (idxs[j] - prev_fi) < (fi - idxs[j]):
+                    buf.append(prev_rgba)
+                else:
+                    buf.append(rgba)
+                j += 1
+                if len(buf) >= batch:
+                    flush()
+            prev_rgba, prev_fi = rgba, fi
+        if not got_any:
+            raise RuntimeError("ffmpeg vt pipeline produced no frames")
+        while j < F and prev_rgba is not None:
+            buf.append(prev_rgba)
+            j += 1
+            if len(buf) >= batch:
+                flush()
+        flush()
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _decode_sparse_av_keyframes(video_path, sw, sh, idxs, batch_cb,
+                                cancel=None, batch=16):
+    """疎サンプリング用: PyAV でキーフレームのみデコードして各スロットに
+    最近傍キーフレームを割り当てる (macOS では VideoToolbox HWデコード)。
+
+    サンプル間隔がキーフレーム間隔より大きい場合、全フレームデコードや
+    フレームシークより桁違いに速い (4K 10bit HEVC 実測: cv2シーク 133s →
+    HWキーフレーム 8s)。時間誤差は最大 GOP/2 フレームでプレビューでは
+    知覚されない。
+    """
+    import av
+    hw = None
+    if sys.platform == "darwin":
+        try:
+            from av.codec.hwaccel import HWAccel
+            hw = HWAccel(device_type="videotoolbox",
+                         allow_software_fallback=True)
+        except Exception:
+            hw = None
+    container = av.open(video_path, hwaccel=hw) if hw else av.open(video_path)
+    try:
+        vs = container.streams.video[0]
+        vs.thread_type = "AUTO"
+        vs.codec_context.skip_frame = "NONKEY"
+        fps = float(vs.average_rate or 30.0)
+        tb = float(vs.time_base) if vs.time_base else 1.0 / fps
+        idxs = np.asarray(idxs, dtype=np.int64)
+        F = len(idxs)
+        z0 = int(idxs[0])
+        if z0 > 0:
+            container.seek(int(z0 / fps * av.time_base), backward=True)
+
+        buf = []
+        start = 0
+        j = 0
+        prev_rgba = None
+        prev_fi = None
+
+        def flush():
+            nonlocal buf, start
+            if buf:
+                batch_cb(start, np.stack(buf))
+                start += len(buf)
+                buf = []
+
+        def to_rgba(frame):
+            arr = frame.reformat(width=sw, height=sh, format="rgb24").to_ndarray()
+            rgba = np.empty((sh, sw, 4), np.uint8)
+            rgba[..., :3] = arr
+            rgba[..., 3] = 255
+            return rgba
+
+        fallback_fi = z0
+        for frame in container.decode(vs):
+            if cancel is not None and cancel.is_set():
+                return
+            if frame.pts is not None:
+                fi = int(round(float(frame.pts) * tb * fps))
+            else:
+                fi = fallback_fi
+            fallback_fi = fi + 1
+            rgba = None     # 遅延変換 (使うスロットがあるときのみ)
+            # このキーフレームより手前のスロットを最近傍で埋める
+            while j < F and idxs[j] <= fi:
+                if prev_fi is not None and (idxs[j] - prev_fi) < (fi - idxs[j]):
+                    buf.append(prev_rgba)
+                else:
+                    if rgba is None:
+                        rgba = to_rgba(frame)
+                    buf.append(rgba)
+                j += 1
+                if len(buf) >= batch:
+                    flush()
+            if j >= F:
+                break
+            if rgba is None:
+                rgba = to_rgba(frame)
+            prev_rgba, prev_fi = rgba, fi
+        # ストリーム終端: 残りは最後のキーフレームで埋める
+        while j < F and prev_rgba is not None:
+            buf.append(prev_rgba)
+            j += 1
+        flush()
+    finally:
+        container.close()
+
+
 def decode_volume_progressive(video_path, sw, sh, idxs, batch_cb,
                               cancel=None, batch=16):
     """指定した入力フレーム番号列 idxs (昇順) を batch ごとに
@@ -102,14 +315,28 @@ def decode_volume_progressive(video_path, sw, sh, idxs, batch_cb,
 
     idxs は軌道データが実際に参照する時間範囲 [z0, z1] を等分したもの
     (imgtrans レンダリングコアと同じ「必要範囲だけ読む」方式)。
-    範囲先頭へ 1 回だけシークし、以後は grab() で連続読み込みする。
-    範囲内でもサンプル間隔が大きい場合のみフレームシークに切り替える。
+
+    パス選択:
+      1. macOS: VideoToolbox 一貫パイプライン (最速。疎ならキーフレームのみ)
+      2. 疎: PyAV キーフレーム方式 (HW/SW)
+      3. 密: cv2 順次 / 疎: cv2 フレームシーク (最終フォールバック)
     """
-    cap = cv2.VideoCapture(video_path)
     idxs = np.asarray(idxs, dtype=np.int64)
     F = len(idxs)
     z0 = int(idxs[0])
     step = (int(idxs[-1]) - z0) / max(1, F - 1)
+
+    if sys.platform == "darwin":
+        try:
+            _decode_ffmpeg_vt(video_path, sw, sh, idxs, batch_cb,
+                              cancel=cancel, batch=batch,
+                              keyframes_only=(step > SEEK_STEP_THRESHOLD))
+            return
+        except Exception:
+            if cancel is not None and cancel.is_set():
+                return
+
+    cap = cv2.VideoCapture(video_path)
     buf = []
     start = 0
 
@@ -121,7 +348,15 @@ def decode_volume_progressive(video_path, sw, sh, idxs, batch_cb,
             buf = []
 
     if step > SEEK_STEP_THRESHOLD:
-        # --- 範囲内でも疎な場合: フレームシーク方式 ---
+        # --- 疎サンプリング: まず PyAV キーフレーム方式 (HW) を試す ---
+        try:
+            cap.release()
+            _decode_sparse_av_keyframes(video_path, sw, sh, idxs,
+                                        batch_cb, cancel=cancel, batch=batch)
+            return
+        except Exception:
+            cap = cv2.VideoCapture(video_path)   # フォールバック: cv2 シーク
+        # --- フォールバック: フレームシーク方式 ---
         # 注: 並列シークは各 HEVC デコーダが内部でマルチスレッドなため
         # CPU 競合で逆に遅くなる (実測 131s→178s)。単線が最速。
         seek_batch = max(4, batch // 2)
