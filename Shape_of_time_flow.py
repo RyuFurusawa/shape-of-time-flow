@@ -150,6 +150,9 @@ TR = {
     "live3d_waiting": {"ja": "(画像と適用方法が揃うと自動生成されます)",
                         "en": "(auto-generates once images & apply mode are set)"},
     "live3d_updating": {"ja": "更新中…", "en": "updating…"},
+    "tip_time_gen_disabled": {
+        "ja": "rate to data 選択中は Time は Rate から自動導出されるため無効です",
+        "en": "Disabled while 'rate to data' is selected — Time is derived from Rate"},
     "lbl_apply_mode_info": {"ja": "適用方法: {m}   (変更は「1. 入力・画像」タブで)",
                              "en": "Apply mode: {m}   (change on the Setup & Images tab)"},
     "status_need_mode": {"ja": "Status: 適用方法が未選択です (「1. 入力・画像」タブで選択)",
@@ -1926,6 +1929,7 @@ class IMGTransApp(QWidget):
             self.animonly_btn.setEnabled(True)
             self.anim_settings_container.setVisible(True)
             self.log("Animation-only rendering is now available.")
+        self._update_generate_gates()
         self._update_tab_gating()
 
     # --- Tab gating ---
@@ -1975,12 +1979,27 @@ class IMGTransApp(QWidget):
         m = self._selected_apply_mode() or "—"
         self.apply_mode_info.setText(tr("lbl_apply_mode_info", m=m))
 
+    def _update_generate_gates(self):
+        """適用方法に応じて Generate & Apply の可否を制御する。
+
+        rate to data 選択中は Time が Rate から自動導出されるため、
+        Time セクションの生成適用ボタンを無効化する。
+        """
+        g = self._section_gens.get("time", {})
+        btn = g.get("generate_btn")
+        if btn is None:
+            return
+        rate_mode = (self._selected_apply_mode() == "rate to data")
+        btn.setEnabled(self.dm is not None and not rate_mode)
+        btn.setToolTip(tr("tip_time_gen_disabled") if rate_mode else "")
+
     def on_apply_mode_changed(self, *_):
         mode = self._selected_apply_mode()
         if mode:
             self.log(f"Apply mode selected: {mode}")
             # 選択された基準画像から対になるマップを即導出
             self._sync_derived_maps()
+        self._update_generate_gates()
         self._update_apply_mode_info()
         self._update_preview_btn_state()
         self._mark_preview_stale()
@@ -2679,9 +2698,14 @@ class IMGTransApp(QWidget):
                 t01 = (cum - vmin_i) / span
                 path = self._save_map_datacoords(
                     t01, f"sample_time_{vmin_i}-{vmax_i}.png")
+                # 導出 time は 3D プロット下のサムネイルにのみ反映する。
+                # Time セクションの生成画面 (プレビュー/パラメータ) はユーザーの
+                # 編集領域なので上書きしない。
                 self.time_img_path = path
-                self._wire_loaded_image("time", path)
-                self.log(f"[sync] time を rate から自動生成 (vrange {vmin_i}-{vmax_i})")
+                if "time" in getattr(self, "_map_thumbs", {}):
+                    self._map_thumbs["time"].set_map(path)
+                self.log(f"[sync] time を rate から自動生成 (vrange {vmin_i}-{vmax_i}, "
+                         f"サムネイルのみ更新)")
         except Exception as e:
             self.log(f"[WARN] map sync failed: {e}")
         finally:
