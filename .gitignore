@@ -21,3 +21,7 @@ env/
 *.mp4
 *.npy
 out.jpeg
+
+# Local scripts / libs
+imgtrans.py
+imgtrans_lib/

@@ -15,6 +15,7 @@ import sys
 import os
 import re
 import time
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QFileDialog,
     QComboBox, QTextEdit, QCheckBox, QMessageBox, QSpinBox, QHBoxLayout,
     QFrame, QDoubleSpinBox, QGroupBox, QTabWidget, QScrollArea, QSplitter,
-    QProgressBar, QSizePolicy
+    QProgressBar, QSizePolicy, QSlider
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QTimer
 from PyQt5.QtGui import (QImage, QPixmap, QMovie, QImageReader,
@@ -70,6 +71,10 @@ TR = {
     "chk_audio": {"ja": "音声を適用", "en": "Apply audio"},
     "audio_mode_play": {"ja": "play (可変速再生)", "en": "play (varispeed)"},
     "audio_mode_grain": {"ja": "grain (グラニュラー)", "en": "grain (granular)"},
+    "audio_out_on": {"ja": "音声出力: {m} × {v}声 (プレビューの設定を使用)",
+                      "en": "Audio out: {m} × {v} voices (from preview settings)"},
+    "audio_out_off": {"ja": "音声出力: なし (プレビューの「音声」で有効化)",
+                       "en": "Audio out: none (enable via the preview's Audio)"},
     "grp_setup":   {"ja": "入力 (Setup)", "en": "Setup"},
     # Language selector
     "lang_label":  {"ja": "言語 / Language:",     "en": "Language / 言語:"},
@@ -208,6 +213,86 @@ TR = {
     "btn_open_external": {"ja": "外部プレイヤーで開く", "en": "Open in external player"},
     "no_multimedia": {"ja": "(QtMultimedia が無いため内蔵再生できません)",
                        "en": "(QtMultimedia not available — embedded playback disabled)"},
+    # --- 入力映像の回転 (Initialize 前に ffmpeg で回転コピーを作る) ---
+    "lbl_video_rotate": {"ja": "入力映像の回転:", "en": "Input video rotation:"},
+    "vrot_none":  {"ja": "なし (0°)",            "en": "None (0°)"},
+    "vrot_cw90":  {"ja": "右90° (時計回り)",      "en": "90° clockwise"},
+    "vrot_180":   {"ja": "180°",                 "en": "180°"},
+    "vrot_ccw90": {"ja": "左90° (反時計回り)",    "en": "90° counter-clockwise"},
+    "vrot_hflip": {"ja": "左右反転",              "en": "Flip horizontal"},
+    "vrot_vflip": {"ja": "上下反転",              "en": "Flip vertical"},
+    "hint_video_rotate": {
+        "ja": "(90°系はメタデータ書き換えのみ = 瞬時・無劣化。反転のみ再エンコード)",
+        "en": "(90° variants remux metadata only — instant, lossless; flips re-encode)"},
+    "vrot_no_ffmpeg": {"ja": "ffmpeg が見つかりません。映像の回転には ffmpeg が必要です。",
+                        "en": "ffmpeg not found — video rotation requires ffmpeg."},
+    "vrot_working":  {"ja": "映像を回転中… (ffmpeg)", "en": "Rotating video… (ffmpeg)"},
+    "vrot_reuse":    {"ja": "回転済みの映像を再利用: {p}",
+                       "en": "Reusing existing rotated video: {p}"},
+    "vrot_failed":   {"ja": "映像の回転に失敗しました。ログを確認してください。",
+                       "en": "Video rotation failed — see the log."},
+    "vrot_reinit":   {"ja": "入力設定を変更しました → 「初期化」をもう一度押してください",
+                       "en": "Input settings changed → press Initialize again"},
+    # --- 入力映像プレビュー / 使用範囲 ---
+    "vid_info": {"ja": "{w}×{h}  |  {n} frames  |  {fps:.2f} fps  |  {dur:.2f} 秒",
+                  "en": "{w}×{h}  |  {n} frames  |  {fps:.2f} fps  |  {dur:.2f} s"},
+    "lbl_use_range": {"ja": "使用範囲 / 再生位置:", "en": "Use range / playhead:"},
+    "btn_range_full": {"ja": "全尺", "en": "Full"},
+    "hint_use_range": {
+        "ja": "(青=開始/終了・赤=再生位置。既定は全尺・頭合わせ。\n"
+              "範囲は軌道データの時間軸調整で適用 — コピー不要・初期化不要)",
+        "en": "(blue = start/end, red = playhead. Default: full length, head-aligned.\n"
+              "Applied by adjusting the trajectory time axis — no copy, no re-init)"},
+    "range_readout": {
+        "ja": "{s:.2f} – {e:.2f} 秒  (使用尺 {d:.2f}s)   |   再生位置 {p:.2f}s",
+        "en": "{s:.2f} – {e:.2f} s  (selected {d:.2f}s)   |   playhead {p:.2f}s"},
+    # --- rate to data の同期点 ---
+    "lbl_sync_anchor": {"ja": "同期点:", "en": "Sync point:"},
+    "sync_head": {"ja": "頭", "en": "Head"},
+    "sync_mid":  {"ja": "中央", "en": "Mid"},
+    "sync_tail": {"ja": "尾", "en": "Tail"},
+    "hint_sync_anchor": {
+        "ja": "(rate to data: 全スリットの時刻が一致する出力位置。"
+              "0%=先頭 / 50%=中央 / 100%=最終フレームで同期)",
+        "en": "(rate to data: output position where all slit times coincide — "
+              "0% head / 50% middle / 100% last frame)"},
+    # --- 階調表示モード ---
+    "chk_colormap": {"ja": "黄(255)–青(0) 表示", "en": "Yellow(255)–Blue(0) view"},
+    "hint_colormap": {"ja": "(表示のみ。書き出す PNG はグレースケールのまま)",
+                       "en": "(display only — exported PNGs stay grayscale)"},
+    # --- 適用画像の後処理 ---
+    "grp_postproc": {"ja": "適用画像の後処理 (破壊的)",
+                      "en": "Post-process applied image (destructive)"},
+    "btn_pp_invert": {"ja": "⚡ 階調反転 (元に戻せません)",
+                       "en": "⚡ Invert tones (no undo)"},
+    "lbl_pp_midgray": {"ja": "基準グレー:", "en": "Mid-gray:"},
+    "hint_pp_midgray": {"ja": "(ヒストグラム中間値をずらす / 0.50 = 変更なし)",
+                         "en": "(shifts the histogram midpoint / 0.50 = no change)"},
+    "lbl_pp_rotate": {"ja": "回転:", "en": "Rotate:"},
+    "hint_pp_rotate": {"ja": "(正=反時計回り。縦横サイズは維持したまま再マッピング)",
+                        "en": "(+ = counter-clockwise; remapped, original pixel size kept)"},
+    "btn_pp_apply": {"ja": "適用 (画像に書き込み)", "en": "Apply (write to image)"},
+    "btn_pp_reset": {"ja": "リセット", "en": "Reset"},
+    "pp_pending": {"ja": "▲ プレビュー中 — 「適用」で画像ファイルへ書き込みます",
+                    "en": "▲ Preview only — press Apply to write to the image file"},
+    "pp_no_image": {"ja": "(適用画像がまだありません)", "en": "(no applied image yet)"},
+    "pp_confirm_title": {"ja": "破壊的な編集の確認", "en": "Confirm destructive edit"},
+    "pp_confirm_invert": {
+        "ja": "{t} の適用画像 ({f}) の階調を反転して上書きします。\n\n"
+              "この操作は元に戻せません。\n"
+              "(必要なら「生成して適用」でレイヤーから作り直せます)\n\n続行しますか?",
+        "en": "This inverts the tones of the applied {t} image ({f}) and overwrites it.\n\n"
+              "This cannot be undone.\n"
+              "(You can rebuild it from the layers with Generate & Apply.)\n\nContinue?"},
+    "pp_confirm_apply": {
+        "ja": "{t} の適用画像 ({f}) に次の後処理を書き込みます:\n{ops}\n\n"
+              "この操作は元に戻せません。\n\n続行しますか?",
+        "en": "The following post-process will be written into the applied {t} image ({f}):\n{ops}\n\n"
+              "This cannot be undone.\n\nContinue?"},
+    "pp_op_midgray": {"ja": "・基準グレー: 0.50 → {v:.2f}", "en": "・Mid-gray: 0.50 → {v:.2f}"},
+    "pp_op_rotate": {"ja": "・回転: {v:.1f}°", "en": "・Rotate: {v:.1f}°"},
+    "pp_nothing": {"ja": "後処理の変更がありません (基準グレー 0.50 / 回転 0°)。",
+                    "en": "Nothing to apply (mid-gray 0.50 / rotation 0°)."},
 }
 
 
@@ -216,6 +301,354 @@ def tr(key, **fmt):
     d = TR.get(key)
     s = (d.get(LANG) or d.get("ja")) if d else key
     return s.format(**fmt) if fmt else s
+
+
+# ======== 階調表示モード (グレースケール / 黄(255)–青(0)) ========
+# GUI 上の "表示" にのみ効くモード。書き出される 16bit PNG は常にグレースケール
+# なので、レンダリング結果には一切影響しない。
+COLOR_MODE = "gray"          # "gray" | "yellowblue"
+
+_YB_LUT = None
+
+
+def _yb_lut():
+    """0..255 → RGB の 黄(255)–青(0) ランプ LUT (uint8, shape (256, 3))。
+
+    純粋な 青 (0,0,255) → グレー → 黄 (255,255,0) の RGB 補間をベースに、
+    線形輝度を中間グレーの輝度へ部分補正して明度差をできるだけ抑える
+    (完全equalize すると青緑〜オレンジに見えてしまうため色相は動かさない)。
+    中間値 0.5 は無彩色グレーのままなので「基準グレー」も目視しやすい。
+    """
+    global _YB_LUT
+    if _YB_LUT is None:
+        W = np.array([0.2126, 0.7152, 0.0722], np.float32)   # 線形輝度係数
+        v = np.arange(256, dtype=np.float32) / 255.0
+        rgb = np.stack([v, v, 1.0 - v], axis=-1)             # 前版と同じ補間
+        # sRGB → 線形
+        lin = np.where(rgb <= 0.04045, rgb / 12.92,
+                       ((rgb + 0.055) / 1.055) ** 2.4)
+        Y = lin @ W
+        Yt = float(Y[128])                                   # 目標 = 中間グレー
+        # 部分補正 (65%): 黄側を減光 / 青側を増光 (クリップまで)
+        gain = (Yt / np.maximum(Y, 1e-6)) ** 0.65
+        lin = np.clip(lin * gain[:, None], 0.0, 1.0)
+        # 青側はクリップで持ち上げきれないため、白を少量混ぜて補う (上限付き)
+        add = np.clip((Yt - lin @ W) * 0.5, 0.0, 0.25)
+        lin = lin + add[:, None] * (1.0 - lin)
+        srgb = np.where(lin <= 0.0031308, lin * 12.92,
+                        1.055 * np.power(lin, 1 / 2.4) - 0.055)
+        _YB_LUT = (np.clip(srgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return _YB_LUT
+
+
+def colorize_gray8(gray8):
+    """uint8 グレースケール (h, w) → 現在の階調表示モードの RGB uint8 (h, w, 3)。"""
+    return np.ascontiguousarray(_yb_lut()[gray8])
+
+
+def gray8_to_qpixmap(gray8):
+    """uint8 グレースケール配列を、現在の階調表示モードで QPixmap 化する。"""
+    gray8 = np.ascontiguousarray(gray8)
+    h, w = gray8.shape[:2]
+    if COLOR_MODE == "yellowblue":
+        rgb = colorize_gray8(gray8)
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+    else:
+        qimg = QImage(gray8.data, w, h, w, QImage.Format_Grayscale8).copy()
+    return QPixmap.fromImage(qimg)
+
+
+def colorize_pixmap(pm):
+    """既存 QPixmap をグレースケールとみなして着色する (gray モードでは素通し)。"""
+    if COLOR_MODE != "yellowblue" or pm is None or pm.isNull():
+        return pm
+    img = pm.toImage().convertToFormat(QImage.Format_Grayscale8)
+    w, h = img.width(), img.height()
+    ptr = img.bits()
+    ptr.setsize(img.byteCount())
+    gray = np.frombuffer(ptr, np.uint8).reshape(h, img.bytesPerLine())[:, :w]
+    return gray8_to_qpixmap(gray)
+
+
+# ======== 適用画像の後処理 (破壊的 / uint16 ファイル座標系で動作) ========
+
+def read_map16(path):
+    """マップ PNG を uint16 (h, w) 単チャンネルで読み込む (失敗時 None)。"""
+    m = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if m is None:
+        return None
+    if m.ndim == 3:
+        m = m[..., 0]
+    if m.dtype != np.uint16:
+        m = (m.astype(np.float32) / 255.0 * 65535.0 + 0.5).astype(np.uint16)
+    return m
+
+
+def pp_invert(img16):
+    """階調反転 (v → 65535 - v)。"""
+    return (65535 - img16.astype(np.int32)).astype(np.uint16)
+
+
+def pp_midgray(img16, target):
+    """基準グレーの移動: 入力 0.5 が target に来るガンマ補正 (Levels の中間調)。
+
+    端点 0 / 1 は固定されるため、レンジを保ったままヒストグラムの重心だけが
+    動く。target=0.5 は恒等変換。
+    """
+    t = float(np.clip(target, 0.01, 0.99))
+    if abs(t - 0.5) < 1e-6:
+        return img16
+    gamma = float(np.log(t) / np.log(0.5))
+    x = img16.astype(np.float32) / 65535.0
+    return (np.clip(np.power(x, gamma), 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+
+
+def pp_rotate(img16, deg):
+    """画像を deg 回転し、回転後の外接矩形を元の W×H へ引き伸ばして戻す。
+
+    「縦横の画像サイズは維持したまま再マッピングする」方針。90° 回転や斜め
+    回転では縦横比が変わるので非等方スケールがかかり、多少のブロックノイズ /
+    ぼけが出るが、img_to_maneuver が要求する space/time の形状一致は保たれる。
+    """
+    deg = float(deg) % 360.0
+    if abs(deg) < 1e-6:
+        return img16
+    h, w = img16.shape[:2]
+    a = np.deg2rad(deg)
+    c, s = abs(np.cos(a)), abs(np.sin(a))
+    bw = w * c + h * s          # 回転後の外接矩形
+    bh = w * s + h * c
+    sx, sy = w / max(bw, 1e-6), h / max(bh, 1e-6)
+    cx, cy = w / 2.0, h / 2.0
+    # p' = C + diag(sx,sy) · R · (p - C)
+    M = cv2.getRotationMatrix2D((cx, cy), deg, 1.0)
+    M[0, :] *= sx
+    M[1, :] *= sy
+    M[0, 2] += cx * (1.0 - sx)
+    M[1, 2] += cy * (1.0 - sy)
+    return cv2.warpAffine(img16, M, (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def pp_apply_pending(img16, midgray=0.5, rotate=0.0):
+    """未適用の後処理 (基準グレー → 回転) をまとめて適用する。"""
+    out = pp_midgray(img16, midgray)
+    return pp_rotate(out, rotate)
+
+
+# ======== rate to data: 同期点 (スリット時刻が一致する出力位置) ========
+def apply_sync_anchor(dm, anchor01):
+    """各スリットの時間軌道に列ごとの定数オフセットを与え、出力タイムライン上の
+    anchor01 (0=頭 / 0.5=中央 / 1=最終フレーム) で全スリットの時刻を一致させる。
+
+    rate to data の累積積分は先頭フレームで全スリット同時刻 (=startpoint) から
+    始まり徐々にズレていく。この関数はその「同期位置」を任意の出力位置へ移す
+    (anchor01=0 は現状どおりで no-op)。同期時刻は各スリットの anchor 時刻の
+    平均にするため、全体の時間的な置き場所は大きく動かない。
+    """
+    a = float(anchor01)
+    if a <= 1e-9:
+        return
+    z = dm.data[:, :, 1]
+    row = int(round(min(1.0, a) * (z.shape[0] - 1)))
+    ref = z[row, :].copy()
+    dm.data[:, :, 1] = z - ref[None, :] + float(ref.mean())
+    try:
+        dm.maneuver_log(f"SyncAnchor{a:.2f}")
+    except Exception:
+        pass
+
+
+# ======== 使用範囲: 軌道データの時間軸調整 ========
+def fit_trajectory_to_range(dm, s_frame, e_frame):
+    """軌道データ (dm.data[:,:,1] = 参照する入力フレーム番号) を
+    使用範囲 [s_frame, e_frame] に収める。ファイルコピーは作らない。
+
+    1. applyTimeSlide: 冒頭フレーム (中央スリット) の参照時刻を範囲開始へ
+       スライドする (頭合わせ)
+    2. 範囲開始より前を参照する軌道があれば全体を押し上げる
+    3. 範囲終了を超える軌道があれば開始点基準でスケーリングして収める
+       (zPointCheck の [0, count] 版と同じ方針を [s, e] に適用)
+    """
+    dm.applyTimeSlide(int(round(s_frame)), baseframe=0)
+    z = dm.data[:, :, 1]
+    zmin = float(np.amin(z))
+    if zmin < s_frame:
+        dm.data[:, :, 1] += (s_frame - zmin)
+    zmax = float(np.amax(dm.data[:, :, 1]))
+    if zmax > e_frame and (zmax - s_frame) > 1e-9:
+        scale = (e_frame - s_frame) / (zmax - s_frame)
+        dm.data[:, :, 1] = s_frame + (dm.data[:, :, 1] - s_frame) * scale
+        print(f"range fit: scaled x{scale:.4f} into [{s_frame}, {e_frame}]")
+    try:
+        dm.maneuver_log(f"RangeFit{int(s_frame)}-{int(e_frame)}")
+    except Exception:
+        pass
+
+
+# ======== 入力映像の回転 ========
+# 90°系: Display Matrix メタデータの書き換えリマックス (-display_rotation +
+#        ストリームコピー)。再エンコードなしで瞬時・画質劣化ゼロ。
+#        cv2 は自動回転、imgtrans は既存の input_rotation 機構が解釈する。
+# 反転:  メタデータで表現できないため従来どおり ffmpeg 再エンコード。
+VIDEO_ROTATIONS = [
+    ("none",  "vrot_none",  None),
+    ("cw90",  "vrot_cw90",  "transpose=1"),
+    ("180",   "vrot_180",   "transpose=1,transpose=1"),
+    ("ccw90", "vrot_ccw90", "transpose=2"),
+    ("hflip", "vrot_hflip", "hflip"),
+    ("vflip", "vrot_vflip", "vflip"),
+]
+VIDEO_ROTATION_VF = {rid: vf for rid, _key, vf in VIDEO_ROTATIONS}
+# Display Matrix の角度 (probe_video_rotation / frame_to_ndarray の規約:
+# 正 = 反時計回り)。ここに無い id (hflip/vflip) は再エンコードで対応。
+VIDEO_ROTATION_ANGLE = {"cw90": -90, "180": 180, "ccw90": 90}
+
+# プレビュー用: 回転 id → cv2 での即時変換 (ffmpeg を待たずに見た目を確認)
+def apply_rotation_cv2(frame, rot_id):
+    if rot_id == "cw90":
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rot_id == "180":
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rot_id == "ccw90":
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if rot_id == "hflip":
+        return cv2.flip(frame, 1)
+    if rot_id == "vflip":
+        return cv2.flip(frame, 0)
+    return frame
+
+
+def probe_video(path):
+    """ffprobe で pix_fmt / 色メタ / 総フレーム数を拾う (取れないキーは None)。"""
+    info = {}
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=pix_fmt,color_primaries,color_transfer,color_space,nb_frames",
+             "-of", "default=noprint_wrappers=1", path],
+            capture_output=True, text=True, timeout=30).stdout
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                info[k.strip()] = None if v.strip() in ("", "unknown", "N/A") else v.strip()
+    except Exception:
+        pass
+    return info
+
+
+def rotated_video_path(src, rot_id):
+    """回転済みコピーの出力パス (元映像と同じフォルダ)。"""
+    p = Path(src)
+    return str(p.with_name(f"{p.stem}_rot-{rot_id}{p.suffix}"))
+
+
+class VideoRotateWorker(QThread):
+    """ffmpeg で入力映像の回転コピーを作るワーカー。
+
+    rot_angle が指定されると Display Matrix メタデータの書き換えリマックス
+    (ストリームコピー・瞬時) を行い、それ以外は vf で再エンコードする。
+    rot_angle は「追加の表示回転角」— 既存メタデータの角度と合算して書き込む。
+    """
+    log_signal = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done_signal = pyqtSignal(bool, str)
+
+    def __init__(self, src, out, vf, info, rot_angle=None):
+        super().__init__()
+        self.src, self.out, self.vf = src, out, vf
+        self.info = info or {}
+        self.rot_angle = rot_angle
+
+    def _encode_args(self):
+        """元素材の pix_fmt / 色メタをできるだけ引き継ぐ x264 設定。"""
+        args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "12"]
+        pix = self.info.get("pix_fmt")
+        if pix:
+            args += ["-pix_fmt", pix]
+        for key, flag in (("color_primaries", "-color_primaries"),
+                          ("color_transfer", "-color_trc"),
+                          ("color_space", "-colorspace")):
+            v = self.info.get(key)
+            if v:
+                args += [flag, v]
+        return args
+
+    def run(self):
+        if self.rot_angle is not None:
+            self._run_remux()
+            return
+        total = 0
+        try:
+            total = int(self.info.get("nb_frames") or 0)
+        except Exception:
+            total = 0
+        cmd = (["ffmpeg", "-y", "-nostdin", "-i", self.src, "-vf", self.vf]
+               + self._encode_args()
+               + ["-c:a", "copy", "-progress", "pipe:1", "-nostats",
+                  "-loglevel", "error", self.out])
+        self.log_signal.emit("[ffmpeg] " + " ".join(cmd))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            self.log_signal.emit("[ERROR] ffmpeg not found")
+            self.done_signal.emit(False, "")
+            return
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("frame=") and total > 0:
+                try:
+                    n = int(line.split("=", 1)[1])
+                    self.progress.emit(min(99, int(n * 100 / total)))
+                except Exception:
+                    pass
+        err = proc.stderr.read()
+        rc = proc.wait()
+        if err.strip():
+            self.log_signal.emit(err.strip())
+        if rc != 0 or not os.path.exists(self.out):
+            self.log_signal.emit(f"[ERROR] ffmpeg exited with {rc}")
+            self.done_signal.emit(False, "")
+            return
+        self.progress.emit(100)
+        self.done_signal.emit(True, self.out)
+
+    def _run_remux(self):
+        """Display Matrix メタデータ書き換えのみのリマックス (再エンコードなし)。
+
+        既存メタデータの回転角と指定角を合算した値を書き込む
+        (例: iPhone 縦位置 (-90) + 右90° (-90) = -180)。
+        """
+        try:
+            from imgtrans_lib._utils import probe_video_rotation
+            existing = int(probe_video_rotation(self.src))
+        except Exception:
+            existing = 0
+        total_angle = (existing + int(self.rot_angle)) % 360
+        if total_angle > 180:
+            total_angle -= 360
+        cmd = ["ffmpeg", "-y", "-nostdin",
+               "-display_rotation", str(total_angle),
+               "-i", self.src, "-c", "copy",
+               "-loglevel", "error", self.out]
+        self.log_signal.emit("[ffmpeg remux] " + " ".join(cmd))
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=600)
+        except FileNotFoundError:
+            self.log_signal.emit("[ERROR] ffmpeg not found")
+            self.done_signal.emit(False, "")
+            return
+        if proc.stderr.strip():
+            self.log_signal.emit(proc.stderr.strip())
+        if proc.returncode != 0 or not os.path.exists(self.out):
+            self.log_signal.emit(f"[ERROR] ffmpeg exited with {proc.returncode}")
+            self.done_signal.emit(False, "")
+            return
+        self.progress.emit(100)
+        self.done_signal.emit(True, self.out)
 
 
 # ======== Sample image generator ========
@@ -961,7 +1394,8 @@ class RenderWorker(QThread):
                  duration,
                  space_set=None, time_vmin=None, time_vmax=None, rate_maxdev=None,
                  anim_only=False, rate_baseline=None, rate_startpoint=None,
-                 audio_out=False, audio_mode="play"):
+                 audio_out=False, audio_mode="play", use_range=None,
+                 sync_anchor=0.0, audio_voices=7, audio_grain_ms=90):
         super().__init__()
         self.dm = dm
         self.mode = mode
@@ -979,6 +1413,13 @@ class RenderWorker(QThread):
         self.anim_only = anim_only
         self.audio_out = audio_out      # 音声を適用して最終出力を作る
         self.audio_mode = audio_mode    # "play"=可変速再生 / "grain"=グラニュラー
+        self.audio_voices = max(1, int(audio_voices))    # ボイス分割数
+        self.audio_grain_ms = max(20, int(audio_grain_ms))  # グレイン長 (ms)
+        # 使用範囲 (start_frame, end_frame)。None = 全尺。
+        # コピーは作らず、zPointCheck 後に軌道の時間軸をこの範囲へ調整する。
+        self.use_range = use_range
+        # 同期点 (0..1)。rate to data で全スリット時刻が一致する出力位置。
+        self.sync_anchor = float(sync_anchor or 0.0)
 
     def run(self):
         try:
@@ -1012,7 +1453,17 @@ class RenderWorker(QThread):
                 self.done_signal.emit(False, "", "")
                 return
 
+            # rate to data: 同期点 (全スリット時刻が一致する出力位置) を適用
+            if self.mode == "rate to data" and self.sync_anchor > 0:
+                self.emit(f"sync anchor: {self.sync_anchor:.2f}")
+                apply_sync_anchor(bm, self.sync_anchor)
+
             bm.zPointCheck()
+            # 使用範囲: 軌道の時間軸を範囲へスライド/フィット (コピー不要)
+            if self.use_range is not None:
+                self.emit(f"applyTimeSlide + range fit: frames {self.use_range[0]}"
+                          f"–{self.use_range[1]}")
+                fit_trajectory_to_range(bm, *self.use_range)
             bm.maneuver_imgplot("all")
 
             video_path = ""
@@ -1045,8 +1496,13 @@ class RenderWorker(QThread):
             # del_data=False で self.data が残っているため音声レンダリング可能。
             if self.audio_out and video_path:
                 try:
-                    self.emit(f"=== audio_video_out (mode={self.audio_mode}) ===")
-                    audio_final = bm.audio_video_out(mode=self.audio_mode)
+                    self.emit(f"=== audio_video_out (mode={self.audio_mode}, "
+                              f"voices={self.audio_voices}, "
+                              f"grain={self.audio_grain_ms}ms) ===")
+                    audio_final = bm.audio_video_out(
+                        mode=self.audio_mode,
+                        thread_num=self.audio_voices,
+                        grain_dur=self.audio_grain_ms / 1000.0)
                     if audio_final and os.path.exists(audio_final):
                         video_path = audio_final
                         self.emit(f"audio applied: {os.path.basename(audio_final)}")
@@ -1135,11 +1591,22 @@ class ManeuverPreviewWorker(QThread):
                  space_set, time_vmin, time_vmax,
                  rate_maxdev, rate_baseline, rate_startpoint,
                  anim_frames=20, anim_fps=10, anim_dpi=80,
-                 skip_2d=False):
+                 skip_2d=False, plot_w_inc=None, plot_h_inc=None,
+                 plot3d_fig=None, gif_width=400, use_range=None,
+                 sync_anchor=0.0):
         super().__init__()
         self.dm = dm
         self.mode = mode  # "time" or "rate"
         self.skip_2d = skip_2d   # ライブ3Dプレビュー用: 2D プロット生成を省略
+        # 2D プロットの図サイズ (インチ)。None なら dm の既定値のまま。
+        self.plot_w_inc = plot_w_inc
+        self.plot_h_inc = plot_h_inc
+        # 3D プロットの表示領域フィット: (fig_w_inc, fig_h_inc, box_aspect)。
+        # None なら maneuver_3dplot の既定動作。
+        self.plot3d_fig = plot3d_fig
+        self.gif_width = max(160, int(gif_width))
+        self.use_range = use_range   # (start_f, end_f) or None — 軌道の時間軸調整
+        self.sync_anchor = float(sync_anchor or 0.0)   # rate モードの同期点
         self.space_img = space_img
         self.time_img = time_img
         self.rate_img = rate_img
@@ -1197,9 +1664,15 @@ class ManeuverPreviewWorker(QThread):
                     rate_startpoint=self.rate_startpoint,
                 )
 
+            # rate モード: 同期点を適用してから範囲チェック/フィット
+            if self.mode == "rate" and self.sync_anchor > 0:
+                apply_sync_anchor(self.dm, self.sync_anchor)
+
             self.progress_signal.emit("zPointCheck…")
             self.percent_signal.emit(25)
             self.dm.zPointCheck()
+            if self.use_range is not None:
+                fit_trajectory_to_range(self.dm, *self.use_range)
 
             # 2D プロット生成: mtime で「呼び出し後に変更されたファイル」を検出
             # (同じファイル名で上書きされるケースに対応するため set 差分は使わない)
@@ -1208,6 +1681,11 @@ class ManeuverPreviewWorker(QThread):
                 ts_2d = time.time() - 0.5  # 小さなクロックスラックを許容
                 self.progress_signal.emit("maneuver_2dplot: 2D プロット生成中…")
                 self.percent_signal.emit(35)
+                # 表示領域のアスペクト比に合わせた図サイズを dm の
+                # クラス変数 (plot_w_inc/plot_h_inc) に反映してから生成する
+                if self.plot_w_inc and self.plot_h_inc:
+                    self.dm.plot_w_inc = self.plot_w_inc
+                    self.dm.plot_h_inc = self.plot_h_inc
                 self.dm.maneuver_2dplot()
                 plot2d = self._latest_file(cwd, (".png",), ts_2d)
 
@@ -1217,10 +1695,15 @@ class ManeuverPreviewWorker(QThread):
                 f"maneuver_3dplot: 3D アニメ生成中 ({self.anim_frames} frames @ {self.anim_dpi} dpi)…"
             )
             self.percent_signal.emit(55)
+            kw3d = {}
+            if self.plot3d_fig:
+                fw, fh, box = self.plot3d_fig
+                kw3d = dict(fig_w_inc=fw, fig_h_inc=fh, box_aspect=box)
             self.dm.maneuver_3dplot(
                 out_framenums=self.anim_frames,
                 out_fps=self.anim_fps,
                 dpi=self.anim_dpi,
+                **kw3d,
             )
             mp4 = self._latest_file(cwd, (".mp4", ".mov"), ts_3d)
 
@@ -1229,9 +1712,10 @@ class ManeuverPreviewWorker(QThread):
                 gif = os.path.splitext(mp4)[0] + "_preview.gif"
                 self.progress_signal.emit("ffmpeg で GIF 変換…")
                 self.percent_signal.emit(85)
-                # 横幅 400 にスケール (高さは自動)、ループ無限
+                # 表示領域幅に合わせてスケール (高さは自動)、ループ無限
                 cmd = ["ffmpeg", "-y", "-i", mp4,
-                       "-vf", f"fps={self.anim_fps},scale=400:-1:flags=lanczos",
+                       "-vf", f"fps={self.anim_fps},"
+                              f"scale={self.gif_width}:-1:flags=lanczos",
                        "-loop", "0", gif]
                 proc = subprocess.run(cmd, capture_output=True)
                 if proc.returncode != 0:
@@ -1283,6 +1767,188 @@ class StdoutPercentTee:
             pass
 
 
+# ======== 使用範囲 + 再生位置の 3 ライン タイムライン ========
+class RangeTimelineSlider(QWidget):
+    """開始 / 終了 / 再生位置の 3 本のラインを 1 本のバーで操作する UI。
+
+    - 開始・終了ライン (青) : 入力映像の使用範囲。間の領域が着色される
+    - 再生ライン (赤)       : プレビュー表示フレーム
+    - 実使用バンド (緑)     : 軌道データ生成後、実際に参照している時間範囲。
+      バンド内をドラッグすると前後スライド、端をドラッグすると伸縮でき、
+      usedRangeChanged で通知される (Time 画像の vmin/vmax へ反映される)。
+    ラインの近くを押すとそのラインを掴んでドラッグ。どのラインからも
+    離れた位置を押すと再生ラインがそこへジャンプする。
+    値はすべて 0..1 の割合 (秒への換算は呼び出し側)。
+    """
+    rangeChanged = pyqtSignal(float, float)      # (start_frac, end_frac)
+    playheadChanged = pyqtSignal(float)          # frac
+    usedRangeChanged = pyqtSignal(float, float)  # 実使用バンドの操作
+
+    GRAB_PX = 8          # ラインのつかみ判定 (px)
+    MIN_GAP = 0.005      # 開始と終了の最小間隔 (割合)
+
+    def __init__(self):
+        super().__init__()
+        self._start = 0.0
+        self._end = 1.0
+        self._pos = 0.0
+        self._used = None            # (s, e) 実使用範囲 / None = 未表示
+        # "start"|"end"|"pos"|"used_start"|"used_end"|"used_body"|None
+        self._drag = None
+        self._drag_dx = 0.0          # used_body ドラッグの掴んだ位置オフセット
+        self.setFixedHeight(34)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    # --- 値 (プログラム側から。シグナルは発火しない) ---
+    def set_range(self, s, e):
+        self._start = min(max(0.0, float(s)), 1.0)
+        self._end = min(max(self._start + self.MIN_GAP, float(e)), 1.0)
+        self.update()
+
+    def set_playhead(self, f):
+        self._pos = min(max(0.0, float(f)), 1.0)
+        self.update()
+
+    def set_used_range(self, s, e):
+        """軌道データが実際に参照している範囲 (緑バンド) を表示する。"""
+        if s is None or e is None:
+            self._used = None
+        else:
+            s = min(max(0.0, float(s)), 1.0)
+            e = min(max(s + self.MIN_GAP, float(e)), 1.0)
+            self._used = (s, e)
+        self.update()
+
+    def clear_used_range(self):
+        self._used = None
+        self.update()
+
+    def values(self):
+        return self._start, self._end, self._pos
+
+    def used_range(self):
+        return self._used
+
+    # --- 座標変換 ---
+    def _frac_to_x(self, f):
+        return 2 + f * max(1, self.width() - 5)
+
+    def _x_to_frac(self, x):
+        return min(1.0, max(0.0, (x - 2) / max(1, self.width() - 5)))
+
+    # --- マウス操作 ---
+    def _hit_test(self, x):
+        """つかむ対象を返す。優先度: 3ライン > 緑バンド端 > 緑バンド内。"""
+        cands = [(abs(x - self._frac_to_x(self._pos)), "pos"),
+                 (abs(x - self._frac_to_x(self._start)), "start"),
+                 (abs(x - self._frac_to_x(self._end)), "end")]
+        cands.sort()
+        if cands[0][0] <= self.GRAB_PX:
+            return cands[0][1]
+        if self._used is not None:
+            u0, u1 = self._used
+            x0, x1 = self._frac_to_x(u0), self._frac_to_x(u1)
+            if abs(x - x0) <= self.GRAB_PX:
+                return "used_start"
+            if abs(x - x1) <= self.GRAB_PX:
+                return "used_end"
+            if x0 < x < x1:
+                return "used_body"
+        return None
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton:
+            return
+        hit = self._hit_test(ev.pos().x())
+        if hit is None:
+            hit = "pos"                       # 何もない所 → 再生ラインをジャンプ
+            self._apply_drag("pos", self._x_to_frac(ev.pos().x()))
+        elif hit == "used_body":
+            self._drag_dx = self._x_to_frac(ev.pos().x()) - self._used[0]
+        self._drag = hit
+
+    def mouseMoveEvent(self, ev):
+        if self._drag:
+            self._apply_drag(self._drag, self._x_to_frac(ev.pos().x()))
+        else:
+            hit = self._hit_test(ev.pos().x())
+            if hit == "used_body":
+                self.setCursor(Qt.OpenHandCursor)
+            elif hit:
+                self.setCursor(Qt.SizeHorCursor)
+            else:
+                self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, ev):
+        self._drag = None
+
+    def _apply_drag(self, which, f):
+        if which == "start":
+            self._start = min(f, self._end - self.MIN_GAP)
+            self._start = max(0.0, self._start)
+            self.rangeChanged.emit(self._start, self._end)
+        elif which == "end":
+            self._end = max(f, self._start + self.MIN_GAP)
+            self._end = min(1.0, self._end)
+            self.rangeChanged.emit(self._start, self._end)
+        elif which in ("used_start", "used_end", "used_body") \
+                and self._used is not None:
+            u0, u1 = self._used
+            if which == "used_start":
+                u0 = min(max(0.0, f), u1 - self.MIN_GAP)
+            elif which == "used_end":
+                u1 = max(min(1.0, f), u0 + self.MIN_GAP)
+            else:                                # 前後スライド (尺は維持)
+                span = u1 - u0
+                u0 = min(max(0.0, f - self._drag_dx), 1.0 - span)
+                u1 = u0 + span
+            self._used = (u0, u1)
+            self.usedRangeChanged.emit(u0, u1)
+        else:
+            self._pos = f
+            self.playheadChanged.emit(self._pos)
+        self.update()
+
+    # --- 描画 ---
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        bar_y, bar_h = 6, h - 12
+        # ベース
+        p.fillRect(2, bar_y, w - 4, bar_h, QColor(40, 40, 40))
+        # 選択範囲
+        x0 = int(self._frac_to_x(self._start))
+        x1 = int(self._frac_to_x(self._end))
+        p.fillRect(x0, bar_y, max(1, x1 - x0), bar_h, QColor(42, 111, 214, 90))
+        # 実使用バンド (緑・内側に細く表示。掴んでスライド/伸縮できる)
+        if self._used is not None:
+            u0 = int(self._frac_to_x(self._used[0]))
+            u1 = int(self._frac_to_x(self._used[1]))
+            band_y = bar_y + bar_h // 4
+            band_h = max(3, bar_h // 2)
+            p.fillRect(u0, band_y, max(1, u1 - u0), band_h,
+                       QColor(60, 200, 120, 160))
+            pen = QPen(QColor(60, 220, 130))
+            pen.setWidth(2)
+            p.setPen(pen)
+            for x in (u0, u1):
+                p.drawLine(x, band_y - 2, x, band_y + band_h + 2)
+        # 開始/終了ライン (青) — 上下に短いつまみ
+        pen = QPen(QColor(90, 160, 255))
+        pen.setWidth(3)
+        p.setPen(pen)
+        for x in (x0, x1):
+            p.drawLine(x, 0, x, h)
+        # 再生ライン (赤)
+        xp = int(self._frac_to_x(self._pos))
+        pen = QPen(QColor(255, 40, 40))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawLine(xp, 0, xp, h)
+        p.end()
+
+
 # ======== 適用済みマップのサムネイル (再生位置の赤ライン付き) ========
 class MapThumb(QLabel):
     """適用済みの space/time/rate マップを小さく表示し、3D アニメの再生位置を
@@ -1292,12 +1958,22 @@ class MapThumb(QLabel):
     - 横スリット (sd=0): マップの時間軸は横 → 垂直の赤ラインが左右に動く
     """
 
-    def __init__(self, caption="", fixed_height=110):
+    def __init__(self, caption="", fixed_height=110, colorizable=True,
+                 stretch=False):
         super().__init__()
         self._src = None            # 元画像 QPixmap
         self._base = None           # ラベルサイズに合わせた縮小キャッシュ
         self._frac = None           # 再生位置 [0,1) / None = 非表示
         self._time_vertical = True
+        # グレースケールのマップだけ「黄–青」表示モードの対象にする
+        # (2D プロットのような既に色付きの画像は colorizable=False)
+        self._colorizable = bool(colorizable)
+        # stretch=True: 縦横比を無視して表示領域いっぱいに引き伸ばす
+        # (適用マップのサムネイル用。プロット画像は False のまま)
+        self._stretch = bool(stretch)
+        # 赤ラインの可動範囲 (表示画像内の割合)。2D プロットでは軸の
+        # データ領域だけを動くように外から設定される。
+        self._range = (0.0, 1.0)
         self.setAlignment(Qt.AlignCenter)
         if fixed_height is not None:
             self.setFixedHeight(fixed_height)
@@ -1328,17 +2004,39 @@ class MapThumb(QLabel):
         self._frac = frac
         self._recompose()
 
+    def set_playhead_range(self, x0, x1):
+        """赤ラインの可動範囲を画像内の割合 [x0, x1] に制限する。
+
+        2D プロットの PNG には軸ラベル等の余白が含まれるため、データ領域
+        (時間軸の始点〜終点) だけを赤ラインが動くように調整する。
+        """
+        try:
+            x0 = float(x0); x1 = float(x1)
+        except (TypeError, ValueError):
+            return
+        if 0.0 <= x0 < x1 <= 1.0:
+            self._range = (x0, x1)
+            self._recompose()
+
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
+        self._rescale()
+
+    def refresh_color_mode(self):
+        """階調表示モードが切り替わったときに再着色する。"""
         self._rescale()
 
     def _rescale(self):
         if self._src is None:
             self._base = None
             return
-        self._base = self._src.scaled(
+        base = self._src.scaled(
             max(10, self.width() - 2), max(10, self.height() - 2),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            Qt.IgnoreAspectRatio if self._stretch else Qt.KeepAspectRatio,
+            Qt.SmoothTransformation)
+        if self._colorizable:
+            base = colorize_pixmap(base)
+        self._base = base
         self._recompose()
 
     def _recompose(self):
@@ -1346,15 +2044,17 @@ class MapThumb(QLabel):
             return
         pm = QPixmap(self._base)
         if self._frac is not None:
+            r0, r1 = self._range
+            f = r0 + self._frac * (r1 - r0)   # 可動範囲内へ写像
             p = QPainter(pm)
             pen = QPen(QColor(255, 40, 40))
             pen.setWidth(2)
             p.setPen(pen)
             if self._time_vertical:
-                y = int(self._frac * (pm.height() - 1))
+                y = int(f * (pm.height() - 1))
                 p.drawLine(0, y, pm.width(), y)
             else:
-                x = int(self._frac * (pm.width() - 1))
+                x = int(f * (pm.width() - 1))
                 p.drawLine(x, 0, x, pm.height())
             p.end()
         self.setPixmap(pm)
@@ -1372,7 +2072,8 @@ class IMGTransApp(QWidget):
         self.resize(1360, 900)   # 3カラム (Space/Time/Rate) を横並びで収める幅
         self.setMinimumSize(640, 480)
 
-        self.videopath = None
+        self.videopath = None        # 実際に処理する映像 (回転指定時は回転済みコピー)
+        self.videopath_src = None    # ユーザーが選択した元映像
         self.space_img_path = None
         self.time_img_path = None
         self.rate_img_path = None
@@ -1385,6 +2086,13 @@ class IMGTransApp(QWidget):
         self._live3d_worker = None
         self._live3d_busy = False
         self._live3d_pending = False
+        self._live2d_last_aspect = None   # 直近の 2D プロット生成時のアスペクト比
+        # ウィンドウリサイズ後、表示領域のアスペクト比が大きく変わっていたら
+        # 2D プロットを作り直す (デバウンス)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(900)
+        self._resize_timer.timeout.connect(self._maybe_replot_on_resize)
         self._live3d_movie = None
         self._live3d_frames = None   # 同期表示用の先読み GIF フレーム
         self._live3d_timer = QTimer(self)
@@ -1450,6 +2158,8 @@ class IMGTransApp(QWidget):
             lbl = self._section_gens[t].get('preview_label')
             if lbl is not None and (lbl.pixmap() is None or lbl.pixmap().isNull()):
                 lbl.setText(tr("preview_after_init"))
+            # 後処理パネルの「未適用」表示も現在言語で貼り直す
+            self._update_postproc_state(t)
         # マニューバプレビューのプレースホルダ (未生成時のみ)
         for lbl in (getattr(self, "preview_2dplot_label", None),
                     getattr(self, "preview_3d_label", None)):
@@ -1501,12 +2211,95 @@ class IMGTransApp(QWidget):
         self._reg(lambda: self.video_btn.setText(tr("btn_select_video")))
         self.video_btn.clicked.connect(self.select_video)
 
+        # --- 入力映像プレビュー (選択直後に表示。回転操作を即時反映) ---
+        self._vid_cap = None            # プレビュー用 VideoCapture
+        self._vid_info = None           # (w, h, fps, frames, dur_sec)
+        self._vid_pos = -1              # cap が次に read するフレーム番号
+        # 常時ループ再生: 使用範囲 (緑バンド優先) を実時間で再生し続ける。
+        # スクラブ中は一時停止し、しばらく操作が無ければ自動再開する。
+        self._vplay_timer = QTimer(self)
+        self._vplay_timer.setInterval(66)          # ≈15fps 表示 (再生は実時間)
+        self._vplay_timer.timeout.connect(self._vplay_tick)
+        self._vplay_t0 = None                      # 再生アンカーの wallclock
+        self._vplay_anchor = 0.0                   # t0 時点のフレーム位置
+        self._vplay_paused = False                 # スクラブによる一時停止
+        self._vplay_resume = QTimer(self)
+        self._vplay_resume.setSingleShot(True)
+        self._vplay_resume.setInterval(1500)       # 操作後 1.5s で再生再開
+        self._vplay_resume.timeout.connect(self._vplay_resume_now)
+        self.video_preview = QLabel()
+        self.video_preview.setAlignment(Qt.AlignCenter)
+        self.video_preview.setFixedHeight(150)
+        self.video_preview.setStyleSheet(
+            "QLabel { background: #111; border: 1px solid #555; }")
+        self.video_preview.setVisible(False)
+        self.video_dim_label = QLabel("")
+        self.video_dim_label.setStyleSheet("color: gray; font-size: 10px;")
+        self.video_dim_label.setVisible(False)
+
+        # 使用範囲 + 再生位置: 3 ラインの統合タイムライン。既定 = 全尺・頭合わせ。
+        self.range_frame = QFrame()
+        rf_v = QVBoxLayout(self.range_frame)
+        rf_v.setContentsMargins(0, 0, 0, 0)
+        rf_v.setSpacing(2)
+        rr = QHBoxLayout()
+        rr.addWidget(self._trlabel("lbl_use_range"))
+        rr.addStretch()
+        self.range_full_btn = QPushButton()
+        self._reg(lambda: self.range_full_btn.setText(tr("btn_range_full")))
+        self.range_full_btn.setMaximumWidth(56)
+        self.range_full_btn.clicked.connect(self._set_range_full)
+        rr.addWidget(self.range_full_btn)
+        rf_v.addLayout(rr)
+        self.range_slider = RangeTimelineSlider()
+        self.range_slider.rangeChanged.connect(self._on_range_changed)
+        self.range_slider.playheadChanged.connect(self._on_playhead_dragged)
+        self.range_slider.usedRangeChanged.connect(self._on_used_range_dragged)
+        self._range_override = None   # 緑バンド操作による実使用範囲 (frames)
+        rf_v.addWidget(self.range_slider)
+        self.range_span_label = QLabel("")
+        self.range_span_label.setStyleSheet("color: gray; font-size: 10px;")
+        rf_v.addWidget(self.range_span_label)
+        rng_hint = self._trlabel("hint_use_range")
+        rng_hint.setStyleSheet("color: gray; font-size: 10px;")
+        rng_hint.setWordWrap(True)
+        rf_v.addWidget(rng_hint)
+        self.range_frame.setVisible(False)
+
         # --- Slit toggle ---
         self.slit_toggle = QCheckBox()
         self._reg(lambda: self.slit_toggle.setText(tr("chk_vertical")))
         self.slit_label = QLabel(tr("slit_h"))
         self.slit_toggle.stateChanged.connect(self.update_slit_label)
         self._reg(self.update_slit_label)  # 言語切替時にスリット表示も更新
+
+        # --- 入力映像の回転 (Initialize 時に ffmpeg で回転コピーを作る) ---
+        self.vrot_combo = QComboBox()
+        for rid, key, _vf in VIDEO_ROTATIONS:
+            self.vrot_combo.addItem(tr(key), rid)
+        self._reg(lambda: [self.vrot_combo.setItemText(i, tr(k))
+                           for i, (_r, k, _v) in enumerate(VIDEO_ROTATIONS)])
+        self.vrot_combo.currentIndexChanged.connect(self._on_video_rotation_changed)
+        vrot_row = QHBoxLayout()
+        vrot_row.addWidget(self._trlabel("lbl_video_rotate"))
+        vrot_row.addWidget(self.vrot_combo, 1)
+        self.vrot_row = vrot_row
+        self.vrot_hint = self._trlabel("hint_video_rotate")
+        self.vrot_hint.setStyleSheet("color: gray; font-size: 10px;")
+        self.vrot_hint.setWordWrap(True)
+        self.vrot_progress = QProgressBar()
+        self.vrot_progress.setRange(0, 100)
+        self.vrot_progress.setTextVisible(True)
+        self.vrot_progress.setVisible(False)
+        self._vrot_worker = None
+
+        # --- 階調表示モード (グレースケール / 黄–青) ---
+        self.colormap_chk = QCheckBox()
+        self._reg(lambda: self.colormap_chk.setText(tr("chk_colormap")))
+        self.colormap_chk.toggled.connect(self._on_colormap_toggled)
+        self.colormap_hint = self._trlabel("hint_colormap")
+        self.colormap_hint.setStyleSheet("color: gray; font-size: 10px;")
+        self.colormap_hint.setWordWrap(True)
 
         # --- Initialize ---
         self.init_btn = QPushButton()
@@ -1648,9 +2441,35 @@ class IMGTransApp(QWidget):
 
         self.rate_info_label = QLabel("")
         self.rate_info_label.setStyleSheet("color: gray; font-size: 10px;")
+
+        # 同期点: 全スリットの時刻が一致する出力位置 (0=頭 / 0.5=中央 / 1=尾)。
+        # rate to data のときのみ軌道生成へ効く (時間マップは変形しない)。
+        sync_row = QHBoxLayout()
+        sync_row.addWidget(self._trlabel("lbl_sync_anchor"))
+        self.sync_anchor_slider = QSlider(Qt.Horizontal)
+        self.sync_anchor_slider.setRange(0, 100)
+        self.sync_anchor_slider.setValue(0)          # 既定 = 頭 (従来動作)
+        self.sync_anchor_slider.valueChanged.connect(self._on_sync_anchor_changed)
+        sync_row.addWidget(self.sync_anchor_slider, 1)
+        self.sync_anchor_val = QLabel("0%")
+        self.sync_anchor_val.setMinimumWidth(34)
+        sync_row.addWidget(self.sync_anchor_val)
+        for key, v in (("sync_head", 0), ("sync_mid", 50), ("sync_tail", 100)):
+            b = QPushButton()
+            self._reg(lambda b_=b, k=key: b_.setText(tr(k)))
+            b.setMaximumWidth(44)
+            b.clicked.connect(lambda *_, vv=v:
+                              self.sync_anchor_slider.setValue(vv))
+            sync_row.addWidget(b)
+        sync_hint = self._trlabel("hint_sync_anchor")
+        sync_hint.setStyleSheet("color: gray; font-size: 10px;")
+        sync_hint.setWordWrap(True)
+
         self.rate_param_frame = QFrame()
         rate_vbox = QVBoxLayout(self.rate_param_frame)
         rate_vbox.addLayout(rate_layout)
+        rate_vbox.addLayout(sync_row)
+        rate_vbox.addWidget(sync_hint)
         rate_vbox.addWidget(self.rate_info_label)
         self.rate_param_frame.setVisible(False)
 
@@ -1691,7 +2510,7 @@ class IMGTransApp(QWidget):
         l3_cols = QHBoxLayout()
 
         # 左: 2D プロット (MapThumb — 赤ラインが常に左→右へスライド)
-        self.live2d_thumb = MapThumb("2D Plot", fixed_height=None)
+        self.live2d_thumb = MapThumb("2D Plot", fixed_height=None, colorizable=False)
         self.live2d_thumb.set_time_vertical(False)   # 2D の時間軸は常に横
         self.live2d_thumb.setStyleSheet(
             "QLabel { background: #ffffff; border: 1px solid #555;"
@@ -1719,7 +2538,8 @@ class IMGTransApp(QWidget):
             cap_lbl.setStyleSheet("color: gray; font-size: 10px;")
             cap_lbl.setAlignment(Qt.AlignCenter)
             col.addWidget(cap_lbl)
-            th = MapThumb(cap)
+            # 適用マップは表示領域いっぱいに引き伸ばして表示 (縦横比可変)
+            th = MapThumb(cap, stretch=True)
             self._map_thumbs[t] = th
             col.addWidget(th)
             thumb_row.addLayout(col, 1)
@@ -1841,8 +2661,15 @@ class IMGTransApp(QWidget):
         sg_l = QVBoxLayout(setup_group)
         sg_l.addLayout(self.lang_row)
         for w in [self.video_btn, self.video_label,
-                  self.slit_toggle, self.slit_label,
-                  self.init_btn, self.info_label]:
+                  self.video_preview, self.video_dim_label,
+                  self.range_frame,
+                  self.slit_toggle, self.slit_label]:
+            sg_l.addWidget(w)
+        sg_l.addLayout(self.vrot_row)
+        sg_l.addWidget(self.vrot_hint)
+        sg_l.addWidget(self.vrot_progress)
+        for w in [self.init_btn, self.info_label,
+                  self.colormap_chk, self.colormap_hint]:
             sg_l.addWidget(w)
 
         t2 = QWidget(); t2_l = QVBoxLayout(t2)
@@ -1925,21 +2752,13 @@ class IMGTransApp(QWidget):
         self._live3d_slot = QVBoxLayout()
         t3_l.addLayout(self._live3d_slot, 2)
 
-        # 出力行: 音声適用 + Start Rendering + 進捗バー
+        # 出力行: Start Rendering + 進捗バー
+        # (音声の適用/モード/分割数/グレイン長は GPU プレビューの音声設定が
+        #  そのまま書き出しにも使われる — 二重の選択 UI は置かない)
         render_row = QHBoxLayout()
-        self.audio_chk = QCheckBox()
-        self._reg(lambda: self.audio_chk.setText(tr("chk_audio")))
-        render_row.addWidget(self.audio_chk)
-        self.audio_mode_combo = QComboBox()
-        self.audio_mode_combo.addItem(tr("audio_mode_play"), "play")
-        self.audio_mode_combo.addItem(tr("audio_mode_grain"), "grain")
-        self._reg(lambda: (
-            self.audio_mode_combo.setItemText(0, tr("audio_mode_play")),
-            self.audio_mode_combo.setItemText(1, tr("audio_mode_grain")),
-        ))
-        self.audio_mode_combo.setEnabled(False)
-        self.audio_chk.toggled.connect(self.audio_mode_combo.setEnabled)
-        render_row.addWidget(self.audio_mode_combo)
+        self.audio_out_info = QLabel("")
+        self.audio_out_info.setStyleSheet("color: gray; font-size: 11px;")
+        render_row.addWidget(self.audio_out_info)
         render_row.addWidget(self.start_btn, 1)
         self.render_progress = QProgressBar()
         self.render_progress.setRange(0, 100)
@@ -1947,6 +2766,15 @@ class IMGTransApp(QWidget):
         self.render_progress.setTextVisible(True)
         render_row.addWidget(self.render_progress, 2)
         t3_l.addLayout(render_row)
+
+        # プレビューの音声設定変更 → 書き出し予定の表示を更新
+        if self.rt_preview is not None:
+            self.rt_preview.audio_chk.toggled.connect(self._update_audio_out_info)
+            self.rt_preview.audio_method.currentIndexChanged.connect(
+                self._update_audio_out_info)
+            self.rt_preview.audio_voices_spin.valueChanged.connect(
+                self._update_audio_out_info)
+        self._reg(self._update_audio_out_info)
 
         tabs.addTab(t3, tr("tab_preview"))
         tabs.currentChanged.connect(self._on_tab_changed)
@@ -2195,6 +3023,9 @@ class IMGTransApp(QWidget):
         v = self.gen_time_size.value()
         if self.dm is not None:
             v = min(v, int(self.dm.count))
+        rng = self._range_frames()
+        if rng is not None:
+            v = min(v, rng[1] - rng[0])   # 使用範囲を超えないレンジに制限
         return v
 
     def _maybe_update_time_defaults(self, *_):
@@ -2217,15 +3048,342 @@ class IMGTransApp(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select video file", "", "Video Files (*.mp4 *.avi *.mov)")
         if path:
-            self.videopath = path
+            self.videopath_src = path          # ユーザーが選んだ元映像
+            self.videopath = path              # 実際に処理する映像 (回転/切り出し後は差し替わる)
             self.video_label.setText(f"Selected: {path}")
             self.log(f"Video selected: {path}")
+            self._open_video_preview(path)
             self.update_ui_state("video_selected")
 
+    # --- 入力映像プレビュー / 使用範囲 ---
+    def _open_video_preview(self, path):
+        """選択直後: プレビュー用キャプチャを開き、情報表示と範囲 UI を初期化。"""
+        self._vplay_timer.stop()
+        self._vplay_resume.stop()
+        if self._vid_cap is not None:
+            try:
+                self._vid_cap.release()
+            except Exception:
+                pass
+            self._vid_cap = None
+        self._vid_info = None
+        self._vid_pos = -1
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            self.video_preview.setVisible(False)
+            self.video_dim_label.setVisible(False)
+            self.range_frame.setVisible(False)
+            return
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        dur = n / max(1e-6, fps)
+        self._vid_cap = cap
+        self._vid_info = (w, h, fps, n, dur)
+        self.video_dim_label.setText(
+            tr("vid_info", w=w, h=h, n=n, fps=fps, dur=dur))
+        # 使用範囲: 既定は全尺・頭合わせ / 再生位置は先頭 / 実使用バンドはクリア
+        self.range_slider.set_range(0.0, 1.0)
+        self.range_slider.set_playhead(0.0)
+        self.range_slider.clear_used_range()
+        self._range_override = None
+        self._update_range_span()
+        for wgt in (self.video_preview, self.video_dim_label, self.range_frame):
+            wgt.setVisible(True)
+        self._update_video_preview()
+        # 使用範囲のループ再生を開始 (以後は常時再生しっぱなし)
+        self._vplay_start()
+
+    def _render_video_frame(self, idx):
+        """フレーム idx を読み、回転を即時適用して表示する。
+
+        連続再生を軽くするため、前回位置からの前進なら seek せず grab で
+        読み飛ばす (cv2 のフレームシークはランダムアクセスだと重い)。
+        """
+        if self._vid_cap is None or self._vid_info is None:
+            return
+        w, h, fps, n, dur = self._vid_info
+        idx = min(max(0, int(idx)), n - 1)
+        gap = idx - self._vid_pos
+        if gap < 0 or gap > 12:
+            self._vid_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        else:
+            for _ in range(gap):
+                self._vid_cap.grab()
+        ret, frame = self._vid_cap.read()
+        self._vid_pos = idx + 1
+        if not ret or frame is None:
+            return
+        frame = apply_rotation_cv2(frame, self.vrot_combo.currentData())
+        rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
+                      rgb.shape[1] * 3, QImage.Format_RGB888).copy()
+        pm = QPixmap.fromImage(qimg).scaled(
+            max(1, self.video_preview.width() - 2),
+            max(1, self.video_preview.height() - 2),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.video_preview.setPixmap(pm)
+        t = idx / max(1e-6, fps)
+        self.video_preview.setToolTip(f"frame {idx} / {n}  ({t:.2f}s)")
+
+    def _update_video_preview(self, *_):
+        """再生ライン位置のフレームを表示する (回転変更などの再描画用)。"""
+        if self._vid_info is None:
+            return
+        n = self._vid_info[3]
+        self._render_video_frame(self.range_slider.values()[2] * max(0, n - 1))
+
+    # --- 常時ループ再生 ---
+    def _vplay_bounds(self):
+        """再生ループの範囲 (start_f, end_f)。緑バンド優先、無ければ青選択。"""
+        if self._vid_info is None:
+            return (0, 1)
+        n = self._vid_info[3]
+        used = self.range_slider.used_range()
+        if used is not None:
+            s, e = used
+        else:
+            s, e, _ = self.range_slider.values()
+        s_f = max(0, int(round(s * (n - 1))))
+        e_f = min(n - 1, int(round(e * (n - 1))))
+        return (s_f, max(s_f + 1, e_f))
+
+    def _vplay_start(self, from_frame=None):
+        """アンカーを合わせてループ再生を開始/再開する。"""
+        if self._vid_cap is None or self._vid_info is None:
+            return
+        s_f, e_f = self._vplay_bounds()
+        if from_frame is None:
+            from_frame = s_f
+        self._vplay_anchor = min(max(s_f, float(from_frame)), e_f)
+        self._vplay_t0 = time.time()
+        self._vplay_paused = False
+        if not self._vplay_timer.isActive():
+            self._vplay_timer.start()
+
+    def _vplay_tick(self):
+        """実時間で使用範囲をループ再生し、赤ラインと readout を追従させる。"""
+        if (self._vplay_paused or self._vid_cap is None
+                or self._vid_info is None or self._vplay_t0 is None):
+            return
+        if not self.video_preview.isVisible():
+            return                       # 別タブ表示中は描画を省く
+        fps = self._vid_info[2]
+        n = self._vid_info[3]
+        s_f, e_f = self._vplay_bounds()
+        span = max(1, e_f - s_f)
+        elapsed = time.time() - self._vplay_t0
+        idx = s_f + (self._vplay_anchor - s_f + elapsed * fps) % span
+        self._render_video_frame(idx)
+        self.range_slider.set_playhead(idx / max(1, n - 1))   # 赤ライン追従
+        self._update_range_span()
+
+    def _vplay_resume_now(self):
+        """スクラブ後の自動再開 (現在の再生ラインの位置から続きを再生)。"""
+        if self._vid_info is None:
+            return
+        n = self._vid_info[3]
+        self._vplay_start(from_frame=self.range_slider.values()[2] * (n - 1))
+
+    def _on_playhead_dragged(self, frac):
+        """赤ラインのドラッグ: 再生を一時停止してスクラブ表示 →
+        しばらく操作が無ければその位置から自動で再生再開する。"""
+        self._vplay_paused = True
+        self._vplay_resume.start()       # 連続ドラッグ中はタイマーが巻き戻る
+        if self._vid_info is not None:
+            n = self._vid_info[3]
+            self._render_video_frame(frac * max(0, n - 1))
+        self._update_range_span()
+
+    def _selected_trim(self):
+        """使用範囲 (start_sec, end_sec)。全尺なら None。"""
+        if self._vid_info is None:
+            return None
+        dur = self._vid_info[4]
+        s_frac, e_frac, _ = self.range_slider.values()
+        s, e = s_frac * dur, e_frac * dur
+        if s <= 0.05 and e >= dur - 0.05:
+            return None
+        return (s, e)
+
+    def _range_frames(self):
+        """使用範囲を入力フレーム番号 (start_f, end_f) で返す。全尺なら None。
+
+        軌道データの時間軸調整 (applyTimeSlide + レンジフィット) に使う。
+        ファイルコピーは作らないため、初期化のやり直しは不要。
+        """
+        trim = self._selected_trim()
+        if trim is None or self._vid_info is None:
+            return None
+        fps = self._vid_info[2]
+        n = self._vid_info[3]
+        s_f = max(0, int(round(trim[0] * fps)))
+        e_f = min(n - 1, int(round(trim[1] * fps)))
+        return (s_f, max(s_f + 1, e_f))
+
+    def _effective_range(self):
+        """ワーカーが軌道フィットに使う範囲。緑バンド操作 (override) 優先。"""
+        return self._range_override or self._range_frames()
+
+    def _sync_anchor01(self):
+        """同期点 (0..1)。rate to data 以外では 0 (無効) を返す。"""
+        if self._selected_apply_mode() != "rate to data":
+            return 0.0
+        return self.sync_anchor_slider.value() / 100.0
+
+    def _on_sync_anchor_changed(self, v):
+        """同期点スライダー: 表示更新 + プレビュー/RT へ反映。"""
+        self.sync_anchor_val.setText(f"{int(v)}%")
+        if self.dm is None:
+            return
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.set_params(sync_anchor=self._sync_anchor01())
+            self.rt_preview.refresh_maps()
+        self._mark_preview_stale()
+
+    def _update_range_span(self):
+        if self._vid_info is None:
+            self.range_span_label.setText("")
+            return
+        dur = self._vid_info[4]
+        s_frac, e_frac, p_frac = self.range_slider.values()
+        self.range_span_label.setText(
+            tr("range_readout", s=s_frac * dur, e=e_frac * dur,
+               d=(e_frac - s_frac) * dur, p=p_frac * dur))
+
+    def _set_range_full(self):
+        self.range_slider.set_range(0.0, 1.0)
+        self._on_range_changed()
+
+    def _sync_range_downstream(self):
+        """使用範囲を GPU プレビューとライブプロットへ反映する共通処理。"""
+        if self.dm is None:
+            return
+        if getattr(self, "rt_preview", None):
+            self.rt_preview.set_params(use_range=self._effective_range())
+            self.rt_preview.refresh_maps()
+        self._mark_preview_stale()
+
+    def _on_range_changed(self, *_):
+        """青ライン (選択範囲) の変更: 頭合わせの既定動作へ戻して反映する。"""
+        self._update_range_span()
+        self._range_override = None      # 緑バンドの手動操作を解除
+        if self.dm is None:
+            return
+        # Time 画像の既定 vmin/vmax を範囲フレーム数に追従
+        self._maybe_update_time_defaults()
+        # rate to data: startpoint も使用範囲の開始フレームへ追従
+        if self._selected_apply_mode() == "rate to data":
+            rng = self._range_frames()
+            self.rate_startpoint_spin.setValue(rng[0] if rng else 0)
+        self._sync_range_downstream()
+
+    def _on_used_range_dragged(self, s_frac, e_frac):
+        """緑バンド (実使用範囲) のスライド/伸縮をパラメータへ適用する。
+
+        time to data: vmin/vmax が直接この範囲になる。
+        rate to data: スライド → startpoint を移動 /
+                      伸縮   → baseline と max_range を尺の比率でスケール
+                      (レートを一様に上げ下げすると軌道の時間スパンが
+                       正確にその倍率で伸縮するため)。
+        """
+        if self._vid_info is None:
+            return
+        n = self._vid_info[3]
+        s_f = max(0, int(round(s_frac * n)))
+        e_f = min(n - 1, int(round(e_frac * n)))
+        e_f = max(s_f + 1, e_f)
+        prev = getattr(self, "_last_used_band_frames", None)
+        self._range_override = (s_f, e_f)
+        self._last_used_band_frames = (s_f, e_f)
+        mode = self._selected_apply_mode()
+        if mode == "time to data":
+            # vmin/vmax へ直接適用 (valueChanged 経由で stale マークも入る)
+            self.time_vmin_spin.setValue(s_f)
+            self.time_vmax_spin.setValue(e_f)
+        elif mode == "rate to data":
+            # スライド分 → startpoint
+            self.rate_startpoint_spin.setValue(s_f)
+            # 伸縮分 → レート全体のスケール (baseline / max_range)
+            if prev is not None:
+                old_span = max(1, prev[1] - prev[0])
+                new_span = max(1, e_f - s_f)
+                factor = new_span / old_span
+                if abs(factor - 1.0) > 0.01:
+                    self.rate_baseline_spin.setValue(
+                        round(self.rate_baseline_spin.value() * factor, 3))
+                    self.rate_maxdev_spin.setValue(
+                        round(max(0.001,
+                                  self.rate_maxdev_spin.value() * factor), 3))
+        self._update_range_span()
+        self._sync_range_downstream()
+
+    def _show_used_range_from_data(self):
+        """軌道データの実使用範囲 (z min/max) を緑バンドとして表示する。"""
+        if self.dm is None or getattr(self.dm, "data", None) is None \
+                or self._vid_info is None:
+            return
+        try:
+            z = self.dm.data[:, :, 1]
+            n = max(1, self._vid_info[3])
+            self.range_slider.set_used_range(float(z.min()) / n,
+                                             float(z.max()) / n)
+            self._last_used_band_frames = (int(z.min()), int(z.max()))
+        except Exception:
+            pass
+
     def initialize_drawmaneuver(self):
-        if not self.videopath:
+        """回転指定があれば先に回転済みコピーを作り、その後 drawManeuver を初期化。
+        使用範囲はコピーを作らず、レンダリング/プレビュー時に軌道データの
+        時間軸調整 (applyTimeSlide + レンジフィット) で適用する。"""
+        src = self.videopath_src or self.videopath
+        if not src:
             QMessageBox.warning(self, "Error", "Select a video first.")
             return
+        rot = self.vrot_combo.currentData()
+        vf = VIDEO_ROTATION_VF.get(rot)
+        if not vf:
+            self.videopath = src
+            self._init_drawmaneuver_now()
+            return
+
+        out = rotated_video_path(src, rot)
+        if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+            self.log(tr("vrot_reuse", p=out))
+            self.videopath = out
+            self._init_drawmaneuver_now()
+            return
+        if shutil.which("ffmpeg") is None:
+            QMessageBox.critical(self, "Error", tr("vrot_no_ffmpeg"))
+            return
+
+        # 90°系はメタデータ書き換えリマックス (瞬時)。反転のみ再エンコード。
+        rot_angle = VIDEO_ROTATION_ANGLE.get(rot)
+        self.info_label.setText(tr("vrot_working"))
+        self.init_btn.setEnabled(False)
+        self.vrot_progress.setValue(0)
+        self.vrot_progress.setVisible(rot_angle is None)   # リマックスは一瞬
+        self._vrot_worker = VideoRotateWorker(
+            src, out, vf, probe_video(src) if rot_angle is None else {},
+            rot_angle=rot_angle)
+        self._vrot_worker.log_signal.connect(self.log)
+        self._vrot_worker.progress.connect(self.vrot_progress.setValue)
+        self._vrot_worker.done_signal.connect(self._on_video_rotated)
+        self._vrot_worker.start()
+
+    def _on_video_rotated(self, success, out_path):
+        self.vrot_progress.setVisible(False)
+        self.init_btn.setEnabled(True)
+        if not success:
+            self.info_label.setText(tr("vrot_failed"))
+            QMessageBox.critical(self, "Error", tr("vrot_failed"))
+            return
+        self.log(f"Rotated video: {out_path}")
+        self.videopath = out_path
+        self._init_drawmaneuver_now()
+
+    def _init_drawmaneuver_now(self):
         sd = bool(self.slit_toggle.isChecked())
         self.log("Initializing drawManeuver...")
         try:
@@ -2237,9 +3395,10 @@ class IMGTransApp(QWidget):
             self.update_ui_state("initialized")
             if getattr(self, "rt_preview", None):
                 self.rt_preview.set_video(self.videopath)
-                # スリット方向と入力実FPS をプレビューに同期
+                # スリット方向・入力実FPS・使用範囲をプレビューに同期
                 self.rt_preview.set_params(sd=int(self.dm.scan_direction),
-                                           rec_fps=float(self.dm.recfps))
+                                           rec_fps=float(self.dm.recfps),
+                                           use_range=self._effective_range())
                 self._sync_rt_timeline()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -2294,7 +3453,97 @@ class IMGTransApp(QWidget):
         self._section_gens[type_name] = g
         self._add_layer(type_name)   # ベースレイヤー
         v.addWidget(g['generate_btn'])
+        v.addWidget(self._build_section_postproc(type_name))
         return frame
+
+    def _build_section_postproc(self, type_name):
+        """適用済み画像に対する破壊的な後処理パネル (反転 / 基準グレー / 回転)。
+
+        レイヤー合成が「これから作る画像」の設定なのに対し、こちらは
+        「すでに適用されている 16bit PNG そのもの」を書き換える。
+        - 階調反転: 確認ダイアログ → 即書き込み (元に戻すボタンは無い)
+        - 基準グレー / 回転: スライダーで即プレビュー → 「適用」で書き込み
+        """
+        g = self._section_gens[type_name]
+        box = QGroupBox()
+        self._reg(lambda b=box: b.setTitle(tr("grp_postproc")))
+        box.setStyleSheet("QGroupBox { font-size: 11px; color: #a33; }"
+                          " QLabel { font-size: 11px; color: #444; }")
+        bv = QVBoxLayout(box)
+        bv.setContentsMargins(6, 4, 6, 4)
+        bv.setSpacing(3)
+
+        # --- 階調反転 (破壊的・即時) ---
+        g['pp_invert_btn'] = QPushButton()
+        self._reg(lambda b=g['pp_invert_btn']: b.setText(tr("btn_pp_invert")))
+        g['pp_invert_btn'].clicked.connect(
+            lambda *_, t=type_name: self.postproc_invert(t))
+        bv.addWidget(g['pp_invert_btn'])
+
+        # --- 基準グレー (ヒストグラム中間値) ---
+        mg_row = QHBoxLayout()
+        mg_row.addWidget(self._trlabel("lbl_pp_midgray"))
+        g['pp_midgray'] = QSlider(Qt.Horizontal)
+        g['pp_midgray'].setRange(5, 95)      # 0.05 .. 0.95
+        g['pp_midgray'].setValue(50)
+        g['pp_midgray'].valueChanged.connect(
+            lambda *_, t=type_name: self._on_postproc_param(t))
+        mg_row.addWidget(g['pp_midgray'], 1)
+        g['pp_midgray_val'] = QLabel("0.50")
+        g['pp_midgray_val'].setMinimumWidth(32)
+        mg_row.addWidget(g['pp_midgray_val'])
+        bv.addLayout(mg_row)
+        mg_hint = self._trlabel("hint_pp_midgray")
+        mg_hint.setStyleSheet("color: gray; font-size: 10px;")
+        mg_hint.setWordWrap(True)
+        bv.addWidget(mg_hint)
+
+        # --- 回転 (サイズ維持で再マッピング) ---
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(self._trlabel("lbl_pp_rotate"))
+        g['pp_rotate'] = QDoubleSpinBox()
+        g['pp_rotate'].setRange(-180.0, 180.0)
+        g['pp_rotate'].setDecimals(1)
+        g['pp_rotate'].setSingleStep(1.0)
+        g['pp_rotate'].setSuffix(" °")
+        g['pp_rotate'].valueChanged.connect(
+            lambda *_, t=type_name: self._on_postproc_param(t))
+        rot_row.addWidget(g['pp_rotate'], 1)
+        for deg, cap in ((-90.0, "↻90"), (90.0, "↺90"), (180.0, "180°")):
+            b = QPushButton(cap)
+            b.setMaximumWidth(46)
+            b.clicked.connect(lambda *_, t=type_name, d=deg:
+                              self._section_gens[t]['pp_rotate'].setValue(d))
+            rot_row.addWidget(b)
+        bv.addLayout(rot_row)
+        rot_hint = self._trlabel("hint_pp_rotate")
+        rot_hint.setStyleSheet("color: gray; font-size: 10px;")
+        rot_hint.setWordWrap(True)
+        bv.addWidget(rot_hint)
+
+        # --- 適用 / リセット ---
+        act_row = QHBoxLayout()
+        g['pp_apply_btn'] = QPushButton()
+        self._reg(lambda b=g['pp_apply_btn']: b.setText(tr("btn_pp_apply")))
+        g['pp_apply_btn'].clicked.connect(
+            lambda *_, t=type_name: self.postproc_apply(t))
+        act_row.addWidget(g['pp_apply_btn'], 1)
+        g['pp_reset_btn'] = QPushButton()
+        self._reg(lambda b=g['pp_reset_btn']: b.setText(tr("btn_pp_reset")))
+        g['pp_reset_btn'].clicked.connect(
+            lambda *_, t=type_name: self.postproc_reset(t))
+        act_row.addWidget(g['pp_reset_btn'])
+        bv.addLayout(act_row)
+
+        g['pp_status'] = QLabel("")
+        g['pp_status'].setStyleSheet("color: #c60; font-size: 10px;")
+        g['pp_status'].setWordWrap(True)
+        g['pp_status'].setVisible(False)
+        bv.addWidget(g['pp_status'])
+
+        g['pp_box'] = box
+        box.setEnabled(False)        # 適用画像ができるまで無効
+        return box
 
     def _current_sd(self):
         """現在のスリット方向 (dm 初期化前はチェックボックスから)。"""
@@ -2343,8 +3592,7 @@ class IMGTransApp(QWidget):
         layers = [lw.params() for lw in g['layers']]
         img16 = composite_layers(ph, pw, layers, scale=scale)
         img8 = np.ascontiguousarray((img16 >> 8).astype(np.uint8))
-        qimg = QImage(img8.tobytes(), pw, ph, pw, QImage.Format_Grayscale8)
-        return QPixmap.fromImage(qimg)
+        return gray8_to_qpixmap(img8)
 
     def _update_section_preview(self, type_name):
         """セクション {type_name} のプレビューラベルを再描画"""
@@ -2367,27 +3615,181 @@ class IMGTransApp(QWidget):
     def _show_loaded_image_in_preview(self, type_name, path):
         """読み込んだ (or 生成した) 画像をセクションのプレビューエリアに表示。
         パターンプレビューと同じ QLabel を使うことで「兼任」を実現。
+
+        未適用の後処理 (基準グレー / 回転) があればそれを乗せた結果を表示する
+        (ファイルはまだ書き換えていない)。階調表示モードにも従う。
         """
         if type_name not in self._section_gens:
             return
         label = self._section_gens[type_name]['preview_label']
         if not (path and os.path.exists(path)):
-            label.setText("(画像なし)")
+            label.setText(tr("pp_no_image"))
             return
-        pix = QPixmap()
-        ok = pix.load(path)
-        if not ok or pix.isNull():
+        img16 = read_map16(path)
+        if img16 is None:
             label.setText(f"(画像 load 失敗: {os.path.basename(path)})")
             return
-        # ラベルサイズに合わせて縮小 (アスペクト比保持)
+        h, w = img16.shape[:2]
+        # 大きい画像はプレビュー段階で縮小してから後処理をかける (軽量化)
         target_w = max(label.width(), label.minimumWidth())
         target_h = max(label.height(), label.minimumHeight())
-        scaled = pix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label.setPixmap(scaled)
+        scale = min(target_w / max(w, 1), target_h / max(h, 1), 1.0)
+        if scale < 1.0:
+            small = cv2.resize(img16, (max(2, int(round(w * scale))),
+                                       max(2, int(round(h * scale)))),
+                               interpolation=cv2.INTER_AREA)
+        else:
+            small = img16
+        mid, rot = self._pp_pending(type_name)
+        small = pp_apply_pending(small, mid, rot)
+        pix = gray8_to_qpixmap((small >> 8).astype(np.uint8))
+        label.setPixmap(pix)
+        note = "" if (abs(mid - 0.5) < 1e-6 and abs(rot) < 1e-6) else \
+            f"\n[未適用] 基準グレー={mid:.2f} / 回転={rot:.1f}°"
         label.setToolTip(
-            f"ロード画像: {os.path.basename(path)}\n"
-            f"({pix.width()}×{pix.height()})"
-        )
+            f"ロード画像: {os.path.basename(path)}\n({w}×{h}){note}")
+
+    # --- 適用画像の後処理 (破壊的) ---
+    def _pp_pending(self, type_name):
+        """セクションの未適用後処理 (midgray, rotate_deg) を返す。"""
+        g = self._section_gens.get(type_name, {})
+        if 'pp_midgray' not in g:
+            return 0.5, 0.0
+        return g['pp_midgray'].value() / 100.0, float(g['pp_rotate'].value())
+
+    def _pp_is_neutral(self, type_name):
+        mid, rot = self._pp_pending(type_name)
+        return abs(mid - 0.5) < 1e-6 and abs(rot) < 1e-6
+
+    def _refresh_section_view(self, type_name):
+        """セクションのプレビューを現在の状態で再描画 (適用画像 > レイヤー合成)。"""
+        path = getattr(self, f"{type_name}_img_path", None)
+        if path and os.path.exists(path):
+            self._show_loaded_image_in_preview(type_name, path)
+        else:
+            self._update_section_preview(type_name)
+
+    def _update_postproc_state(self, type_name):
+        """後処理パネルの有効/無効と「未適用」表示を更新する。"""
+        g = self._section_gens.get(type_name, {})
+        if 'pp_box' not in g:
+            return
+        path = getattr(self, f"{type_name}_img_path", None)
+        has_img = bool(path and os.path.exists(path))
+        g['pp_box'].setEnabled(has_img)
+        mid, rot = self._pp_pending(type_name)
+        g['pp_midgray_val'].setText(f"{mid:.2f}")
+        pending = has_img and not self._pp_is_neutral(type_name)
+        g['pp_status'].setText(tr("pp_pending") if pending else "")
+        g['pp_status'].setVisible(pending)
+        g['preview_label'].setStyleSheet(
+            "QLabel { background: #222; color: #888; border: 2px solid #c60; }"
+            if pending else
+            "QLabel { background: #222; color: #888; border: 1px solid #555; }")
+
+    def _on_postproc_param(self, type_name):
+        """基準グレー / 回転スライダーの変更 → プレビューのみ更新。"""
+        self._update_postproc_state(type_name)
+        self._refresh_section_view(type_name)
+
+    def postproc_reset(self, type_name):
+        """未適用の後処理パラメータを既定値に戻す (ファイルは触らない)。"""
+        g = self._section_gens.get(type_name, {})
+        if 'pp_midgray' not in g:
+            return
+        for w, v in ((g['pp_midgray'], 50), (g['pp_rotate'], 0.0)):
+            w.blockSignals(True)
+            w.setValue(v)
+            w.blockSignals(False)
+        self._on_postproc_param(type_name)
+
+    def _pp_write(self, type_name, img16, what):
+        """後処理結果を適用画像に上書きし、依存する表示をすべて更新する。"""
+        path = getattr(self, f"{type_name}_img_path", None)
+        try:
+            if not cv2.imwrite(path, img16):
+                raise IOError(f"cv2.imwrite failed: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Post-process Error", str(e))
+            self.log(f"[ERROR] postproc {type_name}: {e}")
+            return False
+        self.log(f"[postproc] {type_name}: {what} → {os.path.basename(path)}")
+        self.postproc_reset(type_name)          # 適用済みなので保留値をクリア
+        self._wire_loaded_image(type_name, path)
+        # 適用方法の基準画像を書き換えたら、対になるマップも作り直す
+        mode = self._selected_apply_mode()
+        if (type_name == "time" and mode == "time to data") or \
+           (type_name == "rate" and mode == "rate to data"):
+            self._sync_derived_maps()
+        self._mark_preview_stale()
+        return True
+
+    def postproc_invert(self, type_name):
+        """適用画像の階調を反転して上書きする (破壊的・確認あり)。"""
+        path = getattr(self, f"{type_name}_img_path", None)
+        if not (path and os.path.exists(path)):
+            QMessageBox.warning(self, "Error", tr("pp_no_image"))
+            return
+        if QMessageBox.question(
+                self, tr("pp_confirm_title"),
+                tr("pp_confirm_invert", t=type_name.capitalize(),
+                   f=os.path.basename(path)),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        img16 = read_map16(path)
+        if img16 is None:
+            QMessageBox.critical(self, "Error", f"Could not read {path}")
+            return
+        self._pp_write(type_name, pp_invert(img16), "invert")
+
+    def postproc_apply(self, type_name):
+        """未適用の基準グレー / 回転を適用画像へ書き込む (破壊的・確認あり)。"""
+        path = getattr(self, f"{type_name}_img_path", None)
+        if not (path and os.path.exists(path)):
+            QMessageBox.warning(self, "Error", tr("pp_no_image"))
+            return
+        mid, rot = self._pp_pending(type_name)
+        if self._pp_is_neutral(type_name):
+            QMessageBox.information(self, tr("grp_postproc"), tr("pp_nothing"))
+            return
+        ops = []
+        if abs(mid - 0.5) >= 1e-6:
+            ops.append(tr("pp_op_midgray", v=mid))
+        if abs(rot) >= 1e-6:
+            ops.append(tr("pp_op_rotate", v=rot))
+        if QMessageBox.question(
+                self, tr("pp_confirm_title"),
+                tr("pp_confirm_apply", t=type_name.capitalize(),
+                   f=os.path.basename(path), ops="\n".join(ops)),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        img16 = read_map16(path)
+        if img16 is None:
+            QMessageBox.critical(self, "Error", f"Could not read {path}")
+            return
+        self._pp_write(type_name, pp_apply_pending(img16, mid, rot),
+                       f"midgray={mid:.2f} rotate={rot:.1f}deg")
+
+    # --- 階調表示モード ---
+    def _on_colormap_toggled(self, checked):
+        """黄(255)–青(0) 表示の ON/OFF。表示のみでファイルには影響しない。"""
+        global COLOR_MODE
+        COLOR_MODE = "yellowblue" if checked else "gray"
+        for t in self._section_gens:
+            self._refresh_section_view(t)
+        for th in getattr(self, "_map_thumbs", {}).values():
+            th.refresh_color_mode()
+        self.log(f"[view] tone display: {COLOR_MODE}")
+
+    # --- 入力映像の回転 ---
+    def _on_video_rotation_changed(self, *_):
+        """回転の選択が変わったらプレビューへ即時反映 + 再初期化を促す。"""
+        self._update_video_preview()
+        if self.dm is not None:
+            self.info_label.setText(tr("vrot_reinit"))
+            self.init_btn.setEnabled(True)
 
     # --- Maneuver preview (2D + 3D) ---
     def _selected_preview_mode(self):
@@ -2455,6 +3857,7 @@ class IMGTransApp(QWidget):
         self.preview_progress.setVisible(True)
         self.log(f"[preview] starting in {mode} mode")
 
+        pw, ph = self._plot_inches_for(self.preview_2dplot_label)
         self._preview_worker = ManeuverPreviewWorker(
             self.dm, mode,
             self.space_img_path, self.time_img_path, self.rate_img_path,
@@ -2466,6 +3869,10 @@ class IMGTransApp(QWidget):
             anim_frames=self.preview_frames_spin.value(),
             anim_fps=10,
             anim_dpi=self.preview_dpi_spin.value(),
+            plot_w_inc=pw, plot_h_inc=ph,
+            gif_width=min(720, max(320, self.preview_3d_label.width())),
+            use_range=self._effective_range(),
+            sync_anchor=self._sync_anchor01(),
         )
         self._preview_worker.progress_signal.connect(self._on_preview_progress)
         self._preview_worker.percent_signal.connect(self._on_preview_percent)
@@ -2557,6 +3964,45 @@ class IMGTransApp(QWidget):
         )
         self._preview_stale = True
 
+    def _plot_inches_for(self, widget):
+        """widget の現在の表示領域に合わせた 2D プロットの図サイズ (インチ)。
+
+        図のアスペクト比を表示領域と一致させることで、KeepAspectRatio 縮小時の
+        余白 (レターボックス) を最小化する。面積は既定 (5×9=45in²) に固定し、
+        文字サイズと線の太さの見た目を既定プロットと揃える。
+        """
+        try:
+            w = max(1, widget.width())
+            h = max(1, widget.height())
+        except Exception:
+            return None, None
+        if w < 40 or h < 40:            # レイアウト確定前は既定に任せる
+            return None, None
+        area = 45.0                      # 既定の plot_w_inc(5) × plot_h_inc(9)
+        aspect = w / h
+        w_inc = (area * aspect) ** 0.5
+        h_inc = (area / aspect) ** 0.5
+        # 極端な縦横比では文字が潰れるためクランプ (アスペクトは多少崩れても
+        # 余白は現状より大きくならない)
+        w_inc = min(16.0, max(3.0, w_inc))
+        h_inc = min(16.0, max(3.0, h_inc))
+        return round(w_inc, 2), round(h_inc, 2)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if getattr(self, "_resize_timer", None):
+            self._resize_timer.start()   # 連続リサイズ中は巻き戻る
+
+    def _maybe_replot_on_resize(self):
+        """リサイズ確定後、2D プロット領域のアスペクト比が 10% 以上変わって
+        いたらライブプロットを再生成する (図サイズを表示領域に追従させる)。"""
+        if not self._pipeline_ready() or self._live2d_last_aspect is None:
+            return
+        pw, ph = self._plot_inches_for(self.live2d_thumb)
+        if pw and ph and abs(pw / ph - self._live2d_last_aspect) \
+                / self._live2d_last_aspect > 0.10:
+            self._schedule_live3d()
+
     # --- 3D軌道 ライブプレビュー (タブ2・自動更新) ---
     def _schedule_live3d(self):
         """編集イベントを800msデバウンスして _run_live3d を起動する。"""
@@ -2586,6 +4032,10 @@ class IMGTransApp(QWidget):
             return
         self._live3d_busy = True
         self.live3d_status.setText(tr("live3d_updating"))
+        # 2D プロットの図サイズをライブ表示領域のアスペクト比に合わせる
+        # (3D はネイティブ比率のまま — mplot3d の描画枠は歪ませない)
+        pw, ph = self._plot_inches_for(self.live2d_thumb)
+        self._live2d_last_aspect = (pw / ph) if (pw and ph) else None
         self._live3d_worker = ManeuverPreviewWorker(
             self.dm, mode,
             self.space_img_path, self.time_img_path, self.rate_img_path,
@@ -2596,15 +4046,26 @@ class IMGTransApp(QWidget):
             self.rate_startpoint_spin.value(),
             anim_frames=10, anim_fps=8, anim_dpi=55,
             skip_2d=False,   # 2D プロットもライブ表示する (タブ2へ完全移行)
+            plot_w_inc=pw, plot_h_inc=ph,
+            gif_width=min(720, max(320, self.live3d_label.width())),
+            use_range=self._effective_range(),
+            sync_anchor=self._sync_anchor01(),
         )
         self._live3d_worker.done_signal.connect(self._on_live3d_done)
         self._live3d_worker.start()
 
     def _on_live3d_done(self, success, plot2d, gif):
         self._live3d_busy = False
+        # 軌道データが実際に参照している入力時間範囲を緑バンドで表示
+        if success:
+            self._show_used_range_from_data()
         # 2D プロット (左カラム・赤ライン付きサムネイル)
         if success and plot2d and os.path.exists(plot2d):
             self.live2d_thumb.set_map(plot2d)
+            # 赤ラインの可動範囲を時間軸のデータ領域 (プロット内割合) に合わせる
+            frac = getattr(self.dm, "plot2d_time_axis_frac", None)
+            if frac:
+                self.live2d_thumb.set_playhead_range(*frac)
         if success and gif and os.path.exists(gif):
             if self._live3d_movie is not None:
                 try:
@@ -2852,6 +4313,8 @@ class IMGTransApp(QWidget):
     def _wire_loaded_image(self, img_type, path):
         """select_image() の "画像情報表示 + パラメータ抽出 + プレビュー" 共通処理"""
         getattr(self, f"{img_type}_label").setText(f"Selected: {path}")
+        # 適用画像が差し替わったので、未適用の後処理パラメータは破棄する
+        self.postproc_reset(img_type)
         # ライブプロット下の適用済みマップサムネイルを更新
         if img_type in getattr(self, "_map_thumbs", {}):
             self._map_thumbs[img_type].set_map(path)
@@ -2873,6 +4336,7 @@ class IMGTransApp(QWidget):
 
         # ロードした画像をセクション内のプレビューエリアに表示 (パターン preview と兼任)
         self._show_loaded_image_in_preview(img_type, path)
+        self._update_postproc_state(img_type)
 
         if self.dm:
             try:
@@ -2903,7 +4367,8 @@ class IMGTransApp(QWidget):
                 space_set=self.space_set_value.value(),
                 vmin=self.time_vmin_spin.value(), vmax=self.time_vmax_spin.value(),
                 baseline=self.rate_baseline_spin.value(),
-                maxdev=self.rate_maxdev_spin.value())
+                maxdev=self.rate_maxdev_spin.value(),
+                sync_anchor=self._sync_anchor01())
             self.rt_preview.refresh_maps()
 
     def on_anim_toggle_changed(self, state):
@@ -2957,6 +4422,9 @@ class IMGTransApp(QWidget):
         if getattr(self, "log_box", None):
             self.log_box.setVisible(idx == 1)
         self._move_live3d(idx == 1)
+        # タブ間で 2D プロット領域の形が変わるため、必要ならアスペクト再調整
+        if getattr(self, "_resize_timer", None):
+            self._resize_timer.start()
         rt = getattr(self, "rt_preview", None)
         if not rt:
             return
@@ -2965,6 +4433,23 @@ class IMGTransApp(QWidget):
             rt.start()
         else:
             rt.stop()
+
+    def _audio_export_settings(self):
+        """書き出しに使う音声設定 = GPU プレビューの音声設定そのもの。"""
+        if getattr(self, "rt_preview", None):
+            return self.rt_preview.audio_settings()
+        return {"enabled": False, "mode": "grain", "voices": 7, "grain_ms": 90}
+
+    def _update_audio_out_info(self, *_):
+        """出力行の「音声出力: …」表示をプレビュー設定に追従させる。"""
+        if not hasattr(self, "audio_out_info"):
+            return
+        a = self._audio_export_settings()
+        if a["enabled"]:
+            self.audio_out_info.setText(
+                tr("audio_out_on", m=a["mode"], v=a["voices"]))
+        else:
+            self.audio_out_info.setText(tr("audio_out_off"))
 
     def start_rendering(self):
         mode = self._selected_apply_mode()
@@ -2992,6 +4477,7 @@ class IMGTransApp(QWidget):
         except Exception as e:
             self.log(f"[WARN] could not set outfps: {e}")
 
+        aset = self._audio_export_settings()   # 音声 = プレビューの設定を使用
         space_set = self.space_set_value.value()
         vmin = self.time_vmin_spin.value()
         vmax = self.time_vmax_spin.value()
@@ -3005,8 +4491,10 @@ class IMGTransApp(QWidget):
             duration,
             space_set=space_set, time_vmin=vmin, time_vmax=vmax,
             rate_maxdev=maxdev, rate_baseline=baseline, rate_startpoint=startpoint,
-            audio_out=self.audio_chk.isChecked(),
-            audio_mode=self.audio_mode_combo.currentData() or "play",
+            audio_out=aset["enabled"], audio_mode=aset["mode"],
+            audio_voices=aset["voices"], audio_grain_ms=aset["grain_ms"],
+            use_range=self._effective_range(),
+            sync_anchor=self._sync_anchor01(),
         )
         self.worker.log_signal.connect(self.log)
         self.worker.done_signal.connect(self.on_render_done)

@@ -25,9 +25,10 @@ import cv2
 
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QDoubleSpinBox, QSlider, QProgressBar, QSizePolicy,
+    QDoubleSpinBox, QSpinBox, QSlider, QProgressBar, QSizePolicy,
+    QCheckBox, QComboBox,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent, QObject
 from PyQt5.QtGui import QImage, QPixmap
 
 try:
@@ -35,6 +36,14 @@ try:
     _HAS_WGPU = True
 except Exception:
     _HAS_WGPU = False
+
+# 音声プレビュー (QtMultimedia)。無い環境でも映像プレビューは動く。
+try:
+    from PyQt5.QtMultimedia import (QAudioOutput, QAudioFormat,
+                                    QAudioDeviceInfo)
+    _HAS_QTAUDIO = True
+except Exception:
+    _HAS_QTAUDIO = False
 
 FULLHD_W = 1920
 DEFAULT_BUDGET_MB = 1024      # フレームボリュームのメモリ予算 (可変)
@@ -60,6 +69,28 @@ _T = {
     "build_center": {"ja": "▶ プレビューを構築 / Build Preview",
                       "en": "▶ Build Preview"},
     "mode_info": {"ja": "適用: {m}", "en": "mode: {m}"},
+    # 音声プレビュー
+    "audio": {"ja": "音声", "en": "Audio"},
+    "audio_grain": {"ja": "grain (グラニュラー)", "en": "grain (granular)"},
+    "audio_play": {"ja": "play (可変速再生)", "en": "play (varispeed)"},
+    "audio_loading": {"ja": "音声トラックをデコード中…",
+                       "en": "Decoding audio track…"},
+    "audio_ready": {"ja": "音声プレビュー準備完了 ({sec:.1f}s)",
+                     "en": "Audio preview ready ({sec:.1f}s)"},
+    "audio_none": {"ja": "音声トラックが見つかりません",
+                    "en": "No audio track found"},
+    "audio_no_qt": {"ja": "(QtMultimedia が無いため音声プレビュー不可)",
+                     "en": "(QtMultimedia unavailable — no audio preview)"},
+    "audio_dev_fail": {"ja": "音声出力デバイスを開けませんでした",
+                        "en": "Could not open the audio output device"},
+    "audio_voices": {"ja": "分割:", "en": "Voices:"},
+    "audio_grain_ms": {"ja": "粒(ms):", "en": "Grain(ms):"},
+    "tip_audio_voices": {
+        "ja": "ボイス分割数 (スキャン軸のバンド数)。書き出しの音声も同じ分割数でレンダリングされます",
+        "en": "Number of voices (scan-axis bands). Export audio uses the same count"},
+    "tip_audio_grain": {
+        "ja": "グレイン長。grain モードのプレビューと書き出しの両方に適用",
+        "en": "Grain length, applied to both preview and export in grain mode"},
 }
 
 
@@ -266,8 +297,24 @@ def _decode_sparse_av_keyframes(video_path, sw, sh, idxs, batch_cb,
                 start += len(buf)
                 buf = []
 
+        # PyAV は Display Matrix 回転メタデータを適用しない (cv2/ffmpeg は自動
+        # 適用) ため、ここで物理回転して他パスと向きを揃える。
+        rotation = 0
+        try:
+            from imgtrans_lib._utils import probe_video_rotation
+            rotation = int(probe_video_rotation(video_path))
+        except Exception:
+            pass
+
         def to_rgba(frame):
-            arr = frame.reformat(width=sw, height=sh, format="rgb24").to_ndarray()
+            if rotation:
+                arr = frame.to_ndarray(format="rgb24")
+                arr = np.ascontiguousarray(np.rot90(arr, k=int(rotation / 90)))
+                if (arr.shape[1], arr.shape[0]) != (sw, sh):
+                    arr = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
+            else:
+                arr = frame.reformat(width=sw, height=sh,
+                                     format="rgb24").to_ndarray()
             rgba = np.empty((sh, sw, 4), np.uint8)
             rgba[..., :3] = arr
             rgba[..., 3] = 255
@@ -680,6 +727,314 @@ class _DecodeWorker(threading.Thread):
                 self.done_cb(str(e))
 
 
+# ---- 音声プレビュー (TimeFlowStudio GridAudio のデスクトップ版・列グリッド) ----
+AUDIO_SR = 48000          # 内部 PCM サンプルレート
+AUDIO_VOICES = 7          # スキャン軸を 7 バンドに分割 (TimeFlowStudio の 7 列)
+
+
+def decode_audio_mono(video_path, sr=AUDIO_SR):
+    """ffmpeg で動画の音声トラックをモノラル float32 PCM に落とす。
+
+    音声トラックが無い / 実質無音長 (<0.1s) なら None。
+    """
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", video_path, "-vn",
+           "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1",
+           "-ar", str(sr), "-"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=600).stdout
+    except Exception:
+        return None
+    if not out or len(out) < 4 * sr // 10:
+        return None
+    return np.frombuffer(out, np.float32).copy()
+
+
+class GridAudioPreview(QObject):
+    """RT プレビュー映像に追従する 7 ボイスの音響プレビュー。
+
+    TimeFlowStudio の GridAudio (7×5 グリッド) の系譜。デスクトップの
+    スリットモードでは行 (Y) は未割当なので、スキャン軸の 7 列バンドのみ。
+
+    - 各ボイスの目標時刻 = マップ (絶対入力フレーム) の現在行を 7 バンド平均
+      → recfps で秒に換算 (targets_fn が返す)。明度→時刻がアフィンなので
+      バンド平均明度の時刻 = バンド内平均時刻が厳密に成り立つ。
+    - grain: 2グレイン Hann 窓 50% オーバーラップ加算の位置駆動グラニュラー
+      (ピッチ保持寄り。フリーズ=粒の反復、逆再生・ループ跳びもクリックなし)
+    - play : 連続読みのテープ式可変速 (レート=ピッチ)。0.35s 以上のドリフトで
+      クロスフェード付きジャンプ補正
+    - パン: 列 → 等パワーステレオ (左端=L 〜 右端=R)
+    - ボイスごとに固定ジッタ 0〜20ms で位相分散、合算後 tanh ソフトクリップ
+    """
+    loaded = pyqtSignal(object)      # デコード完了 (np.ndarray or None)
+
+    GRAIN_SEC = 0.09                 # グレイン長 (90ms)
+    JUMP_SEC = 0.35                  # play モードのジャンプ補正しきい値
+    FEED_MS = 20                     # 書き込みポンプ周期
+    MAX_CHUNK_SEC = 0.10             # 1 回の書き込み上限 (レイテンシ抑制)
+
+    def __init__(self, parent, targets_fn):
+        super().__init__(parent)
+        self.targets_fn = targets_fn     # () -> 秒 shape(V,) or None
+        self.buf = None                  # モノラル float32 (未ロード = None)
+        self.method = "grain"            # "grain" | "play"
+        self.volume = 0.7
+        self.voices = AUDIO_VOICES       # 分割数 (書き出しの thread_num と共通)
+        self.grain_sec = self.GRAIN_SEC  # グレイン長 (書き出しの grain_dur と共通)
+        self._loading = False
+        self._out = None                 # QAudioOutput
+        self._io = None                  # push-mode QIODevice
+        self._dev_sr = AUDIO_SR
+        self._dev_float = True
+        self._src_step = 1.0             # 内部SR / デバイスSR (読み増分の補正)
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.FEED_MS)
+        self._timer.timeout.connect(self._feed)
+        self._tgt_wall = None            # 前回 targets 更新の wallclock
+        self._init_voice_state()
+
+    def _init_voice_state(self):
+        """分割数 (voices) に依存する状態をすべて再構築する。"""
+        V = max(1, int(self.voices))
+        pan = np.linspace(0.0, 1.0, V) if V > 1 else np.array([0.5])
+        self._panL = np.cos(pan * np.pi / 2).astype(np.float32)
+        self._panR = np.sin(pan * np.pi / 2).astype(np.float32)
+        rng = np.random.default_rng(7)
+        self._jitter = rng.random(V) * 0.020 * AUDIO_SR   # 0..20ms (samples)
+        # 目標位置 / レート推定
+        self._targets = np.zeros(V)      # samples (内部SR)
+        self._rate = np.ones(V)
+        self._tgt_wall = None
+        # grain 状態: ボイスごとに 2 スロット (デバイスサンプル基準の表は
+        # _setup_grain_tables で構築。デバイス SR 確定後に再構築される)
+        self._g_pos = np.zeros((V, 2))               # グレイン開始位置 (内部SR)
+        self._g_clock = np.zeros(V)                  # ボイス内クロック (devサンプル)
+        # play 状態
+        self._v_pos = np.zeros(V)
+        self._setup_grain_tables()
+
+    def set_voices(self, n):
+        """分割数を変更する (再生中でも即時反映)。"""
+        n = max(1, min(64, int(n)))
+        if n != self.voices:
+            self.voices = n
+            self._init_voice_state()
+
+    def set_grain_ms(self, ms):
+        """グレイン長 (ms) を変更する。"""
+        sec = min(0.5, max(0.02, float(ms) / 1000.0))
+        if abs(sec - self.grain_sec) > 1e-6:
+            self.grain_sec = sec
+            self._setup_grain_tables()
+
+    def _setup_grain_tables(self):
+        """グレイン窓/長さをデバイス SR 基準で構築する。"""
+        L = max(64, int(self.grain_sec * self._dev_sr))
+        self._g_len = L
+        self._g_half = max(1, L // 2)
+        self._win = np.hanning(L).astype(np.float32)
+        self._g_phase = np.full((self.voices, 2), float(L))  # L以上=非アクティブ
+
+    # --- ロード ---
+    def load_async(self, video_path):
+        if self._loading:
+            return
+        self._loading = True
+
+        def work():
+            buf = decode_audio_mono(video_path)
+            self._loading = False
+            self.loaded.emit(buf)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def invalidate(self):
+        """動画差し替え時: バッファを破棄して停止。"""
+        self.set_active(False)
+        self.buf = None
+
+    # --- デバイス ---
+    def _open_device(self):
+        if self._out is not None:
+            return True
+        if not _HAS_QTAUDIO:
+            return False
+        fmt = QAudioFormat()
+        fmt.setSampleRate(AUDIO_SR)
+        fmt.setChannelCount(2)
+        fmt.setCodec("audio/pcm")
+        fmt.setByteOrder(QAudioFormat.LittleEndian)
+        fmt.setSampleSize(32)
+        fmt.setSampleType(QAudioFormat.Float)
+        dev = QAudioDeviceInfo.defaultOutputDevice()
+        if not dev.isFormatSupported(fmt):
+            fmt.setSampleSize(16)
+            fmt.setSampleType(QAudioFormat.SignedInt)
+            if not dev.isFormatSupported(fmt):
+                fmt = dev.nearestFormat(fmt)
+        if fmt.channelCount() != 2 or fmt.codec() != "audio/pcm":
+            return False
+        self._dev_sr = max(8000, fmt.sampleRate())
+        self._dev_float = (fmt.sampleType() == QAudioFormat.Float)
+        self._src_step = AUDIO_SR / float(self._dev_sr)
+        self._setup_grain_tables()      # デバイス SR 基準で窓を再構築
+        bpf = fmt.channelCount() * fmt.sampleSize() // 8
+        self._bpf = bpf
+        self._out = QAudioOutput(dev, fmt, self)
+        self._out.setBufferSize(int(0.25 * self._dev_sr) * bpf)
+        self._out.setVolume(1.0)
+        self._io = self._out.start()
+        return self._io is not None
+
+    def close_device(self):
+        self.set_active(False)
+        if self._out is not None:
+            try:
+                self._out.stop()
+            except Exception:
+                pass
+            self._out = None
+            self._io = None
+
+    # --- 再生ゲート ---
+    def set_active(self, active):
+        """映像の再生/停止・有効チェックに追従して音を出す/止める。"""
+        if active and self.buf is not None:
+            if not self._open_device():
+                return False
+            self._tgt_wall = None       # レート推定をリセット
+            if not self._timer.isActive():
+                self._timer.start()
+        else:
+            self._timer.stop()
+            if self._out is not None:
+                try:
+                    # 溜まったバッファを破棄して即無音 (suspend だと尻が残る)
+                    self._out.reset()
+                    self._io = self._out.start()
+                except Exception:
+                    pass
+        return True
+
+    # --- 目標時刻の更新 + レート推定 (30〜50Hz) ---
+    def _update_targets(self):
+        t = self.targets_fn()
+        now = time.time()
+        if t is None:
+            return False
+        tgt = np.asarray(t, np.float64) * AUDIO_SR
+        if self._tgt_wall is not None:
+            dt = max(1e-3, now - self._tgt_wall)
+            inst = (tgt - self._targets) / (dt * AUDIO_SR)
+            # ループ跳び (大ジャンプ) はレートに反映しない
+            inst = np.where(np.abs(inst) > 16.0, self._rate, inst)
+            self._rate = 0.6 * self._rate + 0.4 * inst
+        self._targets = tgt
+        self._tgt_wall = now
+        return True
+
+    # --- 合成 ---
+    def _synth_grain(self, n):
+        """位置駆動グラニュラー。戻り値 (V, n) float32 (デバイスSRサンプル)。
+
+        位相/窓/クロックはすべてデバイスサンプル基準。バッファの読みだけ
+        _src_step (内部SR/デバイスSR) 刻みの線形補間 → ピッチはデバイス SR に
+        依存しない。
+        """
+        V = self.voices
+        buf = self.buf
+        N = buf.shape[0]
+        L = self._g_len
+        half = self._g_half
+        step = self._src_step            # デバイス1サンプルあたりの内部SR進行
+        out = np.zeros((V, n), np.float32)
+        for v in range(V):
+            i = 0
+            clock = int(self._g_clock[v])
+            while i < n:
+                # 次のグレイン発火境界 (ボイス内クロックが half の倍数)
+                k = clock // half
+                seg = int(min(n - i, (k + 1) * half - clock))
+                for s in (0, 1):
+                    ph = int(self._g_phase[v, s])
+                    if ph < L:
+                        take = min(seg, L - ph)
+                        if take > 0:
+                            idx = np.clip(
+                                self._g_pos[v, s] + (ph + np.arange(take)) * step,
+                                0, N - 2)
+                            out[v, i:i + take] += \
+                                self._read_lin(buf, idx) * self._win[ph:ph + take]
+                        self._g_phase[v, s] = ph + seg
+                clock += seg
+                i += seg
+                # 境界に達したら該当スロットに新グレインを撒く (50% overlap)
+                if clock % half == 0:
+                    slot = (clock // half) % 2
+                    start = self._targets[v] + self._jitter[v]
+                    self._g_pos[v, slot] = min(max(0.0, start),
+                                               max(0, N - L * step - 2))
+                    self._g_phase[v, slot] = 0.0
+            self._g_clock[v] = clock
+        return out
+
+    def _synth_play(self, n):
+        """テープ式可変速。戻り値 (V, n) float32。"""
+        V = self.voices
+        buf = self.buf
+        N = buf.shape[0]
+        step = self._src_step
+        out = np.empty((V, n), np.float32)
+        ramp = np.arange(n, dtype=np.float64)
+        for v in range(V):
+            r = float(self._rate[v]) * step
+            pos = self._v_pos[v]
+            tgt = self._targets[v] + self._jitter[v]
+            if abs(pos - tgt) > self.JUMP_SEC * AUDIO_SR:
+                # ドリフト大 → 旧位置から新位置へブロック内クロスフェード
+                idx_old = np.clip(pos + r * ramp, 0, N - 2)
+                idx_new = np.clip(tgt + r * ramp, 0, N - 2)
+                xf = (ramp / max(1, n - 1)).astype(np.float32)
+                out[v] = (self._read_lin(buf, idx_old) * (1.0 - xf)
+                          + self._read_lin(buf, idx_new) * xf)
+                self._v_pos[v] = tgt + r * n
+            else:
+                idx = np.clip(pos + r * ramp, 0, N - 2)
+                out[v] = self._read_lin(buf, idx)
+                self._v_pos[v] = pos + r * n
+        return out
+
+    @staticmethod
+    def _read_lin(buf, idx):
+        i0 = idx.astype(np.int64)
+        fr = (idx - i0).astype(np.float32)
+        return buf[i0] * (1.0 - fr) + buf[i0 + 1] * fr
+
+    # --- 書き込みポンプ ---
+    def _feed(self):
+        if self._io is None or self.buf is None:
+            return
+        free = self._out.bytesFree()
+        n = free // self._bpf
+        n = int(min(n, self.MAX_CHUNK_SEC * self._dev_sr))
+        if n < 64:
+            return
+        if not self._update_targets():
+            return
+        voices = self._synth_grain(n) if self.method == "grain" \
+            else self._synth_play(n)
+        amp = np.float32(self.volume * 1.6 / max(2, self.voices))
+        L = np.tanh((voices * self._panL[:, None]).sum(0) * amp)
+        R = np.tanh((voices * self._panR[:, None]).sum(0) * amp)
+        inter = np.empty(n * 2, np.float32)
+        inter[0::2] = L
+        inter[1::2] = R
+        if self._dev_float:
+            data = inter.tobytes()
+        else:
+            data = (np.clip(inter, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        self._io.write(data)
+
+
 class RealtimePreviewWidget(QWidget):
     """Tab3 に埋め込む GPU リアルタイム軸間変換プレビュー。"""
 
@@ -701,6 +1056,8 @@ class RealtimePreviewWidget(QWidget):
         self.baseline = 1.0
         self.maxdev = 0.5
         self.rec_fps = 30.0    # 入力動画の実FPS (rate 累積積分の frame_step 用)
+        self.use_range = None  # 使用範囲 (start_f, end_f)。None = 全尺
+        self.sync_anchor = 0.0 # rate: 全スリット時刻が一致する出力位置 (0..1)
 
         self._backend = None
         self._gpu = None       # _WgpuBackend のキャッシュ (device 再利用)
@@ -729,6 +1086,10 @@ class RealtimePreviewWidget(QWidget):
         self._max_interval_ms = 250      # ≈4fps まで自動降下
         self._render_ema = 0.0           # 1フレーム描画時間の移動平均 (sec)
 
+        # 音声プレビュー (グリッド追従)。UI 構築前に作る (チェックボックスが参照)
+        self.audio = GridAudioPreview(self, self._grid_audio_targets)
+        self.audio.loaded.connect(self._on_audio_loaded)
+
         self._build_ui()
         self._timer = QTimer(self)
         self._timer.setInterval(self._base_interval_ms)
@@ -747,6 +1108,13 @@ class RealtimePreviewWidget(QWidget):
             self._speed_label.setText(self._t("speed"))
             self.rebuild_btn.setText(self._t("rebuild"))
             self.center_btn.setText(self._t("build_center"))
+            self.audio_chk.setText(self._t("audio"))
+            self.audio_method.setItemText(0, self._t("audio_grain"))
+            self.audio_method.setItemText(1, self._t("audio_play"))
+            self._audio_voices_label.setText(self._t("audio_voices"))
+            self._audio_grain_label.setText(self._t("audio_grain_ms"))
+            self.audio_voices_spin.setToolTip(self._t("tip_audio_voices"))
+            self.audio_grain_spin.setToolTip(self._t("tip_audio_grain"))
             self.mode_label.setText(self._t("mode_info", m=self.mode))
             self._center_overlays()
             self.play_btn.setText(self._t("pause") if self._timer.isActive()
@@ -833,6 +1201,51 @@ class RealtimePreviewWidget(QWidget):
         self.rebuild_btn = QPushButton(self._t("rebuild"))
         self.rebuild_btn.clicked.connect(self.rebuild)
         ctl.addWidget(self.rebuild_btn)
+
+        # --- 音声プレビュー (グリッド追従) ---
+        self.audio_chk = QCheckBox(self._t("audio"))
+        self.audio_chk.toggled.connect(self._on_audio_toggled)
+        ctl.addWidget(self.audio_chk)
+        self.audio_method = QComboBox()
+        self.audio_method.addItem(self._t("audio_grain"), "grain")
+        self.audio_method.addItem(self._t("audio_play"), "play")
+        self.audio_method.currentIndexChanged.connect(self._on_audio_method)
+        self.audio_method.setEnabled(False)
+        ctl.addWidget(self.audio_method)
+        self.audio_vol = QSlider(Qt.Horizontal)
+        self.audio_vol.setRange(0, 100)
+        self.audio_vol.setValue(70)
+        self.audio_vol.setFixedWidth(80)
+        self.audio_vol.valueChanged.connect(
+            lambda v_: setattr(self.audio, "volume", v_ / 100.0))
+        self.audio_vol.setEnabled(False)
+        ctl.addWidget(self.audio_vol)
+        # 分割数 (ボイス数) — 書き出しの thread_num にもそのまま使われる
+        self._audio_voices_label = QLabel(self._t("audio_voices"))
+        ctl.addWidget(self._audio_voices_label)
+        self.audio_voices_spin = QSpinBox()
+        self.audio_voices_spin.setRange(2, 64)
+        self.audio_voices_spin.setValue(AUDIO_VOICES)
+        self.audio_voices_spin.setToolTip(self._t("tip_audio_voices"))
+        self.audio_voices_spin.valueChanged.connect(
+            lambda n: self.audio.set_voices(n))
+        self.audio_voices_spin.setEnabled(False)
+        ctl.addWidget(self.audio_voices_spin)
+        # グレイン長 (ms) — 書き出しの grain_dur にもそのまま使われる
+        self._audio_grain_label = QLabel(self._t("audio_grain_ms"))
+        ctl.addWidget(self._audio_grain_label)
+        self.audio_grain_spin = QSpinBox()
+        self.audio_grain_spin.setRange(20, 200)
+        self.audio_grain_spin.setValue(90)
+        self.audio_grain_spin.setToolTip(self._t("tip_audio_grain"))
+        self.audio_grain_spin.valueChanged.connect(
+            lambda ms: self.audio.set_grain_ms(ms))
+        self.audio_grain_spin.setEnabled(False)
+        ctl.addWidget(self.audio_grain_spin)
+        if not _HAS_QTAUDIO:
+            self.audio_chk.setEnabled(False)
+            self.audio_chk.setToolTip(self._t("audio_no_qt"))
+
         ctl.addStretch()
         v.addLayout(ctl)
 
@@ -841,6 +1254,15 @@ class RealtimePreviewWidget(QWidget):
         self.status.setWordWrap(True)
         v.addWidget(self.status)
         self._update_time_label()
+
+    def audio_settings(self):
+        """音声のプレビュー設定 = 書き出し設定。RenderWorker がそのまま使う。"""
+        return {
+            "enabled": self.audio_chk.isChecked(),
+            "mode": self.audio_method.currentData() or "grain",
+            "voices": int(self.audio_voices_spin.value()),
+            "grain_ms": int(self.audio_grain_spin.value()),
+        }
 
     # --- 中央オーバーレイの配置/演算中アニメ ---
     def eventFilter(self, obj, ev):
@@ -859,7 +1281,10 @@ class RealtimePreviewWidget(QWidget):
         changed = (path != self.video_path)
         self.video_path = path
         if changed:
-            # 動画が変わったら既存ボリュームは無効 → 中央の構築ボタンに戻す
+            # 動画が変わったら既存ボリューム/音声バッファは無効
+            self.audio.invalidate()
+            if self.audio_chk.isChecked():
+                self.audio.load_async(path)   # 有効中なら新しい音声を先読み
             self.stop()
             if self._worker is not None:
                 self._worker.cancel.set()
@@ -879,7 +1304,12 @@ class RealtimePreviewWidget(QWidget):
 
     def set_params(self, mode=None, space_set=None, vmin=None, vmax=None,
                    baseline=None, maxdev=None, time_size=None, out_fps=None,
-                   sd=None, rec_fps=None):
+                   sd=None, rec_fps=None, use_range="__keep__",
+                   sync_anchor=None):
+        if use_range != "__keep__":
+            self.use_range = use_range    # None = 全尺 (明示渡しのみ更新)
+        if sync_anchor is not None:
+            self.sync_anchor = min(1.0, max(0.0, float(sync_anchor)))
         if rec_fps is not None and float(rec_fps) > 0:
             self.rec_fps = float(rec_fps)
         if sd is not None and int(sd) in (0, 1) and int(sd) != self.scan_direction:
@@ -1071,12 +1501,30 @@ class RealtimePreviewWidget(QWidget):
                     z = z * (count / mx2)
         return z
 
+    def _fit_range(self, z):
+        """使用範囲 [s, e] へ書き出し側 (fit_trajectory_to_range) と同じ調整。
+
+        1. 頭合わせ: 冒頭行 (中央列) の参照時刻を範囲開始へスライド
+        2. 範囲開始より前があれば押し上げ / 3. 終了超過は開始点基準スケーリング
+        """
+        if self.use_range is None:
+            return z
+        s, e = float(self.use_range[0]), float(self.use_range[1])
+        z = z + (s - float(z[0, z.shape[1] // 2]))
+        mn = float(z.min())
+        if mn < s:
+            z = z + (s - mn)
+        mx = float(z.max())
+        if mx > e and (mx - s) > 1e-9:
+            z = s + (z - s) * ((e - s) / (mx - s))
+        return z
+
     def _build_abs_maps(self):
         """3 マップを「絶対入力フレーム」単位のデータ座標系配列で構築する。
 
         すべて img_to_maneuver と同一のデータ座標系 (time 行 × scan 列)。
-        time: vmin + t01*(vmax-vmin) → zPointCheck 再現
-        rate: 書き出しと同じ累積積分 Σ rate×(recfps/outfps) → zPointCheck 再現
+        time: vmin + t01*(vmax-vmin) → zPointCheck 再現 → 使用範囲フィット
+        rate: 書き出しと同じ累積積分 Σ rate×(recfps/outfps) → 同上
         space: 0..1 のまま (space_set スケールはシェーダ側 sscale で適用)
         """
         sd = self.scan_direction
@@ -1084,7 +1532,7 @@ class RealtimePreviewWidget(QWidget):
 
         t01 = load_map_data(self.time_path, sd, "time")
         t_abs = self.vmin + t01 * (self.vmax - self.vmin)
-        maps["time"] = self._z_adjust_array(t_abs)
+        maps["time"] = self._fit_range(self._z_adjust_array(t_abs))
 
         r01 = load_map_data(self.rate_path, sd, "rate")
         rates = self.baseline + (r01 - 0.5) * 2.0 * self.maxdev
@@ -1092,7 +1540,12 @@ class RealtimePreviewWidget(QWidget):
         n = rates.shape[0]
         cum = np.cumsum(rates, axis=0) * frame_step * (self.time_size / max(1, n))
         cum = np.vstack([np.zeros((1, cum.shape[1]), cum.dtype), cum[:-1]])
-        maps["rate"] = self._z_adjust_array(cum)
+        # 同期点: 書き出し側 (apply_sync_anchor) と同じ列オフセット調整
+        if self.sync_anchor > 1e-9:
+            row = int(round(self.sync_anchor * (cum.shape[0] - 1)))
+            ref = cum[row, :].copy()
+            cum = cum - ref[None, :] + float(ref.mean())
+        maps["rate"] = self._fit_range(self._z_adjust_array(cum))
         return maps
 
     def _upload_maps(self, be):
@@ -1117,16 +1570,70 @@ class RealtimePreviewWidget(QWidget):
         self._upload_maps(self._backend)
         self._render_once()
 
+    # ---- 音声プレビュー ----
+    def _grid_audio_targets(self):
+        """現在の再生位置における 7 列バンドの平均入力時刻 (秒) を返す。
+
+        _maps_abs は絶対入力フレーム単位 (time 行 × scan 列)。明度→時刻が
+        アフィンなので、バンド平均がそのままバンド内平均時刻になる
+        (TimeFlowStudio gridTimePositions と同じ閉形式)。
+        """
+        maps = getattr(self, "_maps_abs", None)
+        if not maps or self._F is None:
+            return None
+        m = maps["time"] if self.mode == "time" else maps["rate"]
+        ph01 = min(1.0, float(self._t_out) / max(1, self.time_size - 1))
+        row = int(round(ph01 * (m.shape[0] - 1)))
+        bands = np.array_split(m[row], max(1, self.audio.voices))
+        frames = np.array([float(b.mean()) for b in bands])
+        return frames / max(1e-6, float(self.rec_fps))
+
+    def _audio_should_run(self):
+        return (self.audio_chk.isChecked() and self.audio.buf is not None
+                and self._timer.isActive())
+
+    def _sync_audio_gate(self):
+        self.audio.set_active(self._audio_should_run())
+
+    def _on_audio_toggled(self, checked):
+        for wdg in (self.audio_method, self.audio_vol,
+                    self.audio_voices_spin, self.audio_grain_spin):
+            wdg.setEnabled(checked)
+        if checked:
+            if self.audio.buf is None:
+                if not self.video_path or not os.path.exists(self.video_path):
+                    self.status.setText(self._t("no_video"))
+                    self.audio_chk.setChecked(False)
+                    return
+                self.status.setText(self._t("audio_loading"))
+                self.audio.load_async(self.video_path)
+                return              # ロード完了時にゲートを開く
+        self._sync_audio_gate()
+
+    def _on_audio_loaded(self, buf):
+        if buf is None:
+            self.status.setText(self._t("audio_none"))
+            self.audio_chk.setChecked(False)
+            return
+        self.audio.buf = buf
+        self.status.setText(self._t("audio_ready", sec=len(buf) / AUDIO_SR))
+        self._sync_audio_gate()
+
+    def _on_audio_method(self, *_):
+        self.audio.method = self.audio_method.currentData() or "grain"
+
     # ---- 再生 ----
     def start(self):
         if self._backend and not self._timer.isActive():
             self._timer.start()
             self.play_btn.setText(self._t("pause"))
+        self._sync_audio_gate()
 
     def stop(self):
         if self._timer.isActive():
             self._timer.stop()
             self.play_btn.setText(self._t("play"))
+        self._sync_audio_gate()
 
     def _toggle_play(self):
         if self._timer.isActive():
