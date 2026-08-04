@@ -91,6 +91,16 @@ _T = {
     "tip_audio_grain": {
         "ja": "グレイン長。grain モードのプレビューと書き出しの両方に適用",
         "en": "Grain length, applied to both preview and export in grain mode"},
+    "audio_fx": {"ja": "音響FX (書き出し):", "en": "Audio FX (export):"},
+    "fx_reverb": {"ja": "リバーブ", "en": "Reverb"},
+    "fx_lpf": {"ja": "LPF", "en": "LPF"},
+    "fx_width": {"ja": "広がり", "en": "Width"},
+    "fx_detune": {"ja": "デチューン", "en": "Detune"},
+    "tip_audio_fx": {
+        "ja": "フレーム内在時間 (now depth) 駆動の音響変調。書き出し時の "
+              "audio_render に適用される (プレビューには反映されない)",
+        "en": "Now-depth driven audio modulation, applied to audio_render "
+              "at export (not audible in the preview)"},
 }
 
 
@@ -1115,6 +1125,11 @@ class RealtimePreviewWidget(QWidget):
             self._audio_grain_label.setText(self._t("audio_grain_ms"))
             self.audio_voices_spin.setToolTip(self._t("tip_audio_voices"))
             self.audio_grain_spin.setToolTip(self._t("tip_audio_grain"))
+            self._audio_fx_label.setText(self._t("audio_fx"))
+            self.fx_reverb_chk.setText(self._t("fx_reverb"))
+            self.fx_lpf_chk.setText(self._t("fx_lpf"))
+            self.fx_width_chk.setText(self._t("fx_width"))
+            self.fx_detune_chk.setText(self._t("fx_detune"))
             self.mode_label.setText(self._t("mode_info", m=self.mode))
             self._center_overlays()
             self.play_btn.setText(self._t("pause") if self._timer.isActive()
@@ -1249,6 +1264,24 @@ class RealtimePreviewWidget(QWidget):
         ctl.addStretch()
         v.addLayout(ctl)
 
+        # --- 音響FX 行 (now depth 駆動の変調。書き出し時に適用) ---
+        fx = QHBoxLayout()
+        self._audio_fx_label = QLabel(self._t("audio_fx"))
+        self._audio_fx_label.setStyleSheet("color: gray; font-size: 11px;")
+        self._audio_fx_label.setToolTip(self._t("tip_audio_fx"))
+        fx.addWidget(self._audio_fx_label)
+        self.fx_reverb_chk = QCheckBox(self._t("fx_reverb"))
+        self.fx_lpf_chk = QCheckBox(self._t("fx_lpf"))
+        self.fx_width_chk = QCheckBox(self._t("fx_width"))
+        self.fx_detune_chk = QCheckBox(self._t("fx_detune"))
+        for c in (self.fx_reverb_chk, self.fx_lpf_chk,
+                  self.fx_width_chk, self.fx_detune_chk):
+            c.setToolTip(self._t("tip_audio_fx"))
+            c.setEnabled(False)
+            fx.addWidget(c)
+        fx.addStretch()
+        v.addLayout(fx)
+
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray; font-size: 11px;")
         self.status.setWordWrap(True)
@@ -1262,6 +1295,11 @@ class RealtimePreviewWidget(QWidget):
             "mode": self.audio_method.currentData() or "grain",
             "voices": int(self.audio_voices_spin.value()),
             "grain_ms": int(self.audio_grain_spin.value()),
+            "volume": self.audio_vol.value() / 100.0,   # → audio_render gain
+            "depth_reverb": self.fx_reverb_chk.isChecked(),
+            "depth_lpf": self.fx_lpf_chk.isChecked(),
+            "depth_width": self.fx_width_chk.isChecked(),
+            "depth_detune": self.fx_detune_chk.isChecked(),
         }
 
     # --- 中央オーバーレイの配置/演算中アニメ ---
@@ -1597,7 +1635,9 @@ class RealtimePreviewWidget(QWidget):
 
     def _on_audio_toggled(self, checked):
         for wdg in (self.audio_method, self.audio_vol,
-                    self.audio_voices_spin, self.audio_grain_spin):
+                    self.audio_voices_spin, self.audio_grain_spin,
+                    self.fx_reverb_chk, self.fx_lpf_chk,
+                    self.fx_width_chk, self.fx_detune_chk):
             wdg.setEnabled(checked)
         if checked:
             if self.audio.buf is None:

@@ -41,6 +41,14 @@ import numpy as np
 import cv2
 from PIL import Image
 
+# matplotlib はヘッドレスの Agg に固定する (imgtrans の import 前に必須)。
+# PyQt5 環境で放置すると QtAgg が選ばれ、ワーカースレッドからのプロット生成が
+# メインスレッドの Qt と競合して UI 全体が重くなる + 図が Qt ウィジェットとして
+# 蓄積するため、動作が徐々に悪化していく。
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as _plt   # 図のリーク掃除用 (ワーカー完了時に close)
+
 from imgtrans import drawManeuver
 
 # リアルタイム GPU プレビュー (任意依存: wgpu)。読み込めなくてもアプリは動く。
@@ -155,8 +163,11 @@ TR = {
               "  rate to data = apply the Rate image as a playback-rate map\n"
               "Selecting this (with the required images set) unlocks the Preview / Render tabs.",
     },
-    "grp_live3d": {"ja": "軌道プロット ライブプレビュー (3D / 2D 自動更新)",
-                    "en": "Trajectory Plots Live Preview (3D / 2D, auto)"},
+    "grp_live3d": {"ja": "軌道プロット ライブプレビュー (2D 自動更新)",
+                    "en": "Trajectory Plots Live Preview (2D, auto)"},
+    "btn_plot3d_window": {"ja": "3D プロット表示 (別ウィンドウ)",
+                           "en": "Show 3D plot (new window)"},
+    "plot3d_generating": {"ja": "3D プロット生成中…", "en": "Generating 3D plot…"},
     "live3d_waiting": {"ja": "(画像と適用方法が揃うと自動生成されます)",
                         "en": "(auto-generates once images & apply mode are set)"},
     "live3d_updating": {"ja": "更新中…", "en": "updating…"},
@@ -1395,7 +1406,8 @@ class RenderWorker(QThread):
                  space_set=None, time_vmin=None, time_vmax=None, rate_maxdev=None,
                  anim_only=False, rate_baseline=None, rate_startpoint=None,
                  audio_out=False, audio_mode="play", use_range=None,
-                 sync_anchor=0.0, audio_voices=7, audio_grain_ms=90):
+                 sync_anchor=0.0, audio_voices=7, audio_grain_ms=90,
+                 audio_gain=1.0, audio_fx=None):
         super().__init__()
         self.dm = dm
         self.mode = mode
@@ -1415,6 +1427,9 @@ class RenderWorker(QThread):
         self.audio_mode = audio_mode    # "play"=可変速再生 / "grain"=グラニュラー
         self.audio_voices = max(1, int(audio_voices))    # ボイス分割数
         self.audio_grain_ms = max(20, int(audio_grain_ms))  # グレイン長 (ms)
+        self.audio_gain = float(audio_gain)              # マスター音量 (0..1)
+        # now depth 駆動の音響変調フラグ {depth_reverb, depth_lpf, ...}
+        self.audio_fx = dict(audio_fx or {})
         # 使用範囲 (start_frame, end_frame)。None = 全尺。
         # コピーは作らず、zPointCheck 後に軌道の時間軸をこの範囲へ調整する。
         self.use_range = use_range
@@ -1496,13 +1511,19 @@ class RenderWorker(QThread):
             # del_data=False で self.data が残っているため音声レンダリング可能。
             if self.audio_out and video_path:
                 try:
+                    fx_on = [k for k, v in self.audio_fx.items() if v]
                     self.emit(f"=== audio_video_out (mode={self.audio_mode}, "
                               f"voices={self.audio_voices}, "
-                              f"grain={self.audio_grain_ms}ms) ===")
+                              f"grain={self.audio_grain_ms}ms, "
+                              f"gain={self.audio_gain:.2f}"
+                              + (f", fx={'+'.join(fx_on)}" if fx_on else "")
+                              + ") ===")
                     audio_final = bm.audio_video_out(
                         mode=self.audio_mode,
                         thread_num=self.audio_voices,
-                        grain_dur=self.audio_grain_ms / 1000.0)
+                        grain_dur=self.audio_grain_ms / 1000.0,
+                        gain=self.audio_gain,
+                        **self.audio_fx)
                     if audio_final and os.path.exists(audio_final):
                         video_path = audio_final
                         self.emit(f"audio applied: {os.path.basename(audio_final)}")
@@ -1591,13 +1612,15 @@ class ManeuverPreviewWorker(QThread):
                  space_set, time_vmin, time_vmax,
                  rate_maxdev, rate_baseline, rate_startpoint,
                  anim_frames=20, anim_fps=10, anim_dpi=80,
-                 skip_2d=False, plot_w_inc=None, plot_h_inc=None,
+                 skip_2d=False, skip_3d=False,
+                 plot_w_inc=None, plot_h_inc=None,
                  plot3d_fig=None, gif_width=400, use_range=None,
                  sync_anchor=0.0):
         super().__init__()
         self.dm = dm
         self.mode = mode  # "time" or "rate"
-        self.skip_2d = skip_2d   # ライブ3Dプレビュー用: 2D プロット生成を省略
+        self.skip_2d = skip_2d   # 3D 単独生成用: 2D プロットを省略
+        self.skip_3d = skip_3d   # ライブ更新用: 3D プロット+GIF を省略 (軽量)
         # 2D プロットの図サイズ (インチ)。None なら dm の既定値のまま。
         self.plot_w_inc = plot_w_inc
         self.plot_h_inc = plot_h_inc
@@ -1689,23 +1712,26 @@ class ManeuverPreviewWorker(QThread):
                 self.dm.maneuver_2dplot()
                 plot2d = self._latest_file(cwd, (".png",), ts_2d)
 
-            # 3D アニメ生成: 同じく mtime で検出
-            ts_3d = time.time() - 0.5
-            self.progress_signal.emit(
-                f"maneuver_3dplot: 3D アニメ生成中 ({self.anim_frames} frames @ {self.anim_dpi} dpi)…"
-            )
-            self.percent_signal.emit(55)
-            kw3d = {}
-            if self.plot3d_fig:
-                fw, fh, box = self.plot3d_fig
-                kw3d = dict(fig_w_inc=fw, fig_h_inc=fh, box_aspect=box)
-            self.dm.maneuver_3dplot(
-                out_framenums=self.anim_frames,
-                out_fps=self.anim_fps,
-                dpi=self.anim_dpi,
-                **kw3d,
-            )
-            mp4 = self._latest_file(cwd, (".mp4", ".mov"), ts_3d)
+            # 3D アニメ生成: 同じく mtime で検出 (ライブ更新ではスキップして
+            # 軽量化 — 3D は別ウィンドウのオンデマンド生成でのみ作る)
+            mp4 = ""
+            if not self.skip_3d:
+                ts_3d = time.time() - 0.5
+                self.progress_signal.emit(
+                    f"maneuver_3dplot: 3D アニメ生成中 ({self.anim_frames} frames @ {self.anim_dpi} dpi)…"
+                )
+                self.percent_signal.emit(55)
+                kw3d = {}
+                if self.plot3d_fig:
+                    fw, fh, box = self.plot3d_fig
+                    kw3d = dict(fig_w_inc=fw, fig_h_inc=fh, box_aspect=box)
+                self.dm.maneuver_3dplot(
+                    out_framenums=self.anim_frames,
+                    out_fps=self.anim_fps,
+                    dpi=self.anim_dpi,
+                    **kw3d,
+                )
+                mp4 = self._latest_file(cwd, (".mp4", ".mov"), ts_3d)
 
             gif = ""
             if mp4 and os.path.exists(mp4):
@@ -1728,6 +1754,13 @@ class ManeuverPreviewWorker(QThread):
         except Exception as e:
             self.progress_signal.emit(f"[ERROR] {e}")
             self.done_signal.emit(False, "", "")
+        finally:
+            # maneuver_2dplot は図を close しないため、放置すると再生成の
+            # たびに figure が蓄積してメモリ/速度が悪化する → 毎回掃除
+            try:
+                _plt.close("all")
+            except Exception:
+                pass
 
 
 # ======== stdout の進捗% 検出 (レンダリング進捗バー用) ========
@@ -2097,7 +2130,9 @@ class IMGTransApp(QWidget):
         self._live3d_frames = None   # 同期表示用の先読み GIF フレーム
         self._live3d_timer = QTimer(self)
         self._live3d_timer.setSingleShot(True)
-        self._live3d_timer.setInterval(800)     # 編集のデバウンス
+        # 編集のデバウンス: プロット生成 (matplotlib) は重いので、
+        # 連続編集が完全に落ち着いてから 1 回だけ走らせる
+        self._live3d_timer.setInterval(2000)
         self._live3d_timer.timeout.connect(self._run_live3d)
         # プロット同期タイマ: GPU 映像の再生位置 → 赤ライン/3D GIF フレーム
         self._plot_sync_timer = QTimer(self)
@@ -2118,8 +2153,6 @@ class IMGTransApp(QWidget):
         self._i18n.append(lambda: (None if self.space_img_path else self.space_label.setText(tr("no_space_image"))))
         self._i18n.append(lambda: (None if self.time_img_path else self.time_label.setText(tr("no_time_image"))))
         self._i18n.append(lambda: (None if self.rate_img_path else self.rate_label.setText(tr("no_rate_image"))))
-        # ライブプロットのプレースホルダ (未生成時のみ訳し直す)
-        self._i18n.append(lambda: (None if self._live3d_movie else self.live3d_label.setText(tr("live3d_waiting"))))
         self._i18n.append(lambda: (None if (self.live2d_thumb.pixmap() and not self.live2d_thumb.pixmap().isNull()) else self.live2d_thumb.setText(tr("live3d_waiting"))))
 
         self.update_ui_state("initial")
@@ -2211,22 +2244,19 @@ class IMGTransApp(QWidget):
         self._reg(lambda: self.video_btn.setText(tr("btn_select_video")))
         self.video_btn.clicked.connect(self.select_video)
 
-        # --- 入力映像プレビュー (選択直後に表示。回転操作を即時反映) ---
+        # --- 入力映像プレビュー (静止フレーム表示 + スクラブ) ---
+        # 常時ループ再生は廃止 (4K 素材でメインスレッドを飽和させるため)。
+        # デコードはスクラブ時の 1 フレームのみ。回転/スリット切替などの
+        # 見た目の変更はキャッシュ済みフレームから再描画する (再デコードなし)。
         self._vid_cap = None            # プレビュー用 VideoCapture
         self._vid_info = None           # (w, h, fps, frames, dur_sec)
         self._vid_pos = -1              # cap が次に read するフレーム番号
-        # 常時ループ再生: 使用範囲 (緑バンド優先) を実時間で再生し続ける。
-        # スクラブ中は一時停止し、しばらく操作が無ければ自動再開する。
-        self._vplay_timer = QTimer(self)
-        self._vplay_timer.setInterval(66)          # ≈15fps 表示 (再生は実時間)
-        self._vplay_timer.timeout.connect(self._vplay_tick)
-        self._vplay_t0 = None                      # 再生アンカーの wallclock
-        self._vplay_anchor = 0.0                   # t0 時点のフレーム位置
-        self._vplay_paused = False                 # スクラブによる一時停止
-        self._vplay_resume = QTimer(self)
-        self._vplay_resume.setSingleShot(True)
-        self._vplay_resume.setInterval(1500)       # 操作後 1.5s で再生再開
-        self._vplay_resume.timeout.connect(self._vplay_resume_now)
+        self._vid_frame_cache = None    # (idx, BGR frame) 直近デコード結果
+        self._scrub_pending = None      # スクラブの読み込み待ちフレーム
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setSingleShot(True)
+        self._scrub_timer.setInterval(120)   # 連続ドラッグ中の読み込み間引き
+        self._scrub_timer.timeout.connect(self._scrub_flush)
         self.video_preview = QLabel()
         self.video_preview.setAlignment(Qt.AlignCenter)
         self.video_preview.setFixedHeight(150)
@@ -2271,6 +2301,8 @@ class IMGTransApp(QWidget):
         self._reg(lambda: self.slit_toggle.setText(tr("chk_vertical")))
         self.slit_label = QLabel(tr("slit_h"))
         self.slit_toggle.stateChanged.connect(self.update_slit_label)
+        # スリット方向の切替 → プレビューのガイドライン向きを即時更新
+        self.slit_toggle.stateChanged.connect(self._update_video_preview)
         self._reg(self.update_slit_label)  # 言語切替時にスリット表示も更新
 
         # --- 入力映像の回転 (Initialize 時に ffmpeg で回転コピーを作る) ---
@@ -2497,37 +2529,43 @@ class IMGTransApp(QWidget):
         am_v.addLayout(am_row)
         self.apply_mode_group.setVisible(False)  # Initialize 後に表示
 
-        # ===== 軌道プロット ライブプレビュー (3D | 2D の2カラム・自動更新) =====
+        # ===== 軌道プロット + GPU プレビュー ライブビュー (2カラム・自動更新) =====
         # 画像/パラメータ/適用方法を編集するたびにデバウンス後、軽量設定で
         # maneuver_3dplot (GIF) + maneuver_2dplot (PNG) を再生成して表示する。
+        # レイアウト: [左 2/5: 上=3D GIF / 下=2D プロット]
+        #             [右 3/5: 上=GPU リアルタイムプレビュー /
+        #                      下=Space・Time・Rate サムネイル]
         self.live3d_group = QGroupBox()
         self._reg(lambda: self.live3d_group.setTitle(tr("grp_live3d")))
-        # レイアウト: [2D プロット (左・幅2/5, 再生赤ライン付き)]
-        #             [右 3/5: 上=3D GIF / 下=Space・Time・Rate サムネイル]
-        # 全体は縦方向センタリング (下側の空白を防ぐ)
         l3_outer = QVBoxLayout(self.live3d_group)
-        l3_outer.addStretch(1)
         l3_cols = QHBoxLayout()
 
-        # 左: 2D プロット (MapThumb — 赤ラインが常に左→右へスライド)
+        # 左カラム: 2D プロット + 「3D プロット (別ウィンドウ)」ボタン。
+        # 3D プロット+GIF はライブ更新から外した (生成コストの 6〜7 割を占める
+        # ため)。必要なときだけボタンで生成し、別ウィンドウに表示する。
+        left_col = QVBoxLayout()
         self.live2d_thumb = MapThumb("2D Plot", fixed_height=None, colorizable=False)
+        self.live2d_thumb.setMinimumSize(140, 120)
         self.live2d_thumb.set_time_vertical(False)   # 2D の時間軸は常に横
         self.live2d_thumb.setStyleSheet(
             "QLabel { background: #ffffff; border: 1px solid #555;"
             " color: #888; font-size: 10px; }")
         self.live2d_thumb.setText(tr("live3d_waiting"))
-        l3_cols.addWidget(self.live2d_thumb, 2)
+        left_col.addWidget(self.live2d_thumb, 1)
+        self.plot3d_btn = QPushButton()
+        self._reg(lambda: self.plot3d_btn.setText(tr("btn_plot3d_window")))
+        self.plot3d_btn.clicked.connect(self._open_3d_plot_window)
+        self.plot3d_btn.setEnabled(False)
+        left_col.addWidget(self.plot3d_btn)
+        l3_cols.addLayout(left_col, 4)
 
-        # 右カラム: 3D GIF (上) + マップサムネイル3枚 (下)
+        # 右カラム: GPU プレビュー (上・後で差し込む) + マップサムネイル3枚 (下)
         right_col = QVBoxLayout()
-        self.live3d_label = QLabel(tr("live3d_waiting"))
-        self.live3d_label.setAlignment(Qt.AlignCenter)
-        self.live3d_label.setMinimumSize(320, 200)
-        self.live3d_label.setStyleSheet(
-            "QLabel { background: #222; color: #888; border: 1px solid #555; }")
-        right_col.addWidget(self.live3d_label, 1)
+        self._live_gpu_slot = QVBoxLayout()   # rt_group / rendered_preview 用
+        right_col.addLayout(self._live_gpu_slot, 3)
 
-        # 適用済みマップ 3 枚のサムネイル (3D アニメの再生位置を赤ラインで表示)
+        # 適用済みマップ 3 枚のサムネイル (再生位置を赤ラインで表示)。
+        # 高さ固定をやめ、縦横比を無視して残り領域を目一杯使う。
         self._map_thumbs = {}
         thumb_row = QHBoxLayout()
         thumb_row.setSpacing(6)
@@ -2538,19 +2576,18 @@ class IMGTransApp(QWidget):
             cap_lbl.setStyleSheet("color: gray; font-size: 10px;")
             cap_lbl.setAlignment(Qt.AlignCenter)
             col.addWidget(cap_lbl)
-            # 適用マップは表示領域いっぱいに引き伸ばして表示 (縦横比可変)
-            th = MapThumb(cap, stretch=True)
+            th = MapThumb(cap, fixed_height=None, stretch=True)
+            th.setMinimumSize(100, 60)
             self._map_thumbs[t] = th
-            col.addWidget(th)
+            col.addWidget(th, 1)
             thumb_row.addLayout(col, 1)
-        right_col.addLayout(thumb_row)
-        l3_cols.addLayout(right_col, 3)
+        right_col.addLayout(thumb_row, 1)
+        l3_cols.addLayout(right_col, 11)
 
-        l3_outer.addLayout(l3_cols)
+        l3_outer.addLayout(l3_cols, 1)
         self.live3d_status = QLabel("")
         self.live3d_status.setStyleSheet("color: gray; font-size: 11px;")
         l3_outer.addWidget(self.live3d_status)
-        l3_outer.addStretch(1)
         self.live3d_group.setVisible(False)      # Initialize 後に表示
 
         # ===== マニューバ プレビュー (Time+Space or Rate+Space 揃った時点で確認) =====
@@ -2647,15 +2684,11 @@ class IMGTransApp(QWidget):
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
 
-        # ===== タブ構造でレイアウト組み立て =====
-        self.tabs = QTabWidget()
-        tabs = self.tabs
-
-        # --- Tab 1: 入力 + 画像 (Setup & Images 統合) ---
+        # ===== 1 画面構成でレイアウト組み立て (タブ廃止) =====
         # 上段 2 カラム: 左 = 入力(Setup) + 適用方法 + 共通サイズ設定 /
-        #               右 = 軌道プロット ライブプレビュー (2D|3D)
-        # 下段: Space / Time / Rate の 3 カラム。
-        # 1 画面で入力から画像編集まで全状況を見ながら操作できる。
+        #               右 = ライブビュー (3D+2D プロット | GPU プレビュー+サムネイル)
+        # 中段: Space / Time / Rate の 3 カラム
+        # 下段: 出力行 (音声出力表示 + Start Rendering + 進捗) + ログ
         setup_group = QGroupBox()
         self._reg(lambda b=setup_group: b.setTitle(tr("grp_setup")))
         sg_l = QVBoxLayout(setup_group)
@@ -2672,7 +2705,46 @@ class IMGTransApp(QWidget):
                   self.colormap_chk, self.colormap_hint]:
             sg_l.addWidget(w)
 
-        t2 = QWidget(); t2_l = QVBoxLayout(t2)
+        # GPU リアルタイムプレビュー ⇄ レンダリング結果 (ライブビュー右上へ)
+        # 出力行 (GPU プレビューの右上に配置):
+        # 音声出力表示 + Start Rendering + 進捗バー。
+        # 音声の適用/モード/分割数/FX は GPU プレビューの音声設定がそのまま
+        # 書き出しにも使われる — 二重の選択 UI は置かない。
+        render_row = QHBoxLayout()
+        self.audio_out_info = QLabel("")
+        self.audio_out_info.setStyleSheet("color: gray; font-size: 11px;")
+        render_row.addWidget(self.audio_out_info)
+        render_row.addStretch()
+        self.render_progress = QProgressBar()
+        self.render_progress.setRange(0, 100)
+        self.render_progress.setValue(0)
+        self.render_progress.setTextVisible(True)
+        self.render_progress.setMaximumWidth(220)
+        render_row.addWidget(self.render_progress)
+        render_row.addWidget(self.start_btn)
+
+        if _HAS_RT_PREVIEW:
+            self.rt_group = QGroupBox()
+            self._reg(lambda: self.rt_group.setTitle(tr("grp_realtime")))
+            rt_v = QVBoxLayout(self.rt_group)
+            rt_v.setContentsMargins(4, 4, 4, 4)
+            rt_v.addLayout(render_row)          # 右上にレンダリング開始
+            self.rt_preview = RealtimePreviewWidget(lang=LANG)
+            rt_v.addWidget(self.rt_preview)
+            self._live_gpu_slot.addWidget(self.rt_group, 3)
+            # Rebuild / 構築ボタンで GPU ビューへ戻す
+            self.rt_preview.rebuild_btn.clicked.connect(self._show_gpu_view)
+            self.rt_preview.center_btn.clicked.connect(self._show_gpu_view)
+        else:
+            self.rt_preview = None
+            self._render_row_fallback = render_row   # RT 無し環境ではページ下部へ
+        self.rendered_preview = VideoPreview(tr("rendered_video_title"))
+        self._reg(lambda: self.rendered_preview.set_base_title(tr("rendered_video_title")))
+        self.rendered_preview.setVisible(False)
+        self._live_gpu_slot.addWidget(self.rendered_preview, 3)
+
+        page = QWidget()
+        page_l = QVBoxLayout(page)
         top_row = QHBoxLayout()
         top_left = QVBoxLayout()
         top_left.addWidget(setup_group)
@@ -2680,9 +2752,8 @@ class IMGTransApp(QWidget):
         top_left.addWidget(self.gen_group)
         top_left.addStretch()
         top_row.addLayout(top_left, 1)
-        top_row.addWidget(self.live3d_group, 3)   # シミュレーション側を幅 3/4 に
-        self._t2_top_row = top_row   # live3d_group をタブ間で移動するための帰り先
-        t2_l.addLayout(top_row)
+        top_row.addWidget(self.live3d_group, 3)   # ライブビュー側を幅 3/4 に
+        page_l.addLayout(top_row, 1)
 
         cols = QHBoxLayout()
         cols.setSpacing(8)
@@ -2709,63 +2780,11 @@ class IMGTransApp(QWidget):
             bv.addWidget(gen_frame)
             bv.addStretch()
             cols.addWidget(box, 1)
-        t2_l.addLayout(cols)
+        page_l.addLayout(cols)
 
-
-        t2_l.addStretch()
-        tabs.addTab(self._wrap_scroll(t2), tr("tab_main"))
-
-        # --- Tab 2: プレビュー・出力 (Preview & Render 統合) ---
-        # スクロール無しで「映像ビュー + 軌道プロットライブビュー + 出力操作」を
-        # 1 画面に収める。アニメーション書き出し UI はこのタブには置かない。
-        t3 = QWidget(); t3_l = QVBoxLayout(t3)
-
-        # 上段バー: 適用方法表示 + 「映像ビューのみ表示」チェック
-        pv_top = QHBoxLayout()
-        pv_top.addWidget(self.apply_mode_info, 1)
-        self.video_only_chk = QCheckBox()
-        self._reg(lambda: self.video_only_chk.setText(tr("chk_video_only")))
-        self.video_only_chk.toggled.connect(self._on_video_only_toggled)
-        pv_top.addWidget(self.video_only_chk)
-        t3_l.addLayout(pv_top)
-
-        # 映像エリア: GPU リアルタイムプレビュー ⇄ レンダリング結果を差し替え
-        if _HAS_RT_PREVIEW:
-            self.rt_group = QGroupBox()
-            self._reg(lambda: self.rt_group.setTitle(tr("grp_realtime")))
-            rt_v = QVBoxLayout(self.rt_group)
-            self.rt_preview = RealtimePreviewWidget(lang=LANG)
-            rt_v.addWidget(self.rt_preview)
-            t3_l.addWidget(self.rt_group, 3)
-            # Rebuild / 構築ボタンで GPU ビューへ戻す
-            self.rt_preview.rebuild_btn.clicked.connect(self._show_gpu_view)
-            self.rt_preview.center_btn.clicked.connect(self._show_gpu_view)
-        else:
-            self.rt_preview = None
-        self.rendered_preview = VideoPreview(tr("rendered_video_title"))
-        self._reg(lambda: self.rendered_preview.set_base_title(tr("rendered_video_title")))
-        self.rendered_preview.setVisible(False)
-        t3_l.addWidget(self.rendered_preview, 3)
-
-        # 軌道プロットライブビューの受け皿 (このタブ表示中は live3d_group を
-        # タブ1からここへ移動して併置する)
-        self._live3d_slot = QVBoxLayout()
-        t3_l.addLayout(self._live3d_slot, 2)
-
-        # 出力行: Start Rendering + 進捗バー
-        # (音声の適用/モード/分割数/グレイン長は GPU プレビューの音声設定が
-        #  そのまま書き出しにも使われる — 二重の選択 UI は置かない)
-        render_row = QHBoxLayout()
-        self.audio_out_info = QLabel("")
-        self.audio_out_info.setStyleSheet("color: gray; font-size: 11px;")
-        render_row.addWidget(self.audio_out_info)
-        render_row.addWidget(self.start_btn, 1)
-        self.render_progress = QProgressBar()
-        self.render_progress.setRange(0, 100)
-        self.render_progress.setValue(0)
-        self.render_progress.setTextVisible(True)
-        render_row.addWidget(self.render_progress, 2)
-        t3_l.addLayout(render_row)
+        # RT プレビューが無い環境では出力行をページ下部に置く
+        if getattr(self, "_render_row_fallback", None) is not None:
+            page_l.addLayout(self._render_row_fallback)
 
         # プレビューの音声設定変更 → 書き出し予定の表示を更新
         if self.rt_preview is not None:
@@ -2774,35 +2793,28 @@ class IMGTransApp(QWidget):
                 self._update_audio_out_info)
             self.rt_preview.audio_voices_spin.valueChanged.connect(
                 self._update_audio_out_info)
+            for c in (self.rt_preview.fx_reverb_chk, self.rt_preview.fx_lpf_chk,
+                      self.rt_preview.fx_width_chk,
+                      self.rt_preview.fx_detune_chk):
+                c.toggled.connect(self._update_audio_out_info)
         self._reg(self._update_audio_out_info)
 
-        tabs.addTab(t3, tr("tab_preview"))
-        tabs.currentChanged.connect(self._on_tab_changed)
-
-        # タブ見出しの再翻訳を登録
-        self._reg(lambda: (
-            self.tabs.setTabText(0, tr("tab_main")),
-            self.tabs.setTabText(1, tr("tab_preview")),
-        ))
-
-        # ===== ログ (メインの入力・画像ページでは非表示、他タブで表示) =====
+        # ===== ログ (常時表示・Splitter でサイズ可変) =====
         log_label = self._trlabel("lbl_log")
         log_label.setStyleSheet("color: gray; font-size: 11px; margin-top: 4px;")
-        self.log_window.setMinimumHeight(80)
+        self.log_window.setMinimumHeight(60)
         self.log_window.setMaximumHeight(160)
 
-        # Splitter で「タブ」と「ログ」のサイズを可変に
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(tabs)
+        splitter.addWidget(self._wrap_scroll(page))
         self.log_box = QWidget()
         log_box_l = QVBoxLayout(self.log_box)
         log_box_l.setContentsMargins(0, 0, 0, 0)
         log_box_l.addWidget(log_label)
         log_box_l.addWidget(self.log_window)
         splitter.addWidget(self.log_box)
-        splitter.setStretchFactor(0, 5)  # tabs 側を広く
+        splitter.setStretchFactor(0, 6)  # ページ側を広く
         splitter.setStretchFactor(1, 1)
-        self.log_box.setVisible(False)   # 起動時はメインページ (index 0)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(6, 6, 6, 6)
@@ -2863,19 +2875,13 @@ class IMGTransApp(QWidget):
         return bool(self.rate_img_path)
 
     def _update_tab_gating(self):
-        if not hasattr(self, "tabs"):
+        """(1画面構成) 出力操作をパイプライン準備状況でゲートする。"""
+        if not hasattr(self, "start_btn"):
             return
         ready = self._pipeline_ready()
-        self.tabs.setTabEnabled(1, ready)   # プレビュー・出力 (統合)
-        # 出力操作も同じ条件でゲート (レンダリング可能条件と一致)
         self.start_btn.setEnabled(ready)
-        # 現在表示中のタブが無効化されたら、有効な直近のタブへ戻す
-        cur = self.tabs.currentIndex()
-        if not self.tabs.isTabEnabled(cur):
-            for i in range(cur, -1, -1):
-                if self.tabs.isTabEnabled(i):
-                    self.tabs.setCurrentIndex(i)
-                    break
+        if hasattr(self, "plot3d_btn"):
+            self.plot3d_btn.setEnabled(ready and not self._live3d_busy)
 
     def _update_apply_mode_info(self):
         """タブ4上部の「適用方法」表示を更新 (選択はタブ2で行う)。"""
@@ -3057,9 +3063,14 @@ class IMGTransApp(QWidget):
 
     # --- 入力映像プレビュー / 使用範囲 ---
     def _open_video_preview(self, path):
-        """選択直後: プレビュー用キャプチャを開き、情報表示と範囲 UI を初期化。"""
-        self._vplay_timer.stop()
-        self._vplay_resume.stop()
+        """選択直後: プレビュー用キャプチャを開き、情報表示と範囲 UI を初期化。
+
+        重い処理は先頭 1 フレームのデコードのみ。以後は赤ラインの
+        スクラブでだけフレームを読む (常時再生はしない)。
+        """
+        self._scrub_timer.stop()
+        self._scrub_pending = None
+        self._vid_frame_cache = None
         if self._vid_cap is not None:
             try:
                 self._vid_cap.release()
@@ -3091,20 +3102,21 @@ class IMGTransApp(QWidget):
         self._update_range_span()
         for wgt in (self.video_preview, self.video_dim_label, self.range_frame):
             wgt.setVisible(True)
-        self._update_video_preview()
-        # 使用範囲のループ再生を開始 (以後は常時再生しっぱなし)
-        self._vplay_start()
+        self._read_video_frame(0)
+        self._present_video_frame()
 
-    def _render_video_frame(self, idx):
-        """フレーム idx を読み、回転を即時適用して表示する。
+    def _read_video_frame(self, idx):
+        """フレーム idx をデコードしてキャッシュする (重い処理はここだけ)。
 
-        連続再生を軽くするため、前回位置からの前進なら seek せず grab で
-        読み飛ばす (cv2 のフレームシークはランダムアクセスだと重い)。
+        前回位置からの前進なら seek せず grab で読み飛ばす
+        (cv2 のフレームシークはランダムアクセスだと重い)。
         """
         if self._vid_cap is None or self._vid_info is None:
             return
-        w, h, fps, n, dur = self._vid_info
+        n = self._vid_info[3]
         idx = min(max(0, int(idx)), n - 1)
+        if self._vid_frame_cache is not None and self._vid_frame_cache[0] == idx:
+            return
         gap = idx - self._vid_pos
         if gap < 0 or gap > 12:
             self._vid_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -3113,87 +3125,106 @@ class IMGTransApp(QWidget):
                 self._vid_cap.grab()
         ret, frame = self._vid_cap.read()
         self._vid_pos = idx + 1
-        if not ret or frame is None:
+        if ret and frame is not None:
+            # 表示サイズ基準で先に縮小してからキャッシュする (4K をフル解像度
+            # のまま持ち回ると回転/オーバーレイの再描画まで重くなるため)。
+            fh, fw = frame.shape[:2]
+            limit = 1024.0
+            scale = min(limit / max(1, fw), limit / max(1, fh), 1.0)
+            if scale < 1.0:
+                frame = cv2.resize(frame, (max(2, int(fw * scale)),
+                                           max(2, int(fh * scale))),
+                                   interpolation=cv2.INTER_AREA)
+            self._vid_frame_cache = (idx, frame)
+
+    def _present_video_frame(self):
+        """キャッシュ済みフレームに回転/縮小/スリットガイドを適用して表示する。
+
+        デコードは行わないため、回転コンボやスリット方向の切替は
+        4K 素材でも即座に反映される。
+        """
+        if self._vid_frame_cache is None or self._vid_info is None:
             return
+        idx, frame = self._vid_frame_cache
+        fps = self._vid_info[2]
+        n = self._vid_info[3]
         frame = apply_rotation_cv2(frame, self.vrot_combo.currentData())
+        tw = max(1, self.video_preview.width() - 2)
+        th = max(1, self.video_preview.height() - 2)
+        fh, fw = frame.shape[:2]
+        scale = min(tw / max(1, fw), th / max(1, fh), 1.0)
+        if scale < 1.0:
+            frame = cv2.resize(frame, (max(2, int(fw * scale)),
+                                       max(2, int(fh * scale))),
+                               interpolation=cv2.INTER_AREA)
         rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
                       rgb.shape[1] * 3, QImage.Format_RGB888).copy()
-        pm = QPixmap.fromImage(qimg).scaled(
-            max(1, self.video_preview.width() - 2),
-            max(1, self.video_preview.height() - 2),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm = QPixmap.fromImage(qimg)
+        self._draw_slit_overlay(pm)
         self.video_preview.setPixmap(pm)
         t = idx / max(1e-6, fps)
         self.video_preview.setToolTip(f"frame {idx} / {n}  ({t:.2f}s)")
 
+    def _draw_slit_overlay(self, pm):
+        """入力映像プレビューにスリット方向のガイドラインを重ねる。
+
+        2D/3D プロットと同じ 緑→赤 のグラデーションで、スキャン軸に沿って
+        並ぶスリット群を可視化する:
+          縦スリット (sd=1): 縦ラインが左(緑)→右(赤) に並ぶ
+          横スリット (sd=0): 横ラインが上(緑)→下(赤) に並ぶ
+        """
+        N = 12                                   # ガイドライン本数
+        w_px, h_px = pm.width(), pm.height()
+        if w_px < 8 or h_px < 8:
+            return
+        vertical = (self._current_sd() == 1)
+        p = QPainter(pm)
+        for i in range(N):
+            f = i / (N - 1)
+            color = QColor(int(255 * f), int(255 * (1.0 - f)), 0, 170)
+            pen = QPen(color)
+            pen.setWidth(1)
+            p.setPen(pen)
+            if vertical:
+                x = int(f * (w_px - 1))
+                p.drawLine(x, 0, x, h_px)
+            else:
+                y = int(f * (h_px - 1))
+                p.drawLine(0, y, w_px, y)
+        p.end()
+
     def _update_video_preview(self, *_):
-        """再生ライン位置のフレームを表示する (回転変更などの再描画用)。"""
+        """回転/スリット切替などの見た目変更: キャッシュから再描画のみ。"""
         if self._vid_info is None:
             return
-        n = self._vid_info[3]
-        self._render_video_frame(self.range_slider.values()[2] * max(0, n - 1))
+        if self._vid_frame_cache is None:
+            self._read_video_frame(
+                self.range_slider.values()[2] * max(0, self._vid_info[3] - 1))
+        self._present_video_frame()
 
-    # --- 常時ループ再生 ---
-    def _vplay_bounds(self):
-        """再生ループの範囲 (start_f, end_f)。緑バンド優先、無ければ青選択。"""
-        if self._vid_info is None:
-            return (0, 1)
-        n = self._vid_info[3]
-        used = self.range_slider.used_range()
-        if used is not None:
-            s, e = used
-        else:
-            s, e, _ = self.range_slider.values()
-        s_f = max(0, int(round(s * (n - 1))))
-        e_f = min(n - 1, int(round(e * (n - 1))))
-        return (s_f, max(s_f + 1, e_f))
-
-    def _vplay_start(self, from_frame=None):
-        """アンカーを合わせてループ再生を開始/再開する。"""
-        if self._vid_cap is None or self._vid_info is None:
+    # --- スクラブ (赤ラインのドラッグでのみフレームを読む) ---
+    def _scrub_flush(self):
+        """間引きタイマー経由で最新のスクラブ位置をデコード・表示する。"""
+        idx = self._scrub_pending
+        if idx is None:
             return
-        s_f, e_f = self._vplay_bounds()
-        if from_frame is None:
-            from_frame = s_f
-        self._vplay_anchor = min(max(s_f, float(from_frame)), e_f)
-        self._vplay_t0 = time.time()
-        self._vplay_paused = False
-        if not self._vplay_timer.isActive():
-            self._vplay_timer.start()
-
-    def _vplay_tick(self):
-        """実時間で使用範囲をループ再生し、赤ラインと readout を追従させる。"""
-        if (self._vplay_paused or self._vid_cap is None
-                or self._vid_info is None or self._vplay_t0 is None):
-            return
-        if not self.video_preview.isVisible():
-            return                       # 別タブ表示中は描画を省く
-        fps = self._vid_info[2]
-        n = self._vid_info[3]
-        s_f, e_f = self._vplay_bounds()
-        span = max(1, e_f - s_f)
-        elapsed = time.time() - self._vplay_t0
-        idx = s_f + (self._vplay_anchor - s_f + elapsed * fps) % span
-        self._render_video_frame(idx)
-        self.range_slider.set_playhead(idx / max(1, n - 1))   # 赤ライン追従
-        self._update_range_span()
-
-    def _vplay_resume_now(self):
-        """スクラブ後の自動再開 (現在の再生ラインの位置から続きを再生)。"""
-        if self._vid_info is None:
-            return
-        n = self._vid_info[3]
-        self._vplay_start(from_frame=self.range_slider.values()[2] * (n - 1))
+        self._scrub_pending = None
+        self._read_video_frame(idx)
+        self._present_video_frame()
 
     def _on_playhead_dragged(self, frac):
-        """赤ラインのドラッグ: 再生を一時停止してスクラブ表示 →
-        しばらく操作が無ければその位置から自動で再生再開する。"""
-        self._vplay_paused = True
-        self._vplay_resume.start()       # 連続ドラッグ中はタイマーが巻き戻る
+        """赤ラインのドラッグ: その位置のフレームを表示する。
+
+        連続ドラッグ中は 120ms 間隔に間引いてデコードする
+        (4K 素材のシークで UI が詰まらないように)。
+        """
         if self._vid_info is not None:
             n = self._vid_info[3]
-            self._render_video_frame(frac * max(0, n - 1))
+            self._scrub_pending = int(frac * max(0, n - 1))
+            if not self._scrub_timer.isActive():
+                self._scrub_flush()
+                self._scrub_timer.start()
         self._update_range_span()
 
     def _selected_trim(self):
@@ -4027,15 +4058,16 @@ class IMGTransApp(QWidget):
         mode = self._live3d_prereq_mode()
         if mode is None:
             self.live3d_status.setText("")
-            if self._live3d_movie is None:
-                self.live3d_label.setText(tr("live3d_waiting"))
             return
         self._live3d_busy = True
+        # 重い matplotlib 生成中は常時更新系 (GPU 再生 / 同期ティック) を
+        # 一時停止して CPU を空ける → 生成が速く終わり UI も軽い
+        self._throttle_live_updates(True)
         self.live3d_status.setText(tr("live3d_updating"))
         # 2D プロットの図サイズをライブ表示領域のアスペクト比に合わせる
-        # (3D はネイティブ比率のまま — mplot3d の描画枠は歪ませない)
         pw, ph = self._plot_inches_for(self.live2d_thumb)
         self._live2d_last_aspect = (pw / ph) if (pw and ph) else None
+        # ライブ更新は 2D プロットのみ (3D+GIF は別ウィンドウのオンデマンド)
         self._live3d_worker = ManeuverPreviewWorker(
             self.dm, mode,
             self.space_img_path, self.time_img_path, self.rate_img_path,
@@ -4044,18 +4076,31 @@ class IMGTransApp(QWidget):
             self.rate_maxdev_spin.value(),
             self.rate_baseline_spin.value(),
             self.rate_startpoint_spin.value(),
-            anim_frames=10, anim_fps=8, anim_dpi=55,
-            skip_2d=False,   # 2D プロットもライブ表示する (タブ2へ完全移行)
+            skip_3d=True,
             plot_w_inc=pw, plot_h_inc=ph,
-            gif_width=min(720, max(320, self.live3d_label.width())),
             use_range=self._effective_range(),
             sync_anchor=self._sync_anchor01(),
         )
         self._live3d_worker.done_signal.connect(self._on_live3d_done)
         self._live3d_worker.start()
 
+    def _throttle_live_updates(self, on):
+        """重いプロット生成中の常時更新系の一時停止/再開。"""
+        rt = getattr(self, "rt_preview", None)
+        if on:
+            self._rt_was_playing = bool(rt and rt._timer.isActive())
+            if rt:
+                rt.stop()
+            self._plot_sync_timer.stop()
+        else:
+            if rt and getattr(self, "_rt_was_playing", False):
+                rt.start()
+            if not self._plot_sync_timer.isActive():
+                self._plot_sync_timer.start()
+
     def _on_live3d_done(self, success, plot2d, gif):
         self._live3d_busy = False
+        self._throttle_live_updates(False)   # 常時更新系を再開
         # 軌道データが実際に参照している入力時間範囲を緑バンドで表示
         if success:
             self._show_used_range_from_data()
@@ -4066,89 +4111,71 @@ class IMGTransApp(QWidget):
             frac = getattr(self.dm, "plot2d_time_axis_frac", None)
             if frac:
                 self.live2d_thumb.set_playhead_range(*frac)
-        if success and gif and os.path.exists(gif):
-            if self._live3d_movie is not None:
-                try:
-                    self._live3d_movie.stop()
-                except Exception:
-                    pass
-                self.live3d_label.setMovie(None)
-            # スケール寸法の決定 (ラベル枠内・アスペクト比保持)
-            native = QImageReader(gif).size()
-            box = self.live3d_label.size()
-            if native.width() > 0 and native.height() > 0:
-                scale = min(box.width() / native.width(),
-                            box.height() / native.height())
-                scaled = QSize(max(1, int(native.width() * scale)),
-                               max(1, int(native.height() * scale)))
-            else:
-                scaled = box
-            # 同期表示用に全フレームを先読み (QMovie の jumpToFrame は GIF で
-            # 任意フレームへ飛べないため、setPixmap による直接表示で同期する)
-            frames = []
-            reader = QImageReader(gif)
-            while True:
-                img = reader.read()
-                if img.isNull():
-                    break
-                frames.append(QPixmap.fromImage(img).scaled(
-                    scaled, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                if not reader.supportsAnimation() or len(frames) > 400:
-                    break
-            self._live3d_frames = frames
-            self._last_sync_frac = -1.0     # 新 GIF で強制再同期
-
-            movie = QMovie(gif)
-            movie.setCacheMode(QMovie.CacheNone)
-            if movie.isValid():
-                movie.setScaledSize(scaled)
-                self._live3d_movie = movie
-                rt = getattr(self, "rt_preview", None)
-                if rt is not None and rt._F and frames:
-                    # 同期モード: GIF は自走させず、次の sync tick が
-                    # 再生位置に対応するフレームを setPixmap する
-                    pass
-                else:
-                    # 自走モード (RT 未構築): 従来どおり QMovie 再生
-                    self.live3d_label.setMovie(movie)
-                    movie.frameChanged.connect(self._on_live3d_frame)
-                    movie.start()
-            self.live3d_status.setText("")
-        else:
-            self.live3d_status.setText("")
+        self.live3d_status.setText("")
         # 実行中に編集が入っていたら追いかけ再生成
         if self._live3d_pending:
             self._live3d_pending = False
             self._schedule_live3d()
 
-    def _on_live3d_frame(self, frame_idx):
-        """[RT未構築時のみ] GIF 自走に合わせて赤ラインを動かすフォールバック。
+    # --- 3D プロット (別ウィンドウ・オンデマンド生成) ---
+    def _open_3d_plot_window(self):
+        """3D プロット+GIF をその場で生成し、別ウィンドウで再生する。"""
+        mode = self._can_preview_mode()
+        if mode is None or self._live3d_busy:
+            return
+        self.plot3d_btn.setEnabled(False)
+        self.live3d_status.setText(tr("plot3d_generating"))
+        self._throttle_live_updates(True)
+        self._plot3d_worker = ManeuverPreviewWorker(
+            self.dm, mode,
+            self.space_img_path, self.time_img_path, self.rate_img_path,
+            self.space_set_value.value(),
+            self.time_vmin_spin.value(), self.time_vmax_spin.value(),
+            self.rate_maxdev_spin.value(),
+            self.rate_baseline_spin.value(),
+            self.rate_startpoint_spin.value(),
+            anim_frames=20, anim_fps=10, anim_dpi=80,
+            skip_2d=True, gif_width=640,
+            use_range=self._effective_range(),
+            sync_anchor=self._sync_anchor01(),
+        )
+        self._plot3d_worker.done_signal.connect(self._on_plot3d_window_done)
+        self._plot3d_worker.start()
 
-        GPU リアルタイムプレビューのボリューム構築後は、再生位置を
-        マスタークロックとする _sync_plots_tick が権限を持つ (GIF は
-        jumpToFrame で従属させるため、ここでは何もしない)。
-        """
-        rt = getattr(self, "rt_preview", None)
-        if rt is not None and rt._F:
+    def _on_plot3d_window_done(self, success, _plot2d, gif):
+        self._throttle_live_updates(False)
+        self.plot3d_btn.setEnabled(True)
+        self.live3d_status.setText("")
+        if not (success and gif and os.path.exists(gif)):
+            self.log("[3dplot] 生成に失敗しました (ログ参照)")
             return
-        movie = self._live3d_movie
-        if movie is None:
-            return
-        n = max(1, movie.frameCount())
-        frac = (frame_idx + 0.5) / n
-        for th in getattr(self, "_map_thumbs", {}).values():
-            th.set_playhead(frac)
-        # 2D プロットにも赤ラインを左→右へスライド表示
-        self.live2d_thumb.set_playhead(frac)
+        # 別ウィンドウで GIF を自走再生 (ウィンドウは使い回す)
+        if getattr(self, "_plot3d_win", None) is None:
+            self._plot3d_win = QLabel()
+            self._plot3d_win.setWindowTitle("3D Plot")
+            self._plot3d_win.setAlignment(Qt.AlignCenter)
+            self._plot3d_win.setStyleSheet("background: #ffffff;")
+            self._plot3d_win.setMinimumSize(480, 360)
+        if self._live3d_movie is not None:
+            try:
+                self._live3d_movie.stop()
+            except Exception:
+                pass
+        movie = QMovie(gif)
+        movie.setCacheMode(QMovie.CacheNone)
+        if movie.isValid():
+            self._live3d_movie = movie
+            self._plot3d_win.setMovie(movie)
+            native = QImageReader(gif).size()
+            if native.width() > 0:
+                self._plot3d_win.resize(native.width(), native.height())
+            movie.start()
+        self._plot3d_win.show()
+        self._plot3d_win.raise_()
 
     def _sync_plots_tick(self):
-        """GPU 映像の再生位置をマスタークロックとして、2D/3D プロットと
-        グレー画像の赤ラインを同期させる (映像のゆっくりした時間進行に追従)。
-
-        - 赤ライン (2D プロット + Space/Time/Rate サムネイル): 再生位置の割合で移動
-        - 3D GIF: 一時停止して再生位置に対応するフレームへ jumpToFrame
-          (速度変更・スクラブ・一時停止もすべて追従する)
-        """
+        """GPU 映像の再生位置をマスタークロックとして、2D プロットと
+        グレー画像の赤ラインを同期させる (映像のゆっくりした時間進行に追従)。"""
         rt = getattr(self, "rt_preview", None)
         if rt is None or not rt._F or not getattr(self, "live3d_group", None):
             return
@@ -4159,15 +4186,6 @@ class IMGTransApp(QWidget):
         for th in getattr(self, "_map_thumbs", {}).values():
             th.set_playhead(frac)
         self.live2d_thumb.set_playhead(frac)
-        # 3D GIF: 自走 QMovie を止め、先読みフレームを直接表示して同期
-        frames = getattr(self, "_live3d_frames", None)
-        if frames:
-            if self._live3d_movie is not None and \
-                    self._live3d_movie.state() != QMovie.NotRunning:
-                self._live3d_movie.stop()
-                self.live3d_label.setMovie(None)
-            target = int(round(frac * (len(frames) - 1)))
-            self.live3d_label.setPixmap(frames[target])
 
     def generate_sample_image_action(self, type_name):
         """セクション {type_name} のジェネレータ設定でサンプル画像を生成 → 自動セット"""
@@ -4384,30 +4402,6 @@ class IMGTransApp(QWidget):
         else:
             self.slit_label.setText(tr("slit_h"))
 
-    def _move_live3d(self, to_preview):
-        """軌道プロットライブビュー (live3d_group) をタブ間で移動する。
-
-        タブ1 (入力・画像) では設定の右 3/4 に、統合タブ (プレビュー・出力)
-        では映像ビューの下に「そのまま」併置する (ウィジェットは単一)。
-        """
-        g = getattr(self, "live3d_group", None)
-        if g is None:
-            return
-        if to_preview:
-            self._t2_top_row.removeWidget(g)
-            self._live3d_slot.addWidget(g)
-            g.setVisible(self.dm is not None and
-                         not self.video_only_chk.isChecked())
-        else:
-            self._live3d_slot.removeWidget(g)
-            self._t2_top_row.insertWidget(1, g, 3)
-            g.setVisible(self.dm is not None)
-
-    def _on_video_only_toggled(self, checked):
-        """「映像ビューのみ表示」: 統合タブで軌道プロットを隠し映像を最大化。"""
-        if self.tabs.currentIndex() == 1:
-            self.live3d_group.setVisible(self.dm is not None and not checked)
-
     def _show_gpu_view(self, *_):
         """レンダリング結果表示から GPU リアルタイムプレビューへ戻す。"""
         if getattr(self, "rendered_preview", None):
@@ -4415,24 +4409,6 @@ class IMGTransApp(QWidget):
             self.rendered_preview.setVisible(False)
         if getattr(self, "rt_group", None):
             self.rt_group.setVisible(True)
-
-    def _on_tab_changed(self, idx):
-        """統合タブ (index 1) 表示中だけ RT 再生 + ログ表示。
-        軌道プロットライブビューはタブに合わせて移動する。"""
-        if getattr(self, "log_box", None):
-            self.log_box.setVisible(idx == 1)
-        self._move_live3d(idx == 1)
-        # タブ間で 2D プロット領域の形が変わるため、必要ならアスペクト再調整
-        if getattr(self, "_resize_timer", None):
-            self._resize_timer.start()
-        rt = getattr(self, "rt_preview", None)
-        if not rt:
-            return
-        if idx == 1 and (not getattr(self, "rt_group", None)
-                         or self.rt_group.isVisible()):
-            rt.start()
-        else:
-            rt.stop()
 
     def _audio_export_settings(self):
         """書き出しに使う音声設定 = GPU プレビューの音声設定そのもの。"""
@@ -4446,8 +4422,15 @@ class IMGTransApp(QWidget):
             return
         a = self._audio_export_settings()
         if a["enabled"]:
-            self.audio_out_info.setText(
-                tr("audio_out_on", m=a["mode"], v=a["voices"]))
+            txt = tr("audio_out_on", m=a["mode"], v=a["voices"])
+            fx = [lbl for key, lbl in (("depth_reverb", "Rev"),
+                                       ("depth_lpf", "LPF"),
+                                       ("depth_width", "Wid"),
+                                       ("depth_detune", "Det"))
+                  if a.get(key)]
+            if fx:
+                txt += "  +" + "+".join(fx)
+            self.audio_out_info.setText(txt)
         else:
             self.audio_out_info.setText(tr("audio_out_off"))
 
@@ -4493,6 +4476,10 @@ class IMGTransApp(QWidget):
             rate_maxdev=maxdev, rate_baseline=baseline, rate_startpoint=startpoint,
             audio_out=aset["enabled"], audio_mode=aset["mode"],
             audio_voices=aset["voices"], audio_grain_ms=aset["grain_ms"],
+            audio_gain=aset.get("volume", 1.0),
+            audio_fx={k: aset.get(k, False)
+                      for k in ("depth_reverb", "depth_lpf",
+                                "depth_width", "depth_detune")},
             use_range=self._effective_range(),
             sync_anchor=self._sync_anchor01(),
         )
