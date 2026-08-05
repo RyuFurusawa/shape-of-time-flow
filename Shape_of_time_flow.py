@@ -24,11 +24,11 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QFileDialog,
     QComboBox, QTextEdit, QCheckBox, QMessageBox, QSpinBox, QHBoxLayout,
     QFrame, QDoubleSpinBox, QGroupBox, QTabWidget, QScrollArea, QSplitter,
-    QProgressBar, QSizePolicy, QSlider
+    QProgressBar, QSizePolicy, QSlider, QDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QUrl, QTimer
 from PyQt5.QtGui import (QImage, QPixmap, QMovie, QImageReader,
-                         QPainter, QPen, QColor)
+                         QPainter, QPen, QColor, QRadialGradient)
 
 # 動画の内蔵再生 (QtMultimedia) は環境により無い場合があるため防御的に import
 try:
@@ -147,6 +147,35 @@ TR = {
                         "en": "(no image → treated as 50% gray)"},
     "wave_dir_v": {"ja": "上下方向 (vertical)", "en": "Vertical"},
     "wave_dir_h": {"ja": "左右方向 (horizontal)", "en": "Horizontal"},
+    # ペイント / 深度推定
+    "paint_title": {"ja": "マップをペイント", "en": "Paint map"},
+    "paint_value": {"ja": "明度:", "en": "Value:"},
+    "paint_size": {"ja": "サイズ:", "en": "Size:"},
+    "btn_paint": {"ja": "描く…", "en": "Paint…"},
+    "paint_status_none": {"ja": "(未描画 → 50%グレー扱い)",
+                           "en": "(not painted → 50% gray)"},
+    "paint_status_done": {"ja": "描画済み (再度押すと続きから編集)",
+                           "en": "painted (press again to edit)"},
+    "depth_need_ort": {
+        "ja": "深度推定には onnxruntime が必要です。\n\n"
+              "ターミナルで以下を実行してからアプリを再起動してください:\n"
+              "    pip install onnxruntime",
+        "en": "Depth estimation requires onnxruntime.\n\n"
+              "Run this and restart the app:\n    pip install onnxruntime"},
+    "depth_need_model": {
+        "ja": "深度推定モデル (MiDaS small, 約66MB) を初回ダウンロードします。\n"
+              "続行しますか?",
+        "en": "The depth model (MiDaS small, ~66MB) will be downloaded once.\n"
+              "Continue?"},
+    "depth_downloading": {"ja": "深度モデルをダウンロード中…",
+                           "en": "Downloading depth model…"},
+    "depth_failed": {"ja": "深度推定に失敗しました", "en": "Depth estimation failed"},
+    "depth_done": {"ja": "深度マップ計算済み: {f}", "en": "depth ready: {f}"},
+    "lbl_depth_frame": {"ja": "基準フレーム:", "en": "Ref frame:"},
+    "btn_depth_photo": {"ja": "写真…", "en": "Photo…"},
+    "depth_calc": {"ja": "深度計算中…", "en": "estimating depth…"},
+    "depth_no_video": {"ja": "(映像が未選択です)", "en": "(no video selected)"},
+    "lbl_map_blur": {"ja": "仕上げブラー:", "en": "Final blur:"},
     "preview_after_init": {"ja": "(Initialize 後に表示)", "en": "(shown after Initialize)"},
     "btn_generate_apply": {"ja": "▶ 生成して {t} に適用 / Generate & Apply",
                             "en": "▶ Generate & Apply to {t}"},
@@ -272,13 +301,20 @@ TR = {
     "hint_colormap": {"ja": "(表示のみ。書き出す PNG はグレースケールのまま)",
                        "en": "(display only — exported PNGs stay grayscale)"},
     # --- 適用画像の後処理 ---
-    "grp_postproc": {"ja": "適用画像の後処理 (破壊的)",
-                      "en": "Post-process applied image (destructive)"},
+    "grp_postproc": {"ja": "回転 (破壊的・適用画像へ書き込み)",
+                      "en": "Rotate (destructive, writes to image)"},
     "btn_pp_invert": {"ja": "⚡ 階調反転 (元に戻せません)",
                        "en": "⚡ Invert tones (no undo)"},
     "lbl_pp_midgray": {"ja": "基準グレー:", "en": "Mid-gray:"},
     "hint_pp_midgray": {"ja": "(ヒストグラム中間値をずらす / 0.50 = 変更なし)",
                          "en": "(shifts the histogram midpoint / 0.50 = no change)"},
+    "lbl_pp_blur": {"ja": "ブラー:", "en": "Blur:"},
+    "adj_invert": {"ja": "反転", "en": "Inv"},
+    "tip_adj_mid": {"ja": "基準グレー (ヒストグラム中間値。0.50 = 変更なし)",
+                     "en": "Mid-gray (histogram midpoint; 0.50 = neutral)"},
+    "tip_adj_blur": {"ja": "ブラー (ガウシアン。0 = なし)",
+                      "en": "Blur (Gaussian; 0 = off)"},
+    "pp_op_blur": {"ja": "・ブラー: {v:.1f} px", "en": "・Blur: {v:.1f} px"},
     "lbl_pp_rotate": {"ja": "回転:", "en": "Rotate:"},
     "hint_pp_rotate": {"ja": "(正=反時計回り。縦横サイズは維持したまま再マッピング)",
                         "en": "(+ = counter-clockwise; remapped, original pixel size kept)"},
@@ -302,8 +338,8 @@ TR = {
               "This cannot be undone.\n\nContinue?"},
     "pp_op_midgray": {"ja": "・基準グレー: 0.50 → {v:.2f}", "en": "・Mid-gray: 0.50 → {v:.2f}"},
     "pp_op_rotate": {"ja": "・回転: {v:.1f}°", "en": "・Rotate: {v:.1f}°"},
-    "pp_nothing": {"ja": "後処理の変更がありません (基準グレー 0.50 / 回転 0°)。",
-                    "en": "Nothing to apply (mid-gray 0.50 / rotation 0°)."},
+    "pp_nothing": {"ja": "後処理の変更がありません (回転 0°)。",
+                    "en": "Nothing to apply (rotation 0°)."},
 }
 
 
@@ -441,10 +477,25 @@ def pp_rotate(img16, deg):
                           borderMode=cv2.BORDER_REPLICATE)
 
 
-def pp_apply_pending(img16, midgray=0.5, rotate=0.0):
-    """未適用の後処理 (基準グレー → 回転) をまとめて適用する。"""
-    out = pp_midgray(img16, midgray)
-    return pp_rotate(out, rotate)
+def pp_apply_pending(img16, rotate=0.0):
+    """未適用の破壊的後処理 (回転のみ) を適用する。"""
+    return pp_rotate(img16, rotate)
+
+
+def apply_map_adjust(img16, adj, scale=1.0):
+    """非破壊調整 (反転 → 基準グレー → ブラー) を合成結果へ適用する。
+
+    adj: {"invert": bool, "midgray": 0..1, "blur": px}
+    生成のたびにレイヤー合成結果へかけ直すので、いつでも調整し直せる。
+    scale はプレビュー縮小率 (ブラー半径の補正用)。
+    """
+    if adj.get("invert"):
+        img16 = pp_invert(img16)
+    img16 = pp_midgray(img16, adj.get("midgray", 0.5))
+    sigma = float(adj.get("blur", 0.0)) * scale
+    if sigma > 0.1:
+        img16 = cv2.GaussianBlur(img16, (0, 0), sigmaX=sigma)
+    return img16
 
 
 # ======== rate to data: 同期点 (スリット時刻が一致する出力位置) ========
@@ -803,11 +854,23 @@ def render_pattern(h_pix, w_pix, pattern_id, **wave_params):
 # ======== Layer compositing (パターンを何層でも重ねられる) ========
 
 # レイヤーで追加選択できるパターン (基本パターンに加えて)
-EXTRA_PATTERN_IDS = ["perlin", "image"]
+EXTRA_PATTERN_IDS = ["perlin", "image",
+                     "radial", "spiral", "ripple", "voronoi",
+                     "vluma", "vmotion", "vmotion_slit", "depth", "paint"]
 EXTRA_PATTERN_LABELS = {
-    "ja": ["パーリンノイズ", "画像ファイル…"],
-    "en": ["Perlin noise", "Image file…"],
+    "ja": ["パーリンノイズ", "画像ファイル…",
+           "放射状", "渦巻き", "干渉波", "ボロノイ",
+           "映像: 輝度マップ", "映像: モーションマップ",
+           "映像: モーション (スリット×時間)",
+           "深度推定 (映像フレーム/写真)…", "ペイント…"],
+    "en": ["Perlin noise", "Image file…",
+           "Radial", "Spiral", "Interference", "Voronoi",
+           "Video: luminance", "Video: motion",
+           "Video: motion (slit × time)",
+           "Depth estimation (frame/photo)…", "Paint…"],
 }
+# image_arr (計算済み 0..1 配列) をそのまま使うパターン
+ARRAY_PATTERN_IDS = ("vluma", "vmotion", "vmotion_slit", "depth", "paint")
 
 BLEND_IDS = ["normal", "add", "subtract", "multiply", "screen", "difference"]
 BLEND_LABELS = {
@@ -893,6 +956,61 @@ def render_layer(h, w, p, scale=1.0):
     if pid == "perlin":
         return perlin2d(h, w, max(2.0, p.get("cell", 64) * scale),
                         octaves=p.get("octaves", 3), seed=p.get("pseed", 0))
+    if pid in ("radial", "spiral", "ripple"):
+        period = max(2.0, p.get("period", 120) * scale)
+        amp = float(p.get("amp", 1.0))
+        ph = float(p.get("phase", 0.0)) / 360.0
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+        if pid == "radial":
+            # 中心からの距離のランプ (period ごとに繰り返し。period を
+            # 画面より大きくすると中心→隅への単一グラデーション)
+            r = np.hypot(xx - cx, yy - cy)
+            v = (r / period + ph) % 1.0
+        elif pid == "spiral":
+            # アルキメデス渦巻き: 半径 + 角度のランプ (angle で回転)
+            rot = np.deg2rad(float(p.get("angle", 0.0)))
+            r = np.hypot(xx - cx, yy - cy)
+            th = np.arctan2(yy - cy, xx - cx) + rot
+            v = (r / period + th / (2.0 * np.pi) + ph) % 1.0
+        else:
+            # 干渉波: シードで決まる複数波源からの同心円波の重ね合わせ
+            rng = np.random.default_rng(int(p.get("nseed", 0)))
+            K = 3
+            v = np.zeros((h, w), np.float32)
+            for _ in range(K):
+                sx = rng.uniform(0, w - 1)
+                sy = rng.uniform(0, h - 1)
+                r = np.hypot(xx - sx, yy - sy)
+                v += 0.5 + 0.5 * np.sin(2.0 * np.pi * (r / period - ph))
+            v /= K
+        v = 0.5 + (v - 0.5) * amp        # 振幅 = 中間グレー基準のコントラスト
+        return np.clip(v.astype(np.float32), 0.0, 1.0)
+    if pid == "voronoi":
+        # セルラーノイズ (F1): 最寄りのシード点までの距離
+        from scipy.spatial import cKDTree
+        cell = max(4.0, p.get("cell", 64) * scale)
+        rng = np.random.default_rng(int(p.get("pseed", 0)))
+        gh = max(1, int(np.ceil(h / cell)))
+        gw = max(1, int(np.ceil(w / cell)))
+        pts = np.stack([
+            (np.arange(gh * gw) // gw + rng.random(gh * gw)) * cell,
+            (np.arange(gh * gw) % gw + rng.random(gh * gw)) * cell,
+        ], axis=1)
+        yy, xx = np.mgrid[0:h, 0:w]
+        d, _ = cKDTree(pts).query(
+            np.stack([yy.ravel(), xx.ravel()], axis=1), k=1)
+        v = d.reshape(h, w).astype(np.float32) / (cell * 0.75)
+        return np.clip(v, 0.0, 1.0)
+    if pid in ARRAY_PATTERN_IDS:
+        # 計算済み配列 (映像由来 / 深度推定 / ペイント)。未計算はグレー。
+        arr = p.get("image_arr")
+        if arr is not None:
+            m = cv2.resize(arr.astype(np.float32), (w, h),
+                           interpolation=cv2.INTER_AREA
+                           if arr.shape[0] > h else cv2.INTER_LINEAR)
+            return np.clip(m, 0.0, 1.0)
+        return np.full((h, w), 0.5, np.float32)
     if pid == "image":
         path = p.get("image_path")
         if path and os.path.exists(path):
@@ -1014,6 +1132,301 @@ def generate_sample_image(out_dir, image_type, pattern_id,
     return out_path
 
 
+# ======== 映像由来マップ (輝度 / モーション) ========
+def _stream_gray_frames(video_path, n_frames, max_w=512):
+    """時間等間隔に n_frames 枚のグレースケール小フレームを順に yield する。
+
+    ffmpeg (VideoToolbox HW デコード + fps 間引き + 縮小をデコーダ側で実施)
+    を使うため、4K 素材でも全フレームを Python 側でデコードしない。
+    ffmpeg が無い場合は cv2 シークにフォールバックする。
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
+    cap.release()
+    if w < 2 or n < 2:
+        return
+    n_frames = max(2, min(int(n_frames), n))
+    scale = min(1.0, max_w / max(w, h))
+    sw, sh = max(2, int(w * scale)), max(2, int(h * scale))
+
+    if shutil.which("ffmpeg"):
+        dur = n / fps
+        tfps = n_frames / max(1e-6, dur)
+        cmd = ["ffmpeg", "-v", "error", "-nostdin",
+               "-hwaccel", "videotoolbox",
+               "-i", video_path,
+               "-vf", f"fps={tfps:.6f},scale={sw}:{sh}:flags=area",
+               "-frames:v", str(n_frames),
+               "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    bufsize=10 ** 7)
+            frame_bytes = sw * sh
+            got = 0
+            while got < n_frames:
+                buf = proc.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                got += 1
+                yield np.frombuffer(buf, np.uint8).reshape(sh, sw) \
+                        .astype(np.float32)
+            proc.stdout.close()
+            proc.wait()
+            if got >= 2:
+                return
+        except Exception:
+            pass
+
+    # フォールバック: cv2 シーク (低速だが動く)
+    cap = cv2.VideoCapture(video_path)
+    idxs = np.unique(np.linspace(0, n - 1, n_frames).astype(int))
+    for idx in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, fr = cap.read()
+        if not ret or fr is None:
+            continue
+        g = cv2.cvtColor(cv2.resize(fr, (sw, sh),
+                                    interpolation=cv2.INTER_AREA),
+                         cv2.COLOR_BGR2GRAY)
+        yield g.astype(np.float32)
+    cap.release()
+
+
+def derive_video_map(video_path, kind, samples=48, max_w=320, sd=1,
+                     time_size=None):
+    """入力映像から輝度/モーションのマップ (float32 0..1) を導出する。
+
+    kind="vluma"  : サンプルフレームの平均輝度 (フレーム座標系)
+    kind="vmotion": 隣接サンプル間の絶対差分の平均 (フレーム座標系)
+    kind="vmotion_slit":
+        スリット単位のモーションを「出力する時間 (時間方向サイズ)」に
+        合わせた枚数だけサンプリングして計算し、時間方向へ積み重ねる。
+        全画素の 2D 平均ではなく「スリット 1 本 = 1 値」の 1 次元配列を
+        フレームごとに作り、縦スリットなら下へ積んで面にする
+        (= スリットごとの動きの特性が時間軸に沿って記録された画像)。
+        戻り値はマップのファイル座標系 (sd=1: 時間×スキャン / sd=0: スキャン×時間)。
+    2〜98 パーセンタイルで正規化してコントラストを確保する。
+    デコードは ffmpeg (HW) 側で間引き+縮小するため 4K 素材でも軽い。
+    """
+    if kind == "vmotion_slit":
+        # 行数 = 出力の時間方向サイズ (+1: 差分で 1 枚減るぶん)
+        rows_target = int(time_size) if time_size else 900
+        rows_target = max(2, min(rows_target, 4096))
+        rows = []
+        prev = None
+        for g in _stream_gray_frames(video_path, rows_target + 1, max_w=512):
+            if prev is not None:
+                d = np.abs(g - prev)
+                # 縦スリット: 列平均 (スリット=縦ライン) / 横スリット: 行平均
+                rows.append(d.mean(axis=0) if int(sd) == 1 else d.mean(axis=1))
+            prev = g
+        if len(rows) < 2:
+            return None
+        M = np.stack(rows)                      # (時間, スキャン)
+        lo, hi = np.percentile(M, 2), np.percentile(M, 98)
+        if hi - lo < 1e-6:
+            return None
+        M = np.clip((M - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+        return M if int(sd) == 1 else np.ascontiguousarray(M.T)
+
+    acc = None
+    prev = None
+    count = 0
+    for g in _stream_gray_frames(video_path, samples, max_w=max_w):
+        if acc is None:
+            acc = np.zeros_like(g, np.float64)
+        if kind == "vmotion":
+            if prev is not None:
+                acc += np.abs(g - prev)
+                count += 1
+            prev = g
+        else:
+            acc += g
+            count += 1
+    if acc is None or count == 0:
+        return None
+    m = acc / count
+    lo, hi = np.percentile(m, 2), np.percentile(m, 98)
+    if hi - lo < 1e-6:
+        return np.full(m.shape, 0.5, np.float32)
+    return np.clip((m - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+# ======== 単眼深度推定 (MiDaS small / onnxruntime — 任意依存) ========
+_DEPTH_MODEL_URL = ("https://github.com/isl-org/MiDaS/releases/download/"
+                    "v2_1/model-small.onnx")
+_DEPTH_MODEL_PATH = os.path.join(
+    os.path.expanduser("~"), ".cache", "shape_of_time_flow", "midas_small.onnx")
+_depth_session = None
+
+
+def depth_available():
+    """onnxruntime が import できるか (深度推定の前提)。"""
+    try:
+        import onnxruntime  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def depth_model_ready():
+    return os.path.exists(_DEPTH_MODEL_PATH)
+
+
+def download_depth_model(progress_cb=None):
+    """MiDaS small ONNX (~66MB) をキャッシュへダウンロードする。"""
+    import urllib.request
+    os.makedirs(os.path.dirname(_DEPTH_MODEL_PATH), exist_ok=True)
+    tmp = _DEPTH_MODEL_PATH + ".part"
+
+    def hook(blocks, bs, total):
+        if progress_cb and total > 0:
+            progress_cb(min(100, int(blocks * bs * 100 / total)))
+
+    urllib.request.urlretrieve(_DEPTH_MODEL_URL, tmp, reporthook=hook)
+    os.replace(tmp, _DEPTH_MODEL_PATH)
+
+
+def estimate_depth(img_path):
+    """写真 1 枚から深度マップ (float32 0..1, 近い=白) を推定する。"""
+    img = cv2.imread(img_path)
+    if img is None:
+        return None
+    return estimate_depth_from_bgr(img)
+
+
+def estimate_depth_from_bgr(img):
+    """BGR フレームから深度マップ (float32 0..1, 近い=白) を推定する。
+
+    MiDaS small (ONNX)。onnxruntime かモデルが無ければ None。
+    """
+    global _depth_session
+    if not (depth_available() and depth_model_ready()):
+        return None
+    import onnxruntime as ort
+    if _depth_session is None:
+        _depth_session = ort.InferenceSession(
+            _DEPTH_MODEL_PATH, providers=["CPUExecutionProvider"])
+    h0, w0 = img.shape[:2]
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    x = cv2.resize(rgb, (256, 256), interpolation=cv2.INTER_AREA)
+    x = (x - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+    x = x.transpose(2, 0, 1)[None].astype(np.float32)
+    inp = _depth_session.get_inputs()[0].name
+    out = _depth_session.run(None, {inp: x})[0][0]
+    d = cv2.resize(out.astype(np.float32), (w0, h0),
+                   interpolation=cv2.INTER_CUBIC)
+    lo, hi = np.percentile(d, 2), np.percentile(d, 98)
+    if hi - lo < 1e-6:
+        return None
+    return np.clip((d - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+# ======== ペイントダイアログ (マップを直接描く) ========
+class PaintDialog(QDialog):
+    """グレースケールのマップをブラシで直接描く簡易ペイント。
+
+    - ソフトブラシ (QRadialGradient)。明度とサイズはスライダーで調整
+    - 塗りつぶし (黒 / グレー / 白)、クリア
+    - OK で float32 0..1 の配列を返す (レイヤーの image_arr になる)
+    """
+    CANVAS_LONG = 512      # 作業解像度の長辺
+
+    def __init__(self, parent, map_h, map_w, initial=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("paint_title"))
+        aspect = map_w / max(1, map_h)
+        if aspect >= 1.0:
+            cw, ch = self.CANVAS_LONG, max(32, int(self.CANVAS_LONG / aspect))
+        else:
+            cw, ch = max(32, int(self.CANVAS_LONG * aspect)), self.CANVAS_LONG
+        self._img = QImage(cw, ch, QImage.Format_Grayscale8)
+        if initial is not None:
+            arr8 = (np.clip(initial, 0, 1) * 255).astype(np.uint8)
+            arr8 = cv2.resize(arr8, (cw, ch), interpolation=cv2.INTER_LINEAR)
+            src = QImage(np.ascontiguousarray(arr8).data, cw, ch, cw,
+                         QImage.Format_Grayscale8).copy()
+            self._img = src
+        else:
+            self._img.fill(128)
+
+        v = QVBoxLayout(self)
+        self.canvas = QLabel()
+        self.canvas.setFixedSize(cw, ch)
+        self.canvas.setCursor(Qt.CrossCursor)
+        self.canvas.setStyleSheet("border: 1px solid #555;")
+        self.canvas.mousePressEvent = self._paint_at
+        self.canvas.mouseMoveEvent = self._paint_at
+        v.addWidget(self.canvas, 0, Qt.AlignCenter)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("paint_value")))
+        self.value_slider = QSlider(Qt.Horizontal)
+        self.value_slider.setRange(0, 255)
+        self.value_slider.setValue(255)
+        row.addWidget(self.value_slider, 1)
+        row.addWidget(QLabel(tr("paint_size")))
+        self.size_slider = QSlider(Qt.Horizontal)
+        self.size_slider.setRange(4, 160)
+        self.size_slider.setValue(48)
+        row.addWidget(self.size_slider, 1)
+        v.addLayout(row)
+
+        row2 = QHBoxLayout()
+        for label, val in (("● 0%", 0), ("● 50%", 128), ("● 100%", 255)):
+            b = QPushButton(label)
+            b.clicked.connect(lambda *_, vv=val: self._fill(vv))
+            row2.addWidget(b)
+        row2.addStretch()
+        ok = QPushButton("OK")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row2.addWidget(ok)
+        row2.addWidget(cancel)
+        v.addLayout(row2)
+        self._refresh()
+
+    def _fill(self, val):
+        self._img.fill(int(val))
+        self._refresh()
+
+    def _paint_at(self, ev):
+        r = self.size_slider.value() / 2.0
+        val = self.value_slider.value()
+        p = QPainter(self._img)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QRadialGradient(ev.pos(), r)
+        c = QColor(val, val, val)
+        g.setColorAt(0.0, c)
+        c2 = QColor(val, val, val)
+        c2.setAlpha(0)
+        g.setColorAt(1.0, c2)
+        p.setBrush(g)
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(ev.pos(), r, r)
+        p.end()
+        self._refresh()
+
+    def _refresh(self):
+        self.canvas.setPixmap(QPixmap.fromImage(self._img))
+
+    def result_array(self):
+        """描いた内容を float32 0..1 (h, w=キャンバス解像度) で返す。"""
+        img = self._img
+        w, h = img.width(), img.height()
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        arr = np.frombuffer(ptr, np.uint8).reshape(h, img.bytesPerLine())[:, :w]
+        return (arr.astype(np.float32) / 255.0).copy()
+
+
 # ======== Layer editor widget ========
 class LayerWidget(QFrame):
     """セクションジェネレータの 1 レイヤー分の編集 UI。
@@ -1097,7 +1510,7 @@ class LayerWidget(QFrame):
         self.wave_period_label = QLabel()
         wf.addWidget(self.wave_period_label)
         self.wave_period = QSpinBox()
-        self.wave_period.setRange(1, 32768); self.wave_period.setValue(120)
+        self.wave_period.setRange(1, 32768); self.wave_period.setValue(1000)
         wf.addWidget(self.wave_period)
         self.wave_phase_label = QLabel()
         wf.addWidget(self.wave_phase_label)
@@ -1109,7 +1522,7 @@ class LayerWidget(QFrame):
         wf.addWidget(self.wave_angle_label)
         self.wave_angle = QDoubleSpinBox()
         self.wave_angle.setRange(0.0, 360.0); self.wave_angle.setDecimals(1)
-        self.wave_angle.setSingleStep(5.0); self.wave_angle.setValue(0.0)
+        self.wave_angle.setSingleStep(5.0); self.wave_angle.setValue(30.0)
         wf.addWidget(self.wave_angle)
         wf.addStretch()
         v.addWidget(self.wave_frame)
@@ -1164,7 +1577,7 @@ class LayerWidget(QFrame):
         pf.addStretch()
         v.addWidget(self.perlin_frame)
 
-        # --- 画像ファイル ---
+        # --- 画像ファイル (image / depth 共用) ---
         self.image_frame = QFrame()
         imf = QHBoxLayout(self.image_frame)
         imf.setContentsMargins(0, 0, 0, 0)
@@ -1175,6 +1588,47 @@ class LayerWidget(QFrame):
         self.image_label.setStyleSheet("color: gray; font-size: 10px;")
         imf.addWidget(self.image_label, 1)
         v.addWidget(self.image_frame)
+
+        # --- ペイント ---
+        self._paint_arr = None
+        self._depth_arr = None
+        self.map_shape_cb = None      # () -> (h, w)。親アプリが設定する
+        self.paint_frame = QFrame()
+        pmf = QHBoxLayout(self.paint_frame)
+        pmf.setContentsMargins(0, 0, 0, 0)
+        self.paint_btn = QPushButton()
+        self.paint_btn.clicked.connect(self._open_paint)
+        pmf.addWidget(self.paint_btn)
+        self.paint_status = QLabel()
+        self.paint_status.setStyleSheet("color: gray; font-size: 10px;")
+        pmf.addWidget(self.paint_status, 1)
+        v.addWidget(self.paint_frame)
+
+        # --- 深度推定 (既定 = 入力映像の先頭フレーム。スライダーで基準変更) ---
+        self.video_frame_cb = None    # (frac) -> (BGRフレーム, idx, total) or None
+        self.depth_frame = QFrame()
+        dpf = QHBoxLayout(self.depth_frame)
+        dpf.setContentsMargins(0, 0, 0, 0)
+        self.depth_lbl = QLabel()
+        dpf.addWidget(self.depth_lbl)
+        self.depth_slider = QSlider(Qt.Horizontal)
+        self.depth_slider.setRange(0, 1000)   # 映像内の位置 (割合)
+        self.depth_slider.setValue(0)         # 既定 = 先頭フレーム
+        dpf.addWidget(self.depth_slider, 1)
+        self.depth_photo_btn = QPushButton()
+        dpf.addWidget(self.depth_photo_btn)
+        self.depth_status = QLabel()
+        self.depth_status.setStyleSheet("color: gray; font-size: 10px;")
+        dpf.addWidget(self.depth_status, 1)
+        v.addWidget(self.depth_frame)
+        # スライダー操作は 600ms デバウンスして推定し直す (CPU 推論のため)
+        self._depth_timer = QTimer(self)
+        self._depth_timer.setSingleShot(True)
+        self._depth_timer.setInterval(600)
+        self._depth_timer.timeout.connect(self._compute_depth_from_video)
+        self.depth_slider.valueChanged.connect(
+            lambda *_: self._depth_timer.start())
+        self.depth_photo_btn.clicked.connect(self._pick_depth_photo)
 
         # 初期テキスト/combo 構築
         self.retranslate()
@@ -1208,10 +1662,34 @@ class LayerWidget(QFrame):
 
     def _on_pattern(self, *_):
         pid = self.current_pattern_id()
-        self.wave_frame.setVisible(pid == "wave")
-        self.noise_frame.setVisible(pid == "random")
-        self.perlin_frame.setVisible(pid == "perlin")
+        # スケール spin の既定値をパターンごとに切替
+        # (パーリン=64px / ボロノイ=1000px。ユーザー変更済みなら触らない)
+        if pid == "voronoi" and self.cell_spin.value() == 64:
+            self.cell_spin.blockSignals(True)
+            self.cell_spin.setValue(1000)
+            self.cell_spin.blockSignals(False)
+        elif pid == "perlin" and self.cell_spin.value() == 1000:
+            self.cell_spin.blockSignals(True)
+            self.cell_spin.setValue(64)
+            self.cell_spin.blockSignals(False)
+        # 深度推定: 選択時に映像フレームから自動計算 (未計算なら)
+        if pid == "depth" and self._depth_arr is None:
+            self._depth_timer.start()
+        # 波系 (wave/放射状/渦巻き/干渉波) は振幅・周期・位相 (+角度) を共用
+        self.wave_frame.setVisible(pid in ("wave", "radial", "spiral", "ripple"))
+        # 干渉波は波源のシードにノイズ枠のシードを使う
+        self.noise_frame.setVisible(pid in ("random", "ripple"))
+        self.dot_label.setVisible(pid == "random")
+        self.dot_spin.setVisible(pid == "random")
+        self.blur_label.setVisible(pid == "random")
+        self.blur_spin.setVisible(pid == "random")
+        # ボロノイはスケール+シードにパーリン枠を共用 (オクターブは無効)
+        self.perlin_frame.setVisible(pid in ("perlin", "voronoi"))
+        self.oct_label.setVisible(pid == "perlin")
+        self.oct_spin.setVisible(pid == "perlin")
         self.image_frame.setVisible(pid == "image")
+        self.depth_frame.setVisible(pid == "depth")
+        self.paint_frame.setVisible(pid == "paint")
         self.changed.emit()
 
     def _pick_image(self):
@@ -1223,9 +1701,96 @@ class LayerWidget(QFrame):
         self.image_label.setText(os.path.basename(path))
         self.changed.emit()
 
+    def _ensure_depth_ready(self):
+        """onnxruntime + モデルの準備確認 (必要なら案内/ダウンロード)。"""
+        if not depth_available():
+            QMessageBox.information(self, "Depth", tr("depth_need_ort"))
+            return False
+        if not depth_model_ready():
+            if QMessageBox.question(
+                    self, "Depth", tr("depth_need_model"),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes) != QMessageBox.Yes:
+                return False
+            self.depth_status.setText(tr("depth_downloading"))
+            QApplication.processEvents()
+            try:
+                download_depth_model()
+            except Exception as e:
+                QMessageBox.critical(self, "Depth", f"{tr('depth_failed')}: {e}")
+                self.depth_status.setText(tr("depth_failed"))
+                return False
+        return True
+
+    def _compute_depth_from_video(self):
+        """基準フレーム (スライダー位置) の映像フレームから深度を推定する。"""
+        if self.current_pattern_id() != "depth":
+            return
+        if not callable(self.video_frame_cb):
+            self.depth_status.setText(tr("depth_no_video"))
+            return
+        got = self.video_frame_cb(self.depth_slider.value() / 1000.0)
+        if got is None:
+            self.depth_status.setText(tr("depth_no_video"))
+            return
+        frame, idx, total = got
+        if not self._ensure_depth_ready():
+            return
+        self.depth_status.setText(tr("depth_calc"))
+        QApplication.processEvents()
+        try:
+            arr = estimate_depth_from_bgr(frame)
+        except Exception as e:
+            QMessageBox.critical(self, "Depth", f"{tr('depth_failed')}: {e}")
+            arr = None
+        if arr is None:
+            self.depth_status.setText(tr("depth_failed"))
+            return
+        self._depth_arr = arr
+        self.depth_status.setText(tr("depth_done", f=f"frame {idx}/{total}"))
+        self.changed.emit()
+
+    def _pick_depth_photo(self):
+        """(オプション) 写真ファイルを基準に深度を推定する。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select photo", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif)")
+        if not path or not self._ensure_depth_ready():
+            return
+        self.depth_status.setText(tr("depth_calc"))
+        QApplication.processEvents()
+        try:
+            arr = estimate_depth(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Depth", f"{tr('depth_failed')}: {e}")
+            arr = None
+        if arr is None:
+            self.depth_status.setText(tr("depth_failed"))
+            return
+        self._depth_arr = arr
+        self.depth_status.setText(tr("depth_done", f=os.path.basename(path)))
+        self.changed.emit()
+
+    def _open_paint(self):
+        """ペイントダイアログを開き、結果をレイヤーの配列として保持する。"""
+        if callable(self.map_shape_cb):
+            mh, mw = self.map_shape_cb()
+        else:
+            mh, mw = 512, 512
+        dlg = PaintDialog(self, mh, mw, initial=self._paint_arr)
+        if dlg.exec_() == QDialog.Accepted:
+            self._paint_arr = dlg.result_array()
+            self.paint_status.setText(tr("paint_status_done"))
+            self.changed.emit()
+
     def params(self):
+        pid = self.current_pattern_id()
+        image_arr = None
+        if pid == "paint":
+            image_arr = self._paint_arr
+        elif pid == "depth":
+            image_arr = self._depth_arr
         return {
-            "pattern": self.current_pattern_id(),
+            "pattern": pid,
             "amp": self.wave_amp.value(),
             "period": self.wave_period.value(),
             "phase": self.wave_phase.value(),
@@ -1237,6 +1802,7 @@ class LayerWidget(QFrame):
             "octaves": self.oct_spin.value(),
             "pseed": self.pseed_spin.value(),
             "image_path": self._image_path,
+            "image_arr": image_arr,
             "blend": BLEND_IDS[max(0, self.blend.currentIndex())],
             "opacity": self.opacity_spin.value(),
         }
@@ -1260,6 +1826,11 @@ class LayerWidget(QFrame):
         self.image_btn.setText(tr("btn_layer_image"))
         if not self._image_path:
             self.image_label.setText(tr("no_layer_image"))
+        self.paint_btn.setText(tr("btn_paint"))
+        if self._paint_arr is None:
+            self.paint_status.setText(tr("paint_status_none"))
+        self.depth_lbl.setText(tr("lbl_depth_frame"))
+        self.depth_photo_btn.setText(tr("btn_depth_photo"))
         # pattern combo (選択保持)
         ids, labels = layer_pattern_order(self.section, sd=self.sd)
         idx = self.pattern.currentIndex() if self.pattern.count() else 0
@@ -2133,6 +2704,12 @@ class IMGTransApp(QWidget):
         # 編集のデバウンス: プロット生成 (matplotlib) は重いので、
         # 連続編集が完全に落ち着いてから 1 回だけ走らせる
         self._live3d_timer.setInterval(2000)
+        # 共通サイズ/出力FPS 変更 → 適用済みマップの自動再生成 (デバウンス)
+        self._regen_timer = QTimer(self)
+        self._regen_timer.setSingleShot(True)
+        self._regen_timer.setInterval(800)
+        self._regen_timer.timeout.connect(self._regen_applied_maps)
+        self._last_gen_key = None      # 直近の再生成時の (scan, time, fps)
         self._live3d_timer.timeout.connect(self._run_live3d)
         # プロット同期タイマ: GPU 映像の再生位置 → 赤ライン/3D GIF フレーム
         self._plot_sync_timer = QTimer(self)
@@ -2286,6 +2863,9 @@ class IMGTransApp(QWidget):
         self.range_slider.playheadChanged.connect(self._on_playhead_dragged)
         self.range_slider.usedRangeChanged.connect(self._on_used_range_dragged)
         self._range_override = None   # 緑バンド操作による実使用範囲 (frames)
+        # 非破壊のマップ調整 (反転/基準グレー/ブラー)。生成のたびに適用される
+        self._map_adjust = {t: {"invert": False, "midgray": 0.5, "blur": 0.0}
+                            for t in ("space", "time", "rate")}
         rf_v.addWidget(self.range_slider)
         self.range_span_label = QLabel("")
         self.range_span_label.setStyleSheet("color: gray; font-size: 10px;")
@@ -2396,6 +2976,10 @@ class IMGTransApp(QWidget):
         # Time 画像の vmin/vmax 既定値 (0 .. 出力FPS×時間方向サイズ) を追従更新
         self.gen_time_size.valueChanged.connect(self._maybe_update_time_defaults)
         self.gen_out_fps.currentIndexChanged.connect(self._maybe_update_time_defaults)
+        # サイズ/FPS の変更は適用済みマップにも自動反映 (デバウンス再生成)
+        self.gen_scan_size.valueChanged.connect(lambda *_: self._regen_timer.start())
+        self.gen_time_size.valueChanged.connect(lambda *_: self._regen_timer.start())
+        self.gen_out_fps.currentIndexChanged.connect(lambda *_: self._regen_timer.start())
 
         # 各セクション (Space/Time/Rate) の独立ジェネレータ widget bundle を保持
         self._section_gens = {}
@@ -2582,6 +3166,53 @@ class IMGTransApp(QWidget):
             col.addWidget(th, 1)
             thumb_row.addLayout(col, 1)
         right_col.addLayout(thumb_row, 1)
+
+        # サムネイル直下: 非破壊調整 (反転 / 基準グレー / ブラー)。
+        # 変更は数百ms のデバウンス後にそのセクションのマップを再生成して
+        # 適用し直す (軌道・プロット・GPU プレビューへ連鎖反映)。
+        self._adjust_ui = {}
+        self._adjust_timers = {}
+        adj_row = QHBoxLayout()
+        adj_row.setSpacing(6)
+        for t in ("space", "time", "rate"):
+            au = {}
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            r1 = QHBoxLayout()
+            au['invert'] = QCheckBox()
+            self._reg(lambda c=au['invert']: c.setText(tr("adj_invert")))
+            au['invert'].setStyleSheet("font-size: 10px;")
+            r1.addWidget(au['invert'])
+            au['mid'] = QSlider(Qt.Horizontal)
+            au['mid'].setRange(5, 95)
+            au['mid'].setValue(50)
+            self._reg(lambda s=au['mid']: s.setToolTip(tr("tip_adj_mid")))
+            r1.addWidget(au['mid'], 1)
+            au['mid_val'] = QLabel("0.50")
+            au['mid_val'].setStyleSheet("color: gray; font-size: 9px;")
+            r1.addWidget(au['mid_val'])
+            col.addLayout(r1)
+            r2 = QHBoxLayout()
+            au['blur'] = QSlider(Qt.Horizontal)
+            au['blur'].setRange(0, 128)          # 0 .. 64px (0.5px 刻み)
+            au['blur'].setValue(0)
+            self._reg(lambda s=au['blur']: s.setToolTip(tr("tip_adj_blur")))
+            r2.addWidget(au['blur'], 1)
+            au['blur_val'] = QLabel("0.0px")
+            au['blur_val'].setStyleSheet("color: gray; font-size: 9px;")
+            r2.addWidget(au['blur_val'])
+            col.addLayout(r2)
+            adj_row.addLayout(col, 1)
+            self._adjust_ui[t] = au
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(400)
+            timer.timeout.connect(lambda tt=t: self._regen_adjusted_section(tt))
+            self._adjust_timers[t] = timer
+            au['invert'].toggled.connect(lambda *_, tt=t: self._on_adjust_changed(tt))
+            au['mid'].valueChanged.connect(lambda *_, tt=t: self._on_adjust_changed(tt))
+            au['blur'].valueChanged.connect(lambda *_, tt=t: self._on_adjust_changed(tt))
+        right_col.addLayout(adj_row)
         l3_cols.addLayout(right_col, 11)
 
         l3_outer.addLayout(l3_cols, 1)
@@ -2723,12 +3354,15 @@ class IMGTransApp(QWidget):
         render_row.addWidget(self.render_progress)
         render_row.addWidget(self.start_btn)
 
+        # 出力行は映像ビューの外 (ライブビュー右カラムの最上段) に置く。
+        # rendered_preview 表示時に rt_group を隠してもボタンが消えないように。
+        self._live_gpu_slot.insertLayout(0, render_row)
+
         if _HAS_RT_PREVIEW:
             self.rt_group = QGroupBox()
             self._reg(lambda: self.rt_group.setTitle(tr("grp_realtime")))
             rt_v = QVBoxLayout(self.rt_group)
             rt_v.setContentsMargins(4, 4, 4, 4)
-            rt_v.addLayout(render_row)          # 右上にレンダリング開始
             self.rt_preview = RealtimePreviewWidget(lang=LANG)
             rt_v.addWidget(self.rt_preview)
             self._live_gpu_slot.addWidget(self.rt_group, 3)
@@ -2737,7 +3371,6 @@ class IMGTransApp(QWidget):
             self.rt_preview.center_btn.clicked.connect(self._show_gpu_view)
         else:
             self.rt_preview = None
-            self._render_row_fallback = render_row   # RT 無し環境ではページ下部へ
         self.rendered_preview = VideoPreview(tr("rendered_video_title"))
         self._reg(lambda: self.rendered_preview.set_base_title(tr("rendered_video_title")))
         self.rendered_preview.setVisible(False)
@@ -2781,10 +3414,6 @@ class IMGTransApp(QWidget):
             bv.addStretch()
             cols.addWidget(box, 1)
         page_l.addLayout(cols)
-
-        # RT プレビューが無い環境では出力行をページ下部に置く
-        if getattr(self, "_render_row_fallback", None) is not None:
-            page_l.addLayout(self._render_row_fallback)
 
         # プレビューの音声設定変更 → 書き出し予定の表示を更新
         if self.rt_preview is not None:
@@ -2953,7 +3582,7 @@ class IMGTransApp(QWidget):
         # 各セクション全レイヤーの波形周期既定値 = 時間方向サイズ (= 全体で 1 周期)
         for t in self._section_gens:
             for lw in self._section_gens[t].get('layers', []):
-                lw.wave_period.setValue(120)
+                lw.wave_period.setValue(1000)
         # ヒントラベル更新 + マニューバプレビュー stale マーク用シグナル接続
         for sp in (self.space_set_value, self.time_vmin_spin, self.time_vmax_spin,
                    self.rate_maxdev_spin, self.rate_baseline_spin, self.rate_startpoint_spin):
@@ -3005,6 +3634,51 @@ class IMGTransApp(QWidget):
         v = self.gen_out_fps.currentData()
         return int(v) if v else 30
 
+    def _on_adjust_changed(self, type_name):
+        """非破壊調整の変更: 状態を更新し、デバウンス後にマップを再生成する。"""
+        self._dismiss_rendered_preview()
+        au = self._adjust_ui[type_name]
+        self._map_adjust[type_name] = {
+            "invert": au['invert'].isChecked(),
+            "midgray": au['mid'].value() / 100.0,
+            "blur": au['blur'].value() / 2.0,
+        }
+        au['mid_val'].setText(f"{au['mid'].value() / 100.0:.2f}")
+        au['blur_val'].setText(f"{au['blur'].value() / 2.0:.1f}px")
+        if self.dm is not None:
+            self._adjust_timers[type_name].start()
+
+    def _regen_adjusted_section(self, type_name):
+        """調整変更後の再生成 (適用画像を作り直し、下流をすべて追従させる)。"""
+        if self.dm is None:
+            return
+        try:
+            self.generate_sample_image_action(type_name)
+        except Exception as e:
+            self.log(f"[WARN] adjust regen {type_name}: {e}")
+
+    def _regen_applied_maps(self):
+        """共通サイズ (スキャン/時間方向) や出力FPS の変更を適用済みマップへ反映する。
+
+        適用画像はすべてレイヤー生成由来なので、現在のレイヤー設定のまま
+        新しいサイズで再生成して適用し直す (軌道・プロット・GPU プレビューが
+        連鎖的に追従する)。値が前回から変わっていなければ何もしない。
+        """
+        if not self.dm:
+            return
+        key = (self.gen_scan_size.value(), self.gen_time_size.value(),
+               self._out_fps())
+        if key == self._last_gen_key:
+            return
+        self._last_gen_key = key
+        try:
+            self.dm.outfps = self._out_fps()   # 時間表記/導出マップの基準を更新
+        except Exception:
+            pass
+        self.log(f"[regen] サイズ/FPS 変更を適用画像へ反映: "
+                 f"scan={key[0]} time={key[1]} fps={key[2]}")
+        self._auto_apply_normal_maps()
+
     def _auto_apply_normal_maps(self):
         """Initialize 直後、通常再生グラデーションを Space/Time/Rate に自動適用する。
 
@@ -3017,6 +3691,8 @@ class IMGTransApp(QWidget):
                 self.generate_sample_image_action(t)
             except Exception as e:
                 self.log(f"[WARN] auto-apply {t}: {e}")
+        self._last_gen_key = (self.gen_scan_size.value(),
+                              self.gen_time_size.value(), self._out_fps())
 
     def _default_time_vmax(self):
         """Time 画像 vmax の既定値 = 出力フレーム数 (時間方向サイズ)。
@@ -3465,6 +4141,7 @@ class IMGTransApp(QWidget):
         g['add_btn'].clicked.connect(lambda *_, t=type_name: self._add_layer(t))
         v.addWidget(g['add_btn'])
 
+
         # Preview (合成結果。画像読み込み後はその画像を表示)
         g['preview_label'] = QLabel(tr("preview_after_init"))
         g['preview_label'].setAlignment(Qt.AlignCenter)
@@ -3503,31 +4180,6 @@ class IMGTransApp(QWidget):
         bv = QVBoxLayout(box)
         bv.setContentsMargins(6, 4, 6, 4)
         bv.setSpacing(3)
-
-        # --- 階調反転 (破壊的・即時) ---
-        g['pp_invert_btn'] = QPushButton()
-        self._reg(lambda b=g['pp_invert_btn']: b.setText(tr("btn_pp_invert")))
-        g['pp_invert_btn'].clicked.connect(
-            lambda *_, t=type_name: self.postproc_invert(t))
-        bv.addWidget(g['pp_invert_btn'])
-
-        # --- 基準グレー (ヒストグラム中間値) ---
-        mg_row = QHBoxLayout()
-        mg_row.addWidget(self._trlabel("lbl_pp_midgray"))
-        g['pp_midgray'] = QSlider(Qt.Horizontal)
-        g['pp_midgray'].setRange(5, 95)      # 0.05 .. 0.95
-        g['pp_midgray'].setValue(50)
-        g['pp_midgray'].valueChanged.connect(
-            lambda *_, t=type_name: self._on_postproc_param(t))
-        mg_row.addWidget(g['pp_midgray'], 1)
-        g['pp_midgray_val'] = QLabel("0.50")
-        g['pp_midgray_val'].setMinimumWidth(32)
-        mg_row.addWidget(g['pp_midgray_val'])
-        bv.addLayout(mg_row)
-        mg_hint = self._trlabel("hint_pp_midgray")
-        mg_hint.setStyleSheet("color: gray; font-size: 10px;")
-        mg_hint.setWordWrap(True)
-        bv.addWidget(mg_hint)
 
         # --- 回転 (サイズ維持で再マッピング) ---
         rot_row = QHBoxLayout()
@@ -3582,10 +4234,58 @@ class IMGTransApp(QWidget):
             return int(getattr(self.dm, "scan_direction", 1))
         return 1 if self.slit_toggle.isChecked() else 0
 
+    def _current_map_shape(self):
+        """現在の共通サイズ設定でのマップのファイル形状 (h, w)。"""
+        sd = self._current_sd()
+        scan = self.gen_scan_size.value()
+        ts = self.gen_time_size.value()
+        return (ts, scan) if sd == 1 else (scan, ts)
+
+    def _get_video_derived(self, kind):
+        """映像由来マップ (vluma/vmotion/vmotion_slit) をキャッシュ付きで返す。"""
+        sd = self._current_sd()
+        ts = self.gen_time_size.value()
+        cache = getattr(self, "_vderived_cache", {})
+        key = (self.videopath, kind, sd, ts if kind == "vmotion_slit" else None)
+        if cache.get("key") == key:
+            return cache.get("arr")
+        arr = None
+        if self.videopath and os.path.exists(self.videopath):
+            self.log(f"[derive] {kind} マップを映像から計算中…")
+            QApplication.processEvents()
+            arr = derive_video_map(self.videopath, kind, sd=sd, time_size=ts)
+            self.log(f"[derive] {kind} 完了" if arr is not None
+                     else f"[derive] {kind} 失敗")
+        self._vderived_cache = {"key": key, "arr": arr}
+        return arr
+
+    def _inject_dynamic_layers(self, layers):
+        """映像由来パターンのレイヤーに計算済み配列を注入する。"""
+        for p in layers:
+            if p.get("pattern") in ("vluma", "vmotion", "vmotion_slit") \
+                    and p.get("image_arr") is None:
+                p["image_arr"] = self._get_video_derived(p["pattern"])
+
+    def _grab_video_frame_for_depth(self, frac):
+        """深度推定の基準フレーム取得: (BGRフレーム, idx, total) or None。"""
+        if not (self.videopath and os.path.exists(self.videopath)):
+            return None
+        cap = cv2.VideoCapture(self.videopath)
+        if not cap.isOpened():
+            return None
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        idx = int(min(max(0.0, frac), 1.0) * max(0, n - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, fr = cap.read()
+        cap.release()
+        return (fr, idx, n) if (ret and fr is not None) else None
+
     def _add_layer(self, type_name):
         """セクションにレイヤーを 1 枚追加する。"""
         g = self._section_gens[type_name]
         lw = LayerWidget(type_name, len(g['layers']), sd=self._current_sd())
+        lw.map_shape_cb = self._current_map_shape   # ペイントのキャンバス形状
+        lw.video_frame_cb = self._grab_video_frame_for_depth
         lw.changed.connect(lambda t=type_name: self._update_section_preview(t))
         lw.remove_requested.connect(lambda w, t=type_name: self._remove_layer(t, w))
         g['layers'].append(lw)
@@ -3621,7 +4321,9 @@ class IMGTransApp(QWidget):
         pw = max(4, int(round(w * scale)))
 
         layers = [lw.params() for lw in g['layers']]
+        self._inject_dynamic_layers(layers)
         img16 = composite_layers(ph, pw, layers, scale=scale)
+        img16 = apply_map_adjust(img16, self._map_adjust[type_name], scale=scale)
         img8 = np.ascontiguousarray((img16 >> 8).astype(np.uint8))
         return gray8_to_qpixmap(img8)
 
@@ -3629,6 +4331,7 @@ class IMGTransApp(QWidget):
         """セクション {type_name} のプレビューラベルを再描画"""
         if not self.dm or type_name not in self._section_gens:
             return
+        self._dismiss_rendered_preview()   # 設定変更 → 書き出し結果の表示を閉じる
         pix = self._make_preview_pixmap_for(type_name)
         if pix is None:
             return
@@ -3671,26 +4374,25 @@ class IMGTransApp(QWidget):
                                interpolation=cv2.INTER_AREA)
         else:
             small = img16
-        mid, rot = self._pp_pending(type_name)
-        small = pp_apply_pending(small, mid, rot)
+        rot = self._pp_pending(type_name)
+        small = pp_apply_pending(small, rot)
         pix = gray8_to_qpixmap((small >> 8).astype(np.uint8))
         label.setPixmap(pix)
-        note = "" if (abs(mid - 0.5) < 1e-6 and abs(rot) < 1e-6) else \
-            f"\n[未適用] 基準グレー={mid:.2f} / 回転={rot:.1f}°"
+        note = "" if self._pp_is_neutral(type_name) else \
+            f"\n[未適用] 回転={rot:.1f}°"
         label.setToolTip(
             f"ロード画像: {os.path.basename(path)}\n({w}×{h}){note}")
 
     # --- 適用画像の後処理 (破壊的) ---
     def _pp_pending(self, type_name):
-        """セクションの未適用後処理 (midgray, rotate_deg) を返す。"""
+        """セクションの未適用の破壊的後処理 (rotate_deg) を返す。"""
         g = self._section_gens.get(type_name, {})
-        if 'pp_midgray' not in g:
-            return 0.5, 0.0
-        return g['pp_midgray'].value() / 100.0, float(g['pp_rotate'].value())
+        if 'pp_rotate' not in g:
+            return 0.0
+        return float(g['pp_rotate'].value())
 
     def _pp_is_neutral(self, type_name):
-        mid, rot = self._pp_pending(type_name)
-        return abs(mid - 0.5) < 1e-6 and abs(rot) < 1e-6
+        return abs(self._pp_pending(type_name)) < 1e-6
 
     def _refresh_section_view(self, type_name):
         """セクションのプレビューを現在の状態で再描画 (適用画像 > レイヤー合成)。"""
@@ -3708,8 +4410,6 @@ class IMGTransApp(QWidget):
         path = getattr(self, f"{type_name}_img_path", None)
         has_img = bool(path and os.path.exists(path))
         g['pp_box'].setEnabled(has_img)
-        mid, rot = self._pp_pending(type_name)
-        g['pp_midgray_val'].setText(f"{mid:.2f}")
         pending = has_img and not self._pp_is_neutral(type_name)
         g['pp_status'].setText(tr("pp_pending") if pending else "")
         g['pp_status'].setVisible(pending)
@@ -3719,19 +4419,19 @@ class IMGTransApp(QWidget):
             "QLabel { background: #222; color: #888; border: 1px solid #555; }")
 
     def _on_postproc_param(self, type_name):
-        """基準グレー / 回転スライダーの変更 → プレビューのみ更新。"""
+        """回転スライダーの変更 → プレビューのみ更新。"""
+        self._dismiss_rendered_preview()
         self._update_postproc_state(type_name)
         self._refresh_section_view(type_name)
 
     def postproc_reset(self, type_name):
         """未適用の後処理パラメータを既定値に戻す (ファイルは触らない)。"""
         g = self._section_gens.get(type_name, {})
-        if 'pp_midgray' not in g:
+        if 'pp_rotate' not in g:
             return
-        for w, v in ((g['pp_midgray'], 50), (g['pp_rotate'], 0.0)):
-            w.blockSignals(True)
-            w.setValue(v)
-            w.blockSignals(False)
+        g['pp_rotate'].blockSignals(True)
+        g['pp_rotate'].setValue(0.0)
+        g['pp_rotate'].blockSignals(False)
         self._on_postproc_param(type_name)
 
     def _pp_write(self, type_name, img16, what):
@@ -3755,40 +4455,17 @@ class IMGTransApp(QWidget):
         self._mark_preview_stale()
         return True
 
-    def postproc_invert(self, type_name):
-        """適用画像の階調を反転して上書きする (破壊的・確認あり)。"""
-        path = getattr(self, f"{type_name}_img_path", None)
-        if not (path and os.path.exists(path)):
-            QMessageBox.warning(self, "Error", tr("pp_no_image"))
-            return
-        if QMessageBox.question(
-                self, tr("pp_confirm_title"),
-                tr("pp_confirm_invert", t=type_name.capitalize(),
-                   f=os.path.basename(path)),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No) != QMessageBox.Yes:
-            return
-        img16 = read_map16(path)
-        if img16 is None:
-            QMessageBox.critical(self, "Error", f"Could not read {path}")
-            return
-        self._pp_write(type_name, pp_invert(img16), "invert")
-
     def postproc_apply(self, type_name):
         """未適用の基準グレー / 回転を適用画像へ書き込む (破壊的・確認あり)。"""
         path = getattr(self, f"{type_name}_img_path", None)
         if not (path and os.path.exists(path)):
             QMessageBox.warning(self, "Error", tr("pp_no_image"))
             return
-        mid, rot = self._pp_pending(type_name)
+        rot = self._pp_pending(type_name)
         if self._pp_is_neutral(type_name):
             QMessageBox.information(self, tr("grp_postproc"), tr("pp_nothing"))
             return
-        ops = []
-        if abs(mid - 0.5) >= 1e-6:
-            ops.append(tr("pp_op_midgray", v=mid))
-        if abs(rot) >= 1e-6:
-            ops.append(tr("pp_op_rotate", v=rot))
+        ops = [tr("pp_op_rotate", v=rot)]
         if QMessageBox.question(
                 self, tr("pp_confirm_title"),
                 tr("pp_confirm_apply", t=type_name.capitalize(),
@@ -3800,8 +4477,8 @@ class IMGTransApp(QWidget):
         if img16 is None:
             QMessageBox.critical(self, "Error", f"Could not read {path}")
             return
-        self._pp_write(type_name, pp_apply_pending(img16, mid, rot),
-                       f"midgray={mid:.2f} rotate={rot:.1f}deg")
+        self._pp_write(type_name, pp_apply_pending(img16, rot),
+                       f"rotate={rot:.1f}deg")
 
     # --- 階調表示モード ---
     def _on_colormap_toggled(self, checked):
@@ -3976,10 +4653,27 @@ class IMGTransApp(QWidget):
         self.preview_status_label.setText("Status: done — 設定を変更したら「プレビュー生成」を再実行")
         self._preview_stale = False
 
+    def _dismiss_rendered_preview(self):
+        """レンダリング結果プレビューを畳んで GPU リアルタイムビューへ戻す。
+
+        書き出し後に設定を触ったら、その結果はもう現在の設定と一致しないので
+        表示を残さない (再レンダリングは出力行のボタンからいつでも可能)。
+        """
+        rp = getattr(self, "rendered_preview", None)
+        if rp is None or not rp.isVisible():
+            return
+        self.render_completed = False
+        self._show_gpu_view()
+        rt = getattr(self, "rt_preview", None)
+        if rt is not None and rt._backend is not None:
+            rt.start()
+        self.log("[preview] 設定が変更されたため書き出し結果の表示を閉じました")
+
     def _mark_preview_stale(self, *_):
         """Tab 2 の編集を検知してプレビュー側に「再生成が必要」と表示する。
         実プレビュー画像は残したまま、ステータスだけ更新 (古い表示の使い回し防止)。
         """
+        self._dismiss_rendered_preview()
         if not hasattr(self, "preview_btn"):
             return
         # 3D軌道ライブプレビューは編集のたびにデバウンス再生成
@@ -4060,6 +4754,10 @@ class IMGTransApp(QWidget):
             self.live3d_status.setText("")
             return
         self._live3d_busy = True
+        try:
+            self.dm.outfps = self._out_fps()   # プロットの時間表記を最新に
+        except Exception:
+            pass
         # 重い matplotlib 生成中は常時更新系 (GPU 再生 / 同期ティック) を
         # 一時停止して CPU を空ける → 生成が速く終わり UI も軽い
         self._throttle_live_updates(True)
@@ -4125,6 +4823,10 @@ class IMGTransApp(QWidget):
             return
         self.plot3d_btn.setEnabled(False)
         self.live3d_status.setText(tr("plot3d_generating"))
+        try:
+            self.dm.outfps = self._out_fps()
+        except Exception:
+            pass
         self._throttle_live_updates(True)
         self._plot3d_worker = ManeuverPreviewWorker(
             self.dm, mode,
@@ -4212,8 +4914,11 @@ class IMGTransApp(QWidget):
             h_pix, w_pix = int(scan_size), int(time_size)   # (scan, time) — .T される
 
         layers = [lw.params() for lw in g['layers']]
+        self._inject_dynamic_layers(layers)
         try:
             img16 = composite_layers(h_pix, w_pix, layers, scale=1.0)
+            # 非破壊調整 (反転/基準グレー/ブラー) を毎回かけ直す
+            img16 = apply_map_adjust(img16, self._map_adjust[type_name])
             fname = sample_filename(
                 type_name,
                 space_range=self.space_set_value.value(),
@@ -4468,6 +5173,7 @@ class IMGTransApp(QWidget):
         baseline = self.rate_baseline_spin.value()
         startpoint = self.rate_startpoint_spin.value()
 
+        self.start_btn.setEnabled(False)   # 実行中の二重起動を防ぐ
         self.worker = RenderWorker(
             self.dm, mode, animout,
             self.space_img_path, self.time_img_path, self.rate_img_path,
@@ -4521,6 +5227,8 @@ class IMGTransApp(QWidget):
             self._show_rendered_preview(video_path)
         else:
             self.log("Rendering failed.")
+        # 成功/失敗どちらでも出力ボタンを復帰させる (再レンダリング可能に)
+        self._update_tab_gating()
 
     def _show_rendered_preview(self, video_path):
         """本レンダリング完了後、映像エリアを GPU プレビューから
