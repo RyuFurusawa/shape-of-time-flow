@@ -22,6 +22,7 @@ Shape_of_time_flow.py が「グレー画像 → マニューバデータ」を�
 
 import os
 import sys
+import re
 import ast
 import copy
 import time
@@ -38,8 +39,9 @@ from PyQt5.QtWidgets import (
     QFrame, QGroupBox, QScrollArea, QSplitter, QProgressBar, QSizePolicy,
     QSlider, QLineEdit, QFileDialog, QToolButton, QDialog,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize
+from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor,
+                         QMovie, QImageReader)
 
 import numpy as np
 import cv2
@@ -105,6 +107,8 @@ TR = {
     "cat_add": {"ja": "Add 系 (データを作る/継ぎ足す)", "en": "Add (create/append)"},
     "cat_apply": {"ja": "Apply 系 (全体に効果を適用)", "en": "Apply (transform all)"},
     "cat_data": {"ja": "データ操作 (整列/抽出/チェック)", "en": "Data ops"},
+    "cat_expand": {"ja": "拡張系 (空間サイズを変える・置ける位置に制約あり)",
+                    "en": "Expand (changes spatial size — position constrained)"},
     "cat_other": {"ja": "その他 (出力/解析)", "en": "Other (output/analysis)"},
     "chain_empty": {"ja": "(ステップがありません。下の「＋ ステップを追加」から)",
                      "en": "(no steps yet — use “+ Add step” below)"},
@@ -167,6 +171,84 @@ TR = {
         "en": "Chain unchanged → skipping video render; muxing audio onto {v}"},
     "proxy_note": {"ja": "  [プレビュー {p} 本 → 本番 {r} 本]",
                     "en": "  [preview {p} → full {r} slits]"},
+    "lbl_timeline": {"ja": "入力映像の時間軸 / 使用範囲:",
+                      "en": "Input timeline / used range:"},
+    "timeline_readout": {
+        "ja": "使用範囲 {s:.2f}–{e:.2f} 秒 (frame {sf}–{ef} / 全 {n})   |   再生位置 {p:.2f}s",
+        "en": "used {s:.2f}–{e:.2f}s (frame {sf}–{ef} / {n})   |   playhead {p:.2f}s"},
+    "timeline_hint": {
+        "ja": "(緑=軌道が参照している範囲。ドラッグでスライドすると"
+              "チェーン末尾の zCenterArange が自動調整される / 赤=プレビュー位置)",
+        "en": "(green = range the trajectory reads; drag to slide — a zCenterArange "
+              "step at the end of the chain is auto-adjusted / red = preview playhead)"},
+    "zcenter_added": {"ja": "[timeline] zCenterArange をチェーン末尾に追加 (中央 {f} frame)",
+                       "en": "[timeline] appended zCenterArange (center {f})"},
+    "zcenter_updated": {"ja": "[timeline] zCenterArange の中央を {f} frame に更新",
+                         "en": "[timeline] zCenterArange center → {f}"},
+    "expand_must_be_last": {
+        "ja": "⚠ このメソッドは既存データの左右を広げるため、これ以降のステップは"
+              "配列の形が合わずエラーになります。チェーンの最後へ移動してください。",
+        "en": "⚠ This widens the existing data; later steps will fail on shape "
+              "mismatch. Move it to the END of the chain."},
+    "expand_must_be_first": {
+        "ja": "⚠ このメソッドは新しいスキャン幅を定義するため、データが空の状態"
+              "(=チェーンの先頭) でのみ実行できます。先頭へ移動してください。",
+        "en": "⚠ This defines a new scan width and only runs on empty data. "
+              "Move it to the START of the chain."},
+    "expand_hint_first": {
+        "ja": "拡張系(先頭専用): 新しいスキャン幅を定義します。チェーンの先頭に置いてください"
+              "（以降は新しい幅で続けられます）",
+        "en": "Expand (first only): defines a new scan width — place at the START"},
+    # --- 出力設定 ---
+    "grp_output": {"ja": "出力設定 (Output)", "en": "Output settings"},
+    "lbl_out_kind": {"ja": "出力形式:", "en": "Output:"},
+    "out_video": {"ja": "動画", "en": "Video"},
+    "out_still": {"ja": "連番画像", "en": "Image sequence"},
+    "lbl_out_type": {"ja": "コーデック:", "en": "Codec:"},
+    "lbl_img_format": {"ja": "画像形式:", "en": "Image format:"},
+    "hint_img_format": {"ja": "(.png/.tif は 16bit 可 / .jpg は 8bit)",
+                         "en": "(.png/.tif keep 16bit; .jpg is 8bit)"},
+    "lbl_separate": {"ja": "分割数:", "en": "Segments:"},
+    "hint_separate": {"ja": "(0 = 空きメモリから自動)", "en": "(0 = auto from free memory)"},
+    "btn_out_toggle": {"ja": "出力設定", "en": "Output settings"},
+    # --- 音声設定 ---
+    "grp_audio": {"ja": "音声レンダリング (Audio)", "en": "Audio rendering"},
+    "lbl_audio_smooth": {"ja": "補間:", "en": "Interp:"},
+    "lbl_audio_harmonics": {"ja": "成分数:", "en": "Harmonics:"},
+    "lbl_audio_grain": {"ja": "粒(秒):", "en": "Grain(s):"},
+    "lbl_audio_inpan": {"ja": "パン方式:", "en": "Pan mode:"},
+    "lbl_audio_gain": {"ja": "音量:", "en": "Gain:"},
+    "lbl_audio_jump": {"ja": "跳び閾値(秒):", "en": "Jump thresh(s):"},
+    "chk_audio_normalize": {"ja": "ノーマライズ", "en": "Normalize"},
+    "grp_audio_fx": {"ja": "フレーム内在時間 (now depth) 駆動の変調",
+                      "en": "Now-depth driven modulation"},
+    "fx_reverb": {"ja": "リバーブ", "en": "Reverb"},
+    "fx_lpf": {"ja": "LPF", "en": "LPF"},
+    "fx_width": {"ja": "広がり", "en": "Width"},
+    "fx_detune": {"ja": "デチューン", "en": "Detune"},
+    "lbl_reverb_wet": {"ja": "wet:", "en": "wet:"},
+    "lbl_reverb_time": {"ja": "残響時間 RT60(秒):", "en": "Decay RT60(s):"},
+    "lbl_reverb_room": {"ja": "空間の広さ:", "en": "Room size:"},
+    "lbl_reverb_predelay": {"ja": "初期反射(秒):", "en": "Predelay(s):"},
+    "lbl_reverb_duck": {"ja": "原音を下げる:", "en": "Dry duck:"},
+    "tip_reverb_room": {
+        "ja": "リバーブの空間の広さ。反射が返ってくる間隔を倍率で変える。\n"
+              "0.3=小部屋 (密で金属的) / 1.0=中ホール (既定) / 2.5=大聖堂。\n"
+              "「残響時間 RT60」は消えるまでの長さで、広さとは別の軸。",
+        "en": "Size of the reverb space (spacing between reflections).\n"
+              "0.3 = small room, 1.0 = mid hall (default), 2.5 = cathedral.\n"
+              "Decay time (RT60) is a separate axis."},
+    "hint_reverb": {
+        "ja": "広さ=反射の間隔 / RT60=消えるまでの長さ (別の軸として調整できます)",
+        "en": "Size = spacing of reflections; RT60 = time to silence (independent)"},
+    "lbl_lpf_range": {"ja": "LPF範囲(Hz):", "en": "LPF range(Hz):"},
+    "lbl_width_range": {"ja": "幅範囲:", "en": "Width range:"},
+    "lbl_detune_cents": {"ja": "デチューン(cent):", "en": "Detune(cents):"},
+    "audio_info_title": {"ja": "音声レンダリングのパラメータ",
+                          "en": "Audio rendering parameters"},
+    "expand_hint_last": {
+        "ja": "拡張系(末尾専用): 既存データの左右を広げます。チェーンの最後に置いてください",
+        "en": "Expand (last only): widens existing data — place at the END"},
 }
 
 
@@ -248,6 +330,205 @@ class VideoRotateWorker(QThread):
         self.done_signal.emit(ok, self.out if ok else "")
 
 
+class Accordion(QWidget):
+    """クリックで開閉する折りたたみパネル。出力/音声設定をまとめるのに使う。"""
+
+    def __init__(self, title, expanded=False):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        self.button = QToolButton()
+        self.button.setText(title)
+        self.button.setCheckable(True)
+        self.button.setChecked(expanded)
+        self.button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.button.setStyleSheet(
+            "QToolButton { border:none; font-weight:bold; color:#444; }")
+        self.button.toggled.connect(self._on_toggle)
+        v.addWidget(self.button)
+        self.body = QFrame()
+        self.body.setFrameShape(QFrame.StyledPanel)
+        self.body.setVisible(expanded)
+        self.body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(8, 6, 8, 8)
+        self.body_layout.setSpacing(6)
+        v.addWidget(self.body)
+
+    def _on_toggle(self, on):
+        self.button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self.body.setVisible(on)
+
+    def set_title(self, t):
+        self.button.setText(t)
+
+    def addLayout(self, lay):
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.addLayout(lay)
+
+    def addWidget(self, w):
+        self.body_layout.addWidget(w)
+
+
+# ======== 出力フォーマット / 音声パラメータ定義 ========
+# (out_type, 表示名, 拡張子, 補足)  ※ imgtrans の OUT_* 定数に対応
+OUT_TYPES = [
+    (1, "H.264 (8bit SDR)", ".mp4", "既定。最大 4096×2160"),
+    (2, "H.265 (10bit HDR10 PQ)", ".mp4", "最大 8192×4320"),
+    (5, "H.265 (10bit SDR)", ".mp4", "SDR カラータグ付き"),
+    (7, "H.265 HW (VideoToolbox)", ".mp4", "macOS ハードウェアエンコード・高速"),
+    (3, "ProRes 422 HQ (10bit HDR)", ".mov", "解像度制限なし"),
+    (6, "ProRes 422 HQ (10bit SDR)", ".mov", "SDR カラータグ付き"),
+    (4, "ProRes 4444 (10bit HDR)", ".mov", "4:4:4・解像度制限なし"),
+]
+IMG_FORMATS = [
+    (".png", "PNG (16bit 可)"),
+    (".tif", "TIFF (16bit 可)"),
+    (".bmp", "BMP"),
+    (".jpg", "JPEG (8bit)"),
+]
+
+# audio_render の全パラメータ。Info ボタンで README の説明を引くのに使う。
+AUDIO_PARAM_DOC = "audio_render"
+
+
+# ======== 入力映像タイムライン (使用範囲バンド + 再生位置) ========
+class ManeuverTimelineSlider(QWidget):
+    """入力映像の全長を表すバーに、軌道が参照している範囲と再生位置を重ねる。
+
+    Shape_of_time_flow.py の RangeTimelineSlider を簡略移植したもの。
+      緑バンド : 軌道データが実際に参照している入力時間範囲。
+                 **本体をドラッグしてスライドのみ可能** (端の伸縮は非対応)。
+      赤ライン : プレビュー表示位置。ドラッグでスクラブ。
+    値はすべて 0..1 の割合 (フレーム番号への換算は呼び出し側)。
+    """
+    usedRangeSlid = pyqtSignal(float, float)   # スライド後の (start, end)
+    playheadChanged = pyqtSignal(float)
+
+    GRAB_PX = 8
+
+    def __init__(self):
+        super().__init__()
+        self._used = None            # (s, e) or None
+        self._pos = 0.0
+        self._drag = None            # "band" | "pos" | None
+        self._drag_dx = 0.0
+        self.setFixedHeight(30)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_used_range(self, s, e):
+        """使用範囲を設定する。0..1 の外 (= 入力映像の範囲外) も保持する。"""
+        if s is None or e is None:
+            self._used = None
+        else:
+            s, e = float(s), float(e)
+            self._used = (s, max(s, e))
+        self.update()
+
+    def set_playhead(self, f):
+        self._pos = min(max(0.0, float(f)), 1.0)
+        self.update()
+
+    def used_range(self):
+        return self._used
+
+    def playhead(self):
+        return self._pos
+
+    # --- 座標変換 ---
+    def _f2x(self, f):
+        return 2 + f * max(1, self.width() - 5)
+
+    def _x2f(self, x):
+        return min(1.0, max(0.0, (x - 2) / max(1, self.width() - 5)))
+
+    # --- マウス ---
+    def _hit(self, x):
+        if abs(x - self._f2x(self._pos)) <= self.GRAB_PX:
+            return "pos"
+        if self._used is not None:
+            x0 = self._f2x(min(max(self._used[0], 0.0), 1.0))
+            x1 = self._f2x(min(max(self._used[1], 0.0), 1.0))
+            if x0 - 2 <= x <= x1 + 2:
+                return "band"
+        return None
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton:
+            return
+        hit = self._hit(ev.pos().x())
+        if hit == "band":
+            self._drag_dx = self._x2f(ev.pos().x()) - self._used[0]
+        elif hit is None:
+            hit = "pos"
+            self._apply("pos", self._x2f(ev.pos().x()))
+        self._drag = hit
+
+    def mouseMoveEvent(self, ev):
+        if self._drag:
+            self._apply(self._drag, self._x2f(ev.pos().x()))
+        else:
+            hit = self._hit(ev.pos().x())
+            self.setCursor(Qt.OpenHandCursor if hit == "band"
+                           else (Qt.SizeHorCursor if hit else Qt.PointingHandCursor))
+
+    def mouseReleaseEvent(self, ev):
+        self._drag = None
+
+    def _apply(self, which, f):
+        if which == "band" and self._used is not None:
+            span = self._used[1] - self._used[0]
+            s = f - self._drag_dx
+            if span <= 1.0:
+                s = min(max(0.0, s), 1.0 - span)      # バー内に収める
+            else:
+                s = min(max(1.0 - span, s), 0.0)      # 軌道が映像より長い場合
+            self._used = (s, s + span)
+            self.usedRangeSlid.emit(s, s + span)
+        else:
+            self._pos = f
+            self.playheadChanged.emit(self._pos)
+        self.update()
+
+    # --- 描画 ---
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        bar_y, bar_h = 5, h - 10
+        p.fillRect(2, bar_y, w - 4, bar_h, QColor(40, 40, 40))
+        if self._used is not None:
+            us, ue = self._used
+            cs, ce = min(max(us, 0.0), 1.0), min(max(ue, 0.0), 1.0)
+            x0, x1 = int(self._f2x(cs)), int(self._f2x(ce))
+            p.fillRect(x0, bar_y, max(2, x1 - x0), bar_h, QColor(60, 200, 120, 160))
+            # 端の線: 入力映像の範囲内なら緑、はみ出している側は警告色
+            for x, out in ((x0, us < -1e-6), (x1, ue > 1.0 + 1e-6)):
+                pen = QPen(QColor(230, 120, 40) if out else QColor(60, 220, 130))
+                pen.setWidth(3 if out else 2)
+                p.setPen(pen)
+                p.drawLine(x, bar_y - 2, x, bar_y + bar_h + 2)
+            # はみ出し量を端の三角で示す
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(230, 120, 40))
+            if us < -1e-6:
+                p.drawPolygon(*[QPoint(2, h // 2), QPoint(9, bar_y),
+                                QPoint(9, bar_y + bar_h)])
+            if ue > 1.0 + 1e-6:
+                p.drawPolygon(*[QPoint(w - 2, h // 2), QPoint(w - 9, bar_y),
+                                QPoint(w - 9, bar_y + bar_h)])
+            p.setBrush(Qt.NoBrush)
+        xp = int(self._f2x(self._pos))
+        pen = QPen(QColor(255, 40, 40))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawLine(xp, 0, xp, h)
+        p.end()
+
+
 # ======== メソッドレジストリ (イントロスペクションで自動生成) ========
 # 定義元ミックスインでカテゴリを決める。imgtrans にメソッドが増えれば
 # 自動的に選択肢へ現れる。
@@ -259,9 +540,36 @@ _MIXIN_CATEGORY = {
     "AudioMixin": "other",
     "SurfaceRenderingMixin": "other",
 }
-CATEGORY_ORDER = ["add", "apply", "data", "other"]
+CATEGORY_ORDER = ["add", "apply", "data", "expand", "other"]
 CATEGORY_LABEL_KEY = {"add": "cat_add", "apply": "cat_apply",
-                      "data": "cat_data", "other": "cat_other"}
+                      "data": "cat_data", "expand": "cat_expand",
+                      "other": "cat_other"}
+
+# スキャン方向のサイズ (data.shape[1]) を変えるメソッド群。
+# 実行後は配列の形が変わるため、置ける位置に制約がある。
+# 実測 (2026-08-11) で挙動が2種類に分かれることを確認した。
+#
+# ① 先頭専用 (EXPAND_FIRST):
+#    新しいスキャン幅を定義し、scan_nums もその値へ更新する。
+#    データが空の状態でのみ実行でき、**その後は新しい幅で他のメソッドを続けられる**。
+#      Cut を先頭 → addFlat  : OK  (51, 1440)
+#      addFlat → Cut         : NG  (形が合わない)
+#    ※ addCycleTrans など width/height を直接参照するメソッドは
+#      更新後の scan_nums を見ないため、続けても失敗する
+EXPAND_FIRST = {
+    "addWideKeyframeTrans",   # scan_nums = width * wide_scale
+    "addCylinderCut",         # _cut_finalize が scan_nums = output_width に更新
+    "addBoxUnfoldCut",        # 同上 (直方体の周長ぶんの幅になる)
+}
+# ② 末尾専用 (EXPAND_LAST):
+#    既存データの左右を np.pad で広げる。scan_nums は据え置きなので、
+#    **これ以降にステップを足すと必ず失敗する**。
+#      addFlat → wide_expandB          : OK  (50, 1320)
+#      addFlat → wide_expandB → addFlat : NG
+EXPAND_LAST = {
+    "wide_expandB",
+}
+EXPAND_METHODS = EXPAND_FIRST | EXPAND_LAST
 
 # チェーンに載せない (アプリ側が別 UI で扱う / 本アプリの対象外)
 _EXCLUDE = {
@@ -290,6 +598,8 @@ def build_method_registry():
             continue
         if cat == "data" and name.startswith("apply"):
             cat = "apply"
+        if name in EXPAND_METHODS:
+            cat = "expand"      # 空間サイズを変える系は独立カテゴリへ
         try:
             sig = inspect.signature(fn)
         except (ValueError, TypeError):
@@ -319,45 +629,101 @@ def _readme_paths():
     return [p for p in order if p.exists()]
 
 
+_IMG_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_HEAD_RE = re.compile(r"^(#{2,6})\s+(.*?)\s*$")
+
+
 def _parse_readme(path):
-    """README を「## `メソッド名`」単位のセクション辞書にする。"""
+    """README を見出し単位のセクション辞書にする。
+
+    値は {"text": 画像参照を除いた markdown, "images": [絶対パス, ...]}。
+    索引は2段階で作る:
+      1. 「## `メソッド名`」形式 … 変換メソッドの解説 (最優先)
+      2. 見出し文にメソッド名を含む任意レベルの見出し … 音声まわりのように
+         「##### Python内で完結する音声レンダリング audio_render」と
+         書かれている節を拾うため
+    セクションは「自分と同じか浅いレベルの見出し」が来るまでを範囲とする。
+    """
     key = str(path)
     if key in _README_CACHE:
         return _README_CACHE[key]
-    sections = {}
-    name = None
-    buf = []
+    root = path.parent
+    primary, secondary = {}, {}
+    cur_name = cur_level = None
+    cur_primary = False
+    buf, imgs = [], []
+
+    def flush():
+        if not cur_name:
+            return
+        entry = {"text": "\n".join(buf).strip(), "images": list(imgs)}
+        target = primary if cur_primary else secondary
+        if cur_name not in target or len(entry["text"]) > len(
+                target[cur_name]["text"]):
+            target[cur_name] = entry
+
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
-            m = line.strip()
-            if m.startswith("## `") and m.endswith("`"):
-                if name:
-                    sections[name] = "\n".join(buf).strip()
-                name = m[4:-1]
-                buf = []
-            elif m.startswith("## ") and name:
-                sections[name] = "\n".join(buf).strip()
-                name = None
-                buf = []
-            elif name is not None:
-                # 画像参照はダイアログで表示できないので除く
-                if not m.startswith("!["):
+            hm = _HEAD_RE.match(line)
+            if hm:
+                level, title = len(hm.group(1)), hm.group(2)
+                # 現在のセクションを終える (同じか浅いレベルの見出しで区切る)
+                if cur_name and level <= cur_level:
+                    flush()
+                    cur_name = cur_level = None
+                    cur_primary = False
+                    buf, imgs = [], []
+                m = re.fullmatch(r"`([A-Za-z_][A-Za-z0-9_]*)`", title)
+                if level == 2 and m:
+                    flush() if cur_name else None
+                    cur_name, cur_level, cur_primary = m.group(1), level, True
+                    buf, imgs = [], []
+                    continue
+                # 見出し文の末尾がメソッド名のもの (例: "… audio_render")
+                tok = re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", title)
+                cand = next((t for t in reversed(tok) if t in METHOD_SIGS), None)
+                if cand and cur_name is None:
+                    cur_name, cur_level, cur_primary = cand, level, False
+                    buf, imgs = [], []
+                    continue
+                if cur_name:
                     buf.append(line)
-        if name:
-            sections[name] = "\n".join(buf).strip()
+                continue
+            if cur_name is not None:
+                found = _IMG_RE.findall(line.strip())
+                if found:
+                    for rel in found:
+                        rel = rel.split(" ")[0].strip()
+                        fp = (root / rel).resolve()
+                        if fp.exists() and str(fp) not in imgs:
+                            imgs.append(str(fp))
+                else:
+                    buf.append(line)
+        flush()
     except Exception:
         pass
-    _README_CACHE[key] = sections
-    return sections
+    merged = dict(secondary)
+    merged.update(primary)          # 「## `名前`」形式を優先
+    _README_CACHE[key] = merged
+    return merged
 
 
 def readme_doc(method_name):
-    """README のメソッド説明 (markdown)。無ければ None。"""
+    """メソッド説明。{"text":…, "images":[…]} / 無ければ None。
+
+    現在言語の README を優先し、そちらに画像が無ければもう一方の
+    README の画像を補う (画像はどちらの版も同じものを指すため)。
+    """
+    result = None
     for path in _readme_paths():
-        doc = _parse_readme(path).get(method_name)
-        if doc:
-            return doc
-    return None
+        sec = _parse_readme(path).get(method_name)
+        if not sec:
+            continue
+        if result is None:
+            result = {"text": sec["text"], "images": list(sec["images"])}
+        elif not result["images"]:
+            result["images"] = list(sec["images"])
+    return result
 
 
 def method_params(name):
@@ -387,6 +753,10 @@ PARAM_NAME_DEFAULTS = {
     "target_z": 0, "target_frame": 0, "center_time": 100,
     "zdepth": 100, "v": 1.0, "xypoint": 0.5, "start": 0, "end": 300,
     "connection_num": 30,
+    # 拡張系
+    "key_array": [[0, 0], [300, 300]], "add_size": 960,
+    # サイクル/波形系の必須引数
+    "cycle_degree": 360, "start_center": 0.5, "end_center": 0.5,
 }
 
 
@@ -406,6 +776,108 @@ def fmt_value(v):
     if isinstance(v, np.ndarray):
         return repr(v.tolist())
     return repr(v)
+
+
+class DocDialog(QDialog):
+    """README のメソッド説明を、図・GIF アニメーション付きで表示する。
+
+    QTextEdit の markdown 表示は GIF を静止画としてしか扱えないため、
+    本文と図を分離し、図は QLabel + QMovie で再生する。
+    """
+
+    MAX_IMG_W = 620
+
+    def __init__(self, parent, title, subtitle, doc_text, images, where=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(700, 620)
+        self._movies = []          # QMovie の生存維持
+        v = QVBoxLayout(self)
+
+        head = QLabel(f"<b>{title}</b> <span style='color:#666;'>{subtitle}</span>"
+                      + (f"<br><span style='color:#999; font-size:10px;'>{where}</span>"
+                         if where else ""))
+        head.setWordWrap(True)
+        head.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(head)
+
+        inner = QWidget()
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(0, 0, 0, 0)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        try:
+            body.setMarkdown(doc_text)
+        except Exception:
+            body.setPlainText(doc_text)
+        body.setMinimumHeight(220)
+        il.addWidget(body)
+
+        for path in images or []:
+            cap = QLabel(os.path.basename(path))
+            cap.setStyleSheet("color:#999; font-size:10px; margin-top:6px;")
+            il.addWidget(cap)
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("background:#fff; border:1px solid #ddd;")
+            if path.lower().endswith(".gif"):
+                movie = QMovie(path)
+                if movie.isValid():
+                    native = QImageReader(path).size()
+                    if native.width() > self.MAX_IMG_W:
+                        sc = self.MAX_IMG_W / native.width()
+                        movie.setScaledSize(QSize(self.MAX_IMG_W,
+                                                  max(1, int(native.height() * sc))))
+                    lbl.setMovie(movie)
+                    movie.start()
+                    self._movies.append(movie)
+            else:
+                pm = QPixmap(path)
+                if not pm.isNull():
+                    if pm.width() > self.MAX_IMG_W:
+                        pm = pm.scaledToWidth(self.MAX_IMG_W, Qt.SmoothTransformation)
+                    lbl.setPixmap(pm)
+            il.addWidget(lbl)
+        il.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        v.addWidget(scroll, 1)
+
+        close = QPushButton("OK")
+        close.clicked.connect(self.accept)
+        v.addWidget(close, 0, Qt.AlignRight)
+
+    def closeEvent(self, ev):
+        for m in self._movies:
+            try:
+                m.stop()
+            except Exception:
+                pass
+        super().closeEvent(ev)
+
+
+def show_method_doc(parent, method_name):
+    """メソッドの説明ダイアログを開く (README 優先 → docstring)。"""
+    fn = getattr(drawManeuver, method_name, None)
+    try:
+        sig = str(inspect.signature(fn)).replace("self, ", "").replace("self", "")
+    except Exception:
+        sig = "()"
+    try:
+        where = (f"{os.path.basename(inspect.getfile(fn))}:"
+                 f"{inspect.getsourcelines(fn)[1]}")
+    except Exception:
+        where = ""
+    doc = readme_doc(method_name)
+    if doc:
+        text, images = doc["text"], doc["images"]
+    else:
+        text, images = (inspect.getdoc(fn) if fn else None) or tr("no_doc"), []
+    DocDialog(parent, method_name, sig, text, images, where).exec_()
 
 
 # ======== 引数エディタ ========
@@ -529,7 +1001,7 @@ class StepWidget(QFrame):
     duplicate_requested = pyqtSignal(object)
 
     CAT_COLOR = {"add": "#2a6fd6", "apply": "#c07000",
-                 "data": "#2a8f4f", "other": "#777777"}
+                 "data": "#2a8f4f", "expand": "#8e44ad", "other": "#777777"}
 
     def __init__(self, category, method_name, values=None, enabled=True):
         super().__init__()
@@ -558,6 +1030,15 @@ class StepWidget(QFrame):
         name.setStyleSheet(
             f"font-weight:bold; color:{self.CAT_COLOR.get(category, '#333')};")
         head.addWidget(name)
+        if method_name in EXPAND_METHODS:
+            badge = QLabel("⤢先" if method_name in EXPAND_FIRST else "⤢末")
+            badge.setToolTip(tr("expand_hint_first")
+                             if method_name in EXPAND_FIRST
+                             else tr("expand_hint_last"))
+            badge.setStyleSheet(
+                "color:#8e44ad; font-weight:bold; border:1px solid #8e44ad;"
+                " border-radius:3px; padding:0 3px; font-size:10px;")
+            head.addWidget(badge)
         head.addStretch()
         info_btn = QToolButton()
         info_btn.setText("ⓘ")
@@ -589,51 +1070,8 @@ class StepWidget(QFrame):
         v.addWidget(self.error_label)
 
     def _show_info(self):
-        """メソッドの説明をダイアログ表示する。
-
-        優先順: imgtrans リポジトリの README (現在言語 → もう一方) の
-        「## `メソッド名`」セクション → docstring → (説明なし)。
-        """
-        fn = getattr(drawManeuver, self.method_name, None)
-        try:
-            sig = str(inspect.signature(fn)).replace("self, ", "").replace("self", "")
-        except Exception:
-            sig = "()"
-        try:
-            srcfile = os.path.basename(inspect.getfile(fn))
-            line = inspect.getsourcelines(fn)[1]
-            where = f"{srcfile}:{line}"
-        except Exception:
-            where = ""
-
-        doc_md = readme_doc(self.method_name)
-        if doc_md is None:
-            doc_md = inspect.getdoc(fn) if fn else None
-        if not doc_md:
-            doc_md = tr("no_doc")
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(self.method_name)
-        dlg.resize(640, 480)
-        v = QVBoxLayout(dlg)
-        head = QLabel(f"<b>{self.method_name}</b><span style='color:#666;'>"
-                      f"{sig}</span>"
-                      + (f"<br><span style='color:#999; font-size:10px;'>"
-                         f"{where}</span>" if where else ""))
-        head.setWordWrap(True)
-        head.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        v.addWidget(head)
-        body = QTextEdit()
-        body.setReadOnly(True)
-        try:
-            body.setMarkdown(doc_md)
-        except Exception:
-            body.setPlainText(doc_md)
-        v.addWidget(body, 1)
-        close = QPushButton("OK")
-        close.clicked.connect(dlg.accept)
-        v.addWidget(close, 0, Qt.AlignRight)
-        dlg.exec_()
+        """メソッドの説明を README (図・GIF 込み) で表示する。"""
+        show_method_doc(self, self.method_name)
 
     def _set_border(self):
         on = self.enable_chk.isChecked() if hasattr(self, "enable_chk") else True
@@ -652,6 +1090,26 @@ class StepWidget(QFrame):
         return {"category": self.category, "method": self.method_name,
                 "kwargs": self.editor.values(),
                 "enabled": self.enable_chk.isChecked()}
+
+    def set_param(self, name, value):
+        """引数をプログラムから設定する (タイムライン連動で使用)。"""
+        entry = self.editor._widgets.get(name)
+        if entry is None:
+            return False
+        kind, w = entry
+        w.blockSignals(True)
+        try:
+            if kind == "bool":
+                w.setChecked(bool(value))
+            elif kind == "int":
+                w.setValue(int(value))
+            elif kind == "float":
+                w.setValue(float(value))
+            else:
+                w.setText("" if value is None else repr(value))
+        finally:
+            w.blockSignals(False)
+        return True
 
     def show_error(self, msg):
         self.error_label.setText(msg or "")
@@ -875,16 +1333,20 @@ class RenderWorker(QThread):
     done_signal = pyqtSignal(bool, str)
 
     def __init__(self, dm, specs, out_type=1, separate_num=None,
-                 audio_out=False, audio_mode="play", audio_voices=20,
-                 audio_only=False, video_path="", full_data=None):
+                 audio_out=False, audio_kwargs=None, audio_voices=20,
+                 audio_only=False, video_path="", full_data=None,
+                 imgtype=None):
         super().__init__()
         self.dm = dm
         self.specs = specs
         self.out_type = out_type
         self.separate_num = separate_num
         self.audio_out = audio_out
-        self.audio_mode = audio_mode
+        # audio_render / audio_video_out へそのまま渡す全パラメータ
+        self.audio_kwargs = dict(audio_kwargs or {})
+        self.audio_mode = self.audio_kwargs.get("mode", "play")
         self.audio_voices = max(2, int(audio_voices))
+        self.imgtype = imgtype     # out_type=0 (連番画像) のときの拡張子
         # 音声のみ再書き出し: チェーンが前回レンダリングと同一のとき、
         # 保存済みの映像 (video_path) に対して audio_video_out だけ実行する
         self.audio_only = audio_only
@@ -912,7 +1374,12 @@ class RenderWorker(QThread):
                 f"–{d[:, :, 1].max():.0f}")
 
             # 2) レンダリング
-            self.log_signal.emit("=== new_transprocess ===")
+            if self.imgtype:
+                self.dm.imgtype = self.imgtype
+            self.log_signal.emit(
+                f"=== new_transprocess (out_type={self.out_type}"
+                + (f", imgtype={self.imgtype}" if self.out_type == 0 else "")
+                + ") ===")
             self.dm.new_transprocess(separate_num=self.separate_num,
                                      out_type=self.out_type, del_data=False)
             path = getattr(self.dm, "out_videopath", "") or ""
@@ -924,10 +1391,9 @@ class RenderWorker(QThread):
             if self.audio_out and path and os.path.exists(path):
                 try:
                     self.log_signal.emit(
-                        f"=== audio_video_out (mode={self.audio_mode}, "
-                        f"voices={self.audio_voices}) ===")
+                        f"=== audio_video_out ({self._audio_desc()}) ===")
                     final = self.dm.audio_video_out(
-                        mode=self.audio_mode, thread_num=self.audio_voices)
+                        thread_num=self.audio_voices, **self.audio_kwargs)
                     if final and os.path.exists(final):
                         path = os.path.abspath(final)
                 except Exception as e:
@@ -943,6 +1409,14 @@ class RenderWorker(QThread):
                 plt.close("all")
             except Exception:
                 pass
+
+    def _audio_desc(self):
+        fx = [k.replace("depth_", "") for k, v in self.audio_kwargs.items()
+              if k.startswith("depth_") and v is True]
+        s = f"mode={self.audio_mode}, voices={self.audio_voices}"
+        if fx:
+            s += ", fx=" + "+".join(fx)
+        return s
 
     def _run_audio_only(self):
         """映像の再レンダリングを省略し、保存済み映像へ音声だけ書き出す。"""
@@ -962,11 +1436,10 @@ class RenderWorker(QThread):
                     return
             self.video_only_path = self.video_path
             self.log_signal.emit(
-                f"=== audio_video_out (mode={self.audio_mode}, "
-                f"voices={self.audio_voices}) ===")
+                f"=== audio_video_out ({self._audio_desc()}) ===")
             final = self.dm.audio_video_out(
                 videopath=self.video_path,
-                mode=self.audio_mode, thread_num=self.audio_voices)
+                thread_num=self.audio_voices, **self.audio_kwargs)
             if final and os.path.exists(final):
                 self.done_signal.emit(True, os.path.abspath(final))
             else:
@@ -1085,14 +1558,29 @@ class DrawBeautifulManeuverApp(QWidget):
             "QLabel { background:#111; border:1px solid #555; }")
         self.video_preview.setVisible(False)
         sg.addWidget(self.video_preview)
-        self.video_scrub = QSlider(Qt.Horizontal)
-        self.video_scrub.setRange(0, 1000)
-        self.video_scrub.valueChanged.connect(self._on_scrub)
-        self.video_scrub.setVisible(False)
-        sg.addWidget(self.video_scrub)
         self.video_dim_label = QLabel("")
         self.video_dim_label.setStyleSheet("color:gray; font-size:10px;")
         sg.addWidget(self.video_dim_label)
+
+        # 入力映像の時間軸 + 使用範囲バンド (Shape_of_time_flow からの移植)
+        self.timeline_label = self._trlabel("lbl_timeline")
+        self.timeline_label.setStyleSheet("font-size:11px;")
+        self.timeline_label.setVisible(False)
+        sg.addWidget(self.timeline_label)
+        self.timeline = ManeuverTimelineSlider()
+        self.timeline.playheadChanged.connect(self._on_scrub)
+        self.timeline.usedRangeSlid.connect(self._on_used_range_slid)
+        self.timeline.setVisible(False)
+        sg.addWidget(self.timeline)
+        self.timeline_readout = QLabel("")
+        self.timeline_readout.setStyleSheet("color:gray; font-size:10px;")
+        self.timeline_readout.setVisible(False)
+        sg.addWidget(self.timeline_readout)
+        self.timeline_hint = self._trlabel("timeline_hint")
+        self.timeline_hint.setStyleSheet("color:gray; font-size:10px;")
+        self.timeline_hint.setWordWrap(True)
+        self.timeline_hint.setVisible(False)
+        sg.addWidget(self.timeline_hint)
 
         self.slit_toggle = QCheckBox()
         self._reg(lambda: self.slit_toggle.setText(tr("chk_vertical")))
@@ -1259,24 +1747,10 @@ class DrawBeautifulManeuverApp(QWidget):
         actions.addWidget(self.export_btn)
         pg.addLayout(actions)
 
+        pg.addWidget(self._build_output_panel())
+        pg.addWidget(self._build_audio_panel())
+
         render_row = QHBoxLayout()
-        self.audio_chk = QCheckBox()
-        self._reg(lambda: self.audio_chk.setText(tr("chk_audio")))
-        render_row.addWidget(self.audio_chk)
-        self.audio_mode_combo = QComboBox()
-        self.audio_mode_combo.addItem(tr("audio_mode_play"), "play")
-        self.audio_mode_combo.addItem(tr("audio_mode_grain"), "grain")
-        self._reg(lambda: (
-            self.audio_mode_combo.setItemText(0, tr("audio_mode_play")),
-            self.audio_mode_combo.setItemText(1, tr("audio_mode_grain"))))
-        self.audio_mode_combo.setEnabled(False)
-        self.audio_chk.toggled.connect(self.audio_mode_combo.setEnabled)
-        render_row.addWidget(self.audio_mode_combo)
-        render_row.addWidget(self._trlabel("lbl_audio_voices"))
-        self.audio_voices_spin = QSpinBox()
-        self.audio_voices_spin.setRange(2, 64)
-        self.audio_voices_spin.setValue(20)
-        render_row.addWidget(self.audio_voices_spin)
         self.render_btn = QPushButton()
         self._reg(lambda: self.render_btn.setText(tr("btn_render")))
         self.render_btn.clicked.connect(self.start_render)
@@ -1333,6 +1807,319 @@ class DrawBeautifulManeuverApp(QWidget):
         v.addWidget(outer_split)
         self.setLayout(v)
 
+    # ---- 出力設定パネル ----
+    def _build_output_panel(self):
+        """出力形式 (動画コーデック / 連番画像) のアコーディオン。"""
+        acc = Accordion(tr("grp_output"))
+        self._reg(lambda a=acc: a.set_title(tr("grp_output")))
+
+        r1 = QHBoxLayout()
+        r1.addWidget(self._trlabel("lbl_out_kind"))
+        self.out_kind_combo = QComboBox()
+        self.out_kind_combo.addItem(tr("out_video"), "video")
+        self.out_kind_combo.addItem(tr("out_still"), "still")
+        self._reg(lambda: (self.out_kind_combo.setItemText(0, tr("out_video")),
+                           self.out_kind_combo.setItemText(1, tr("out_still"))))
+        self.out_kind_combo.currentIndexChanged.connect(self._on_out_kind)
+        r1.addWidget(self.out_kind_combo, 1)
+        acc.addLayout(r1)
+
+        self.out_type_row = QHBoxLayout()
+        self.out_type_row.addWidget(self._trlabel("lbl_out_type"))
+        self.out_type_combo = QComboBox()
+        for val, label, ext, note in OUT_TYPES:
+            self.out_type_combo.addItem(f"{label}  {ext}", val)
+            self.out_type_combo.setItemData(
+                self.out_type_combo.count() - 1, note, Qt.ToolTipRole)
+        self.out_type_row.addWidget(self.out_type_combo, 1)
+        acc.addLayout(self.out_type_row)
+
+        self.img_row = QHBoxLayout()
+        self.img_row.addWidget(self._trlabel("lbl_img_format"))
+        self.img_format_combo = QComboBox()
+        for ext, label in IMG_FORMATS:
+            self.img_format_combo.addItem(label, ext)
+        self.img_row.addWidget(self.img_format_combo, 1)
+        acc.addLayout(self.img_row)
+        self.img_hint = self._trlabel("hint_img_format")
+        self.img_hint.setStyleSheet("color:gray; font-size:10px;")
+        acc.addWidget(self.img_hint)
+
+        r3 = QHBoxLayout()
+        r3.addWidget(self._trlabel("lbl_separate"))
+        self.separate_spin = QSpinBox()
+        self.separate_spin.setRange(0, 999)
+        self.separate_spin.setValue(0)
+        r3.addWidget(self.separate_spin)
+        h = self._trlabel("hint_separate")
+        h.setStyleSheet("color:gray; font-size:10px;")
+        r3.addWidget(h)
+        r3.addStretch()
+        acc.addLayout(r3)
+
+        self._on_out_kind()
+        return acc
+
+    def _on_out_kind(self, *_):
+        """動画 / 連番画像 で表示する設定を切り替える。"""
+        still = self.out_kind_combo.currentData() == "still"
+        for i in range(self.out_type_row.count()):
+            w = self.out_type_row.itemAt(i).widget()
+            if w:
+                w.setVisible(not still)
+        for i in range(self.img_row.count()):
+            w = self.img_row.itemAt(i).widget()
+            if w:
+                w.setVisible(still)
+        self.img_hint.setVisible(still)
+
+    def selected_out_type(self):
+        if self.out_kind_combo.currentData() == "still":
+            return 0
+        return int(self.out_type_combo.currentData())
+
+    # ---- 音声設定パネル ----
+    def _build_audio_panel(self):
+        """audio_render の全パラメータを扱うアコーディオン。"""
+        acc = Accordion(tr("grp_audio"))
+        self._reg(lambda a=acc: a.set_title(tr("grp_audio")))
+
+        r0 = QHBoxLayout()
+        self.audio_chk = QCheckBox()
+        self._reg(lambda: self.audio_chk.setText(tr("chk_audio")))
+        self.audio_chk.toggled.connect(self._on_audio_toggled)
+        r0.addWidget(self.audio_chk)
+        self.audio_mode_combo = QComboBox()
+        self.audio_mode_combo.addItem(tr("audio_mode_play"), "play")
+        self.audio_mode_combo.addItem(tr("audio_mode_grain"), "grain")
+        self._reg(lambda: (
+            self.audio_mode_combo.setItemText(0, tr("audio_mode_play")),
+            self.audio_mode_combo.setItemText(1, tr("audio_mode_grain"))))
+        r0.addWidget(self.audio_mode_combo, 1)
+        info = QToolButton()
+        info.setText("ⓘ")
+        info.setAutoRaise(True)
+        self._reg(lambda b=info: b.setToolTip(tr("tip_info")))
+        info.clicked.connect(lambda: show_method_doc(self, AUDIO_PARAM_DOC))
+        r0.addWidget(info)
+        acc.addLayout(r0)
+
+        r1 = QHBoxLayout()
+        r1.addWidget(self._trlabel("lbl_audio_voices"))
+        self.audio_voices_spin = QSpinBox()
+        self.audio_voices_spin.setRange(2, 128)
+        self.audio_voices_spin.setValue(20)
+        r1.addWidget(self.audio_voices_spin)
+        r1.addWidget(self._trlabel("lbl_audio_gain"))
+        self.audio_gain_spin = QDoubleSpinBox()
+        self.audio_gain_spin.setRange(0.0, 8.0)
+        self.audio_gain_spin.setSingleStep(0.1)
+        self.audio_gain_spin.setValue(1.0)
+        r1.addWidget(self.audio_gain_spin)
+        self.audio_normalize_chk = QCheckBox()
+        self._reg(lambda: self.audio_normalize_chk.setText(
+            tr("chk_audio_normalize")))
+        self.audio_normalize_chk.setChecked(True)
+        r1.addWidget(self.audio_normalize_chk)
+        r1.addStretch()
+        acc.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.addWidget(self._trlabel("lbl_audio_smooth"))
+        self.audio_smooth_combo = QComboBox()
+        self.audio_smooth_combo.addItem("fourier", "fourier")
+        self.audio_smooth_combo.addItem("spline", "spline")
+        r2.addWidget(self.audio_smooth_combo)
+        r2.addWidget(self._trlabel("lbl_audio_harmonics"))
+        self.audio_harmonics_spin = QSpinBox()
+        self.audio_harmonics_spin.setRange(0, 4096)
+        self.audio_harmonics_spin.setValue(0)      # 0 = None (全成分)
+        self.audio_harmonics_spin.setSpecialValueText("all")
+        r2.addWidget(self.audio_harmonics_spin)
+        r2.addWidget(self._trlabel("lbl_audio_inpan"))
+        self.audio_inpan_combo = QComboBox()
+        for v in ("balance", "gain", "none"):
+            self.audio_inpan_combo.addItem(v, v)
+        r2.addWidget(self.audio_inpan_combo)
+        r2.addStretch()
+        acc.addLayout(r2)
+
+        r3 = QHBoxLayout()
+        r3.addWidget(self._trlabel("lbl_audio_grain"))
+        self.audio_grain_spin = QDoubleSpinBox()
+        self.audio_grain_spin.setRange(0.005, 1.0)
+        self.audio_grain_spin.setDecimals(3)
+        self.audio_grain_spin.setSingleStep(0.01)
+        self.audio_grain_spin.setValue(0.1)
+        r3.addWidget(self.audio_grain_spin)
+        r3.addWidget(self._trlabel("lbl_audio_jump"))
+        self.audio_jump_spin = QDoubleSpinBox()
+        self.audio_jump_spin.setRange(0.01, 5.0)
+        self.audio_jump_spin.setDecimals(3)
+        self.audio_jump_spin.setSingleStep(0.05)
+        self.audio_jump_spin.setValue(0.25)
+        r3.addWidget(self.audio_jump_spin)
+        r3.addStretch()
+        acc.addLayout(r3)
+
+        # --- now depth 駆動の変調 ---
+        fxg = self._trlabel("grp_audio_fx")
+        fxg.setStyleSheet("color:#555; font-size:10px; margin-top:4px;")
+        acc.addWidget(fxg)
+        f1 = QHBoxLayout()
+        self.fx_reverb_chk = QCheckBox()
+        self.fx_lpf_chk = QCheckBox()
+        self.fx_width_chk = QCheckBox()
+        self.fx_detune_chk = QCheckBox()
+        for c, key in ((self.fx_reverb_chk, "fx_reverb"),
+                       (self.fx_lpf_chk, "fx_lpf"),
+                       (self.fx_width_chk, "fx_width"),
+                       (self.fx_detune_chk, "fx_detune")):
+            self._reg(lambda cc=c, k=key: cc.setText(tr(k)))
+            f1.addWidget(c)
+        f1.addStretch()
+        acc.addLayout(f1)
+
+        # --- リバーブ: 広さと残響時間は別の軸として並べる ---
+        f2 = QHBoxLayout()
+        f2.addWidget(self._trlabel("lbl_reverb_wet"))
+        self.reverb_wet_spin = QDoubleSpinBox()
+        self.reverb_wet_spin.setRange(0.0, 1.0)
+        self.reverb_wet_spin.setSingleStep(0.05)
+        self.reverb_wet_spin.setValue(0.4)
+        f2.addWidget(self.reverb_wet_spin)
+        f2.addWidget(self._trlabel("lbl_reverb_time"))
+        self.reverb_time_spin = QDoubleSpinBox()
+        self.reverb_time_spin.setRange(0.1, 20.0)
+        self.reverb_time_spin.setSingleStep(0.1)
+        self.reverb_time_spin.setValue(2.5)
+        f2.addWidget(self.reverb_time_spin)
+        f2.addWidget(self._trlabel("lbl_reverb_predelay"))
+        self.reverb_predelay_spin = QDoubleSpinBox()
+        self.reverb_predelay_spin.setRange(0.0, 0.5)
+        self.reverb_predelay_spin.setDecimals(3)
+        self.reverb_predelay_spin.setSingleStep(0.005)
+        self.reverb_predelay_spin.setValue(0.048)
+        f2.addWidget(self.reverb_predelay_spin)
+        f2.addStretch()
+        acc.addLayout(f2)
+
+        # 空間の広さ: 感覚的に効くのでスライダーで
+        fr = QHBoxLayout()
+        lab_room = self._trlabel("lbl_reverb_room")
+        self._reg(lambda l=lab_room: l.setToolTip(tr("tip_reverb_room")))
+        fr.addWidget(lab_room)
+        self.reverb_room_slider = QSlider(Qt.Horizontal)
+        self.reverb_room_slider.setRange(20, 400)      # 0.20 .. 4.00
+        self.reverb_room_slider.setValue(100)          # 1.00
+        self._reg(lambda s=self.reverb_room_slider: s.setToolTip(
+            tr("tip_reverb_room")))
+        self.reverb_room_slider.valueChanged.connect(
+            lambda v: self.reverb_room_val.setText(f"{v / 100.0:.2f}×"))
+        fr.addWidget(self.reverb_room_slider, 1)
+        self.reverb_room_val = QLabel("1.00×")
+        self.reverb_room_val.setMinimumWidth(48)
+        fr.addWidget(self.reverb_room_val)
+        fr.addWidget(self._trlabel("lbl_reverb_duck"))
+        self.reverb_duck_spin = QDoubleSpinBox()
+        self.reverb_duck_spin.setRange(0.0, 1.0)
+        self.reverb_duck_spin.setSingleStep(0.05)
+        self.reverb_duck_spin.setValue(0.0)
+        fr.addWidget(self.reverb_duck_spin)
+        acc.addLayout(fr)
+        rh = self._trlabel("hint_reverb")
+        rh.setStyleSheet("color:gray; font-size:10px;")
+        rh.setWordWrap(True)
+        acc.addWidget(rh)
+
+        fd = QHBoxLayout()
+        fd.addWidget(self._trlabel("lbl_detune_cents"))
+        self.detune_cents_spin = QDoubleSpinBox()
+        self.detune_cents_spin.setRange(0.0, 200.0)
+        self.detune_cents_spin.setValue(18.0)
+        fd.addWidget(self.detune_cents_spin)
+        fd.addWidget(QLabel("LFO(Hz):"))
+        self.detune_rate_spin = QDoubleSpinBox()
+        self.detune_rate_spin.setRange(0.01, 10.0)
+        self.detune_rate_spin.setDecimals(2)
+        self.detune_rate_spin.setSingleStep(0.05)
+        self.detune_rate_spin.setValue(0.15)
+        fd.addWidget(self.detune_rate_spin)
+        fd.addStretch()
+        acc.addLayout(fd)
+
+        f3 = QHBoxLayout()
+        f3.addWidget(self._trlabel("lbl_lpf_range"))
+        self.lpf_hi_spin = QSpinBox()
+        self.lpf_hi_spin.setRange(100, 22000)
+        self.lpf_hi_spin.setValue(18000)
+        f3.addWidget(self.lpf_hi_spin)
+        self.lpf_lo_spin = QSpinBox()
+        self.lpf_lo_spin.setRange(20, 22000)
+        self.lpf_lo_spin.setValue(600)
+        f3.addWidget(self.lpf_lo_spin)
+        f3.addWidget(self._trlabel("lbl_width_range"))
+        self.width_lo_spin = QDoubleSpinBox()
+        self.width_lo_spin.setRange(0.0, 4.0)
+        self.width_lo_spin.setSingleStep(0.1)
+        self.width_lo_spin.setValue(1.0)
+        f3.addWidget(self.width_lo_spin)
+        self.width_hi_spin = QDoubleSpinBox()
+        self.width_hi_spin.setRange(0.0, 4.0)
+        self.width_hi_spin.setSingleStep(0.1)
+        self.width_hi_spin.setValue(1.8)
+        f3.addWidget(self.width_hi_spin)
+        f3.addStretch()
+        acc.addLayout(f3)
+
+        self._audio_widgets = [
+            self.audio_mode_combo, self.audio_voices_spin, self.audio_gain_spin,
+            self.audio_normalize_chk, self.audio_smooth_combo,
+            self.audio_harmonics_spin, self.audio_inpan_combo,
+            self.audio_grain_spin, self.audio_jump_spin,
+            self.fx_reverb_chk, self.fx_lpf_chk, self.fx_width_chk,
+            self.fx_detune_chk, self.reverb_wet_spin, self.reverb_time_spin,
+            self.reverb_predelay_spin, self.reverb_room_slider,
+            self.reverb_duck_spin, self.detune_cents_spin,
+            self.detune_rate_spin, self.lpf_hi_spin, self.lpf_lo_spin,
+            self.width_lo_spin, self.width_hi_spin,
+        ]
+        self._on_audio_toggled(False)
+        return acc
+
+    def _on_audio_toggled(self, on):
+        for w in getattr(self, "_audio_widgets", []):
+            w.setEnabled(bool(on))
+
+    def audio_kwargs(self):
+        """audio_render / audio_video_out へ渡す全パラメータ。"""
+        harm = self.audio_harmonics_spin.value()
+        return {
+            "mode": self.audio_mode_combo.currentData() or "play",
+            "smooth": self.audio_smooth_combo.currentData() or "fourier",
+            "n_harmonics": None if harm == 0 else harm,
+            "inpan_mode": self.audio_inpan_combo.currentData() or "balance",
+            "grain_dur": float(self.audio_grain_spin.value()),
+            "jump_thresh_sec": float(self.audio_jump_spin.value()),
+            "normalize": self.audio_normalize_chk.isChecked(),
+            "gain": float(self.audio_gain_spin.value()),
+            "depth_reverb": self.fx_reverb_chk.isChecked(),
+            "reverb_wet": float(self.reverb_wet_spin.value()),
+            "reverb_time": float(self.reverb_time_spin.value()),
+            "reverb_predelay": float(self.reverb_predelay_spin.value()),
+            "reverb_room_size": self.reverb_room_slider.value() / 100.0,
+            "reverb_dry_duck": float(self.reverb_duck_spin.value()),
+            "depth_lpf": self.fx_lpf_chk.isChecked(),
+            "lpf_range": (float(self.lpf_hi_spin.value()),
+                          float(self.lpf_lo_spin.value())),
+            "depth_width": self.fx_width_chk.isChecked(),
+            "width_range": (float(self.width_lo_spin.value()),
+                            float(self.width_hi_spin.value())),
+            "depth_detune": self.fx_detune_chk.isChecked(),
+            "detune_cents": float(self.detune_cents_spin.value()),
+            "detune_rate": float(self.detune_rate_spin.value()),
+        }
+
     # ---- 入力映像 ----
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1358,7 +2145,9 @@ class DrawBeautifulManeuverApp(QWidget):
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             self.video_preview.setVisible(False)
-            self.video_scrub.setVisible(False)
+            for wgt in (self.timeline_label, self.timeline,
+                        self.timeline_readout, self.timeline_hint):
+                wgt.setVisible(False)
             return
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1369,10 +2158,12 @@ class DrawBeautifulManeuverApp(QWidget):
         self.video_dim_label.setText(
             tr("vid_info", w=w, h=h, n=n, fps=fps, dur=n / max(1e-6, fps)))
         self.video_preview.setVisible(True)
-        self.video_scrub.setVisible(True)
-        self.video_scrub.blockSignals(True)
-        self.video_scrub.setValue(0)
-        self.video_scrub.blockSignals(False)
+        for wgt in (self.timeline_label, self.timeline,
+                    self.timeline_readout, self.timeline_hint):
+            wgt.setVisible(True)
+        self.timeline.set_used_range(None, None)
+        self.timeline.set_playhead(0.0)
+        self._update_timeline_readout()
         self._read_video_frame(0)
         self._present_video_frame()
 
@@ -1443,11 +2234,80 @@ class DrawBeautifulManeuverApp(QWidget):
                 p.drawLine(0, y, w, y)
         p.end()
 
-    def _on_scrub(self, val):
+    def _on_scrub(self, frac):
         if self._vid_info is None:
             return
-        self._read_video_frame(val / 1000.0 * max(0, self._vid_info[3] - 1))
+        self._read_video_frame(frac * max(0, self._vid_info[3] - 1))
         self._present_video_frame()
+        self._update_timeline_readout()
+
+    # ---- タイムライン (使用範囲バンド ⇄ zCenterArange) ----
+    def _update_timeline_band(self):
+        """軌道データが参照している入力時間範囲を緑バンドに反映する。
+
+        z 値はスリット本数に依存しないため、プロキシ計算の結果をそのまま使える。
+        """
+        if self._vid_info is None:
+            return
+        if not self._has_data():
+            self.timeline.set_used_range(None, None)
+            self._update_timeline_readout()
+            return
+        n = max(1, int(self.dm.count))
+        z = self.dm.data[:, :, 1]
+        # 入力範囲外 (負 / count 超過) もそのまま渡す → バー端に警告表示される
+        self.timeline.set_used_range(float(z.min()) / n, float(z.max()) / n)
+        self._update_timeline_readout()
+
+    def _update_timeline_readout(self):
+        if self._vid_info is None:
+            self.timeline_readout.setText("")
+            return
+        fps = self._vid_info[2]
+        n = self._vid_info[3]
+        used = self.timeline.used_range()
+        if used is None:
+            self.timeline_readout.setText(
+                f"(軌道データなし)   |   再生位置 "
+                f"{self.timeline.playhead() * n / max(1e-6, fps):.2f}s"
+                if LANG == "ja" else
+                f"(no trajectory)   |   playhead "
+                f"{self.timeline.playhead() * n / max(1e-6, fps):.2f}s")
+            return
+        sf, ef = int(round(used[0] * n)), int(round(used[1] * n))
+        txt = tr("timeline_readout",
+                 s=sf / max(1e-6, fps), e=ef / max(1e-6, fps),
+                 sf=sf, ef=ef, n=n,
+                 p=self.timeline.playhead() * n / max(1e-6, fps))
+        if sf < 0 or ef > n:
+            txt += "  ⚠ 範囲外" if LANG == "ja" else "  ⚠ out of range"
+        self.timeline_readout.setText(txt)
+
+    def _on_used_range_slid(self, s_frac, e_frac):
+        """緑バンドのスライド → チェーン末尾の zCenterArange を自動調整する。
+
+        zCenterArange(center_time_frame) は「軌道の z min/max の中央」を
+        指定フレームへ持っていくメソッドなので、バンドの中央フレームを
+        そのまま引数に入れれば操作と1対1で対応する。
+        末尾に zCenterArange が無ければ追加し、あれば値を更新する。
+        """
+        if self.dm is None or self._vid_info is None:
+            return
+        n = int(self.dm.count)
+        center = int(round((s_frac + e_frac) / 2.0 * n))
+        center = max(0, min(n, center))
+        self._update_timeline_readout()
+
+        last = self.steps[-1] if self.steps else None
+        if last is not None and last.method_name == "zCenterArange":
+            last.set_param("center_time_frame", center)
+            self.log(tr("zcenter_updated", f=center))
+            self._push_history()
+            self._request_rebuild()
+        else:
+            self.add_step("data", "zCenterArange",
+                          {"center_time_frame": center})
+            self.log(tr("zcenter_added", f=center))
 
     def _current_sd(self):
         if self.dm is not None:
@@ -1534,6 +2394,7 @@ class DrawBeautifulManeuverApp(QWidget):
             self._last_video_path = ""
             self._last_full_data = None
             self.rebuild_pipeline()
+            self._update_timeline_band()
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.log("[ERROR] " + str(e))
@@ -1562,10 +2423,17 @@ class DrawBeautifulManeuverApp(QWidget):
         w.move_requested.connect(self._move_step)
         w.remove_requested.connect(self._remove_step)
         w.duplicate_requested.connect(self._duplicate_step)
-        self.steps.append(w)
-        self.steps_box.insertWidget(len(self.steps), w)
+        # 先頭専用の拡張系 (新しいスキャン幅を定義する) は自動で先頭へ入れる
+        if method_name in EXPAND_FIRST:
+            self.steps.insert(0, w)
+            self.steps_box.insertWidget(1, w)      # index 0 は empty_label
+            pos = 1
+        else:
+            self.steps.append(w)
+            self.steps_box.insertWidget(len(self.steps), w)
+            pos = len(self.steps)
         self._renumber()
-        self.log(f"+ step {len(self.steps)}: {method_name}")
+        self.log(f"+ step {pos}: {method_name}")
         self._schedule_rebuild()
         return w
 
@@ -1698,12 +2566,26 @@ class DrawBeautifulManeuverApp(QWidget):
     def enabled_specs(self):
         return [w.spec() for w in self.steps if w.is_enabled_step()]
 
+    def _warn_expand_position(self):
+        """拡張系が置ける位置に無いステップへ注意書きを出す。
+
+        先頭専用 (新しいスキャン幅を定義する) は先頭以外だと必ず失敗し、
+        末尾専用 (既存データを広げる) は末尾以外だと後続が必ず失敗する。
+        """
+        enabled = [w for w in self.steps if w.is_enabled_step()]
+        for i, w in enumerate(enabled):
+            if w.method_name in EXPAND_FIRST and i != 0:
+                w.show_error(tr("expand_must_be_first"))
+            elif w.method_name in EXPAND_LAST and i != len(enabled) - 1:
+                w.show_error(tr("expand_must_be_last"))
+
     def rebuild_pipeline(self):
         """全ステップを再実行して dm.data を作り直し、プロットを更新する。"""
         if self.dm is None:
             return
         for w in self.steps:
             w.show_error("")
+        self._warn_expand_position()
         specs = self.enabled_specs()
         if not specs:
             self.dm.data = []
@@ -1713,6 +2595,7 @@ class DrawBeautifulManeuverApp(QWidget):
             self.data_info.setText("")
             self._set_dirty(False)
             self.zcheck_btn.setVisible(False)
+            self._update_timeline_band()
             self._update_gates()
             return
         self.plot_label.setText(tr("plot_building"))
@@ -1725,6 +2608,7 @@ class DrawBeautifulManeuverApp(QWidget):
             enabled_widgets = [w for w in self.steps if w.is_enabled_step()]
             if 0 <= err_i < len(enabled_widgets):
                 enabled_widgets[err_i].show_error(msg)
+            self._warn_expand_position()
             self.log(f"[ERROR] step {err_i + 1}: {msg}")
             self.plot_label.setText(tr("plot_error", e=msg))
             self.data_info.setText("")
@@ -1736,6 +2620,7 @@ class DrawBeautifulManeuverApp(QWidget):
         self._set_dirty(False)
         self._refresh_plot()
         self._refresh_zcheck_warning()
+        self._update_timeline_band()
         self._push_to_rt_preview()
         self._update_gates()
 
@@ -1825,11 +2710,18 @@ class DrawBeautifulManeuverApp(QWidget):
             plt.close("all")
 
     def _render_key(self, specs):
-        """映像レンダリング結果を左右する条件の指紋 (音声設定は含めない)。"""
+        """映像レンダリング結果を左右する条件の指紋 (音声設定は含めない)。
+
+        音声だけを変えた再書き出しでは映像を作り直さないため、
+        出力形式や分割数など映像に効く設定はすべてここに含める。
+        """
         return json.dumps({
             "video": self.videopath,
             "sd": bool(self.slit_toggle.isChecked()),
             "outfps": int(self.outfps_combo.currentData()),
+            "out_type": self.selected_out_type(),
+            "imgtype": self.img_format_combo.currentData(),
+            "separate": int(self.separate_spin.value()),
             "specs": specs,
         }, sort_keys=True, default=str)
 
@@ -1841,7 +2733,9 @@ class DrawBeautifulManeuverApp(QWidget):
         key = self._render_key(specs)
         # チェーンが前回レンダリングと同一 + 映像が残っている + 音声ON
         # → 映像の再レンダリングを省略して音声のみ書き出す
-        audio_only = (self.audio_chk.isChecked()
+        out_type = self.selected_out_type()
+        # 連番画像出力では音声を後付けできないので通常経路のみ
+        audio_only = (self.audio_chk.isChecked() and out_type != 0
                       and key == self._last_render_key
                       and bool(self._last_video_path)
                       and os.path.exists(self._last_video_path))
@@ -1850,10 +2744,15 @@ class DrawBeautifulManeuverApp(QWidget):
         self.render_btn.setEnabled(False)
         self.render_progress.setVisible(True)
         self.log(tr("rendering"))
+        sep = int(self.separate_spin.value())
         self._render_worker = RenderWorker(
             self.dm, specs,
-            audio_out=self.audio_chk.isChecked(),
-            audio_mode=self.audio_mode_combo.currentData() or "play",
+            out_type=out_type,
+            separate_num=sep if sep > 0 else None,
+            imgtype=(self.img_format_combo.currentData()
+                     if out_type == 0 else None),
+            audio_out=self.audio_chk.isChecked() and out_type != 0,
+            audio_kwargs=self.audio_kwargs(),
             audio_voices=self.audio_voices_spin.value(),
             audio_only=audio_only,
             video_path=self._last_video_path,
@@ -1912,14 +2811,22 @@ class DrawBeautifulManeuverApp(QWidget):
                 lines.append(f"{call}    # step {i + 1}")
             else:
                 lines.append(f"# [無効] {call}    # step {i + 1}")
-        lines += [
-            "",
-            "# ==== 検証 & 出力 ====",
-            "dm.zPointCheck()",
-            "dm.maneuver_2dplot()",
-            "dm.new_transprocess(out_type=1, del_data=False)",
-            "",
-        ]
+        out_type = self.selected_out_type()
+        sep = int(self.separate_spin.value())
+        sep_arg = f", separate_num={sep}" if sep > 0 else ""
+        lines += ["", "# ==== 検証 & 出力 ===="]
+        lines.append("dm.maneuver_2dplot()")
+        if out_type == 0:
+            lines.append(f"dm.imgtype = {self.img_format_combo.currentData()!r}")
+        lines.append(
+            f"dm.new_transprocess(out_type={out_type}{sep_arg}, del_data=False)")
+        if self.audio_chk.isChecked() and out_type != 0:
+            kw = self.audio_kwargs()
+            args = ", ".join(f"{k}={v!r}" for k, v in kw.items())
+            lines.append(
+                f"dm.audio_video_out(thread_num="
+                f"{int(self.audio_voices_spin.value())}, {args})")
+        lines.append("")
         return "\n".join(lines)
 
     def export_script(self):
