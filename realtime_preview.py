@@ -26,9 +26,10 @@ import cv2
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QDoubleSpinBox, QSpinBox, QSlider, QProgressBar, QSizePolicy,
-    QCheckBox, QComboBox,
+    QCheckBox, QComboBox, QLayout,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent, QObject
+from PyQt5.QtCore import (Qt, QTimer, pyqtSignal, QEvent, QObject,
+                          QSize, QRect, QPoint)
 from PyQt5.QtGui import QImage, QPixmap
 
 try:
@@ -1045,6 +1046,102 @@ class GridAudioPreview(QObject):
         self._io.write(data)
 
 
+class FlowLayout(QLayout):
+    """幅が足りないときだけ次の行へ折り返す横並びレイアウト。
+
+    設定行を QHBoxLayout で組むと、列が狭い画面では縮み切らずに
+    ウィジェット同士が重なって読めなくなる。折り返せば重ならない。
+    """
+
+    def __init__(self, parent=None, margin=0, spacing=6):
+        super().__init__(parent)
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+        self._items = []
+        self._space = spacing
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Horizontal)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._do_layout(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = eff.x(), eff.y(), 0
+        for it in self._items:
+            sz = it.sizeHint()
+            nx = x + sz.width() + self._space
+            if line_h > 0 and nx - self._space > eff.right() + 1:
+                x = eff.x()
+                y += line_h + self._space
+                nx = x + sz.width() + self._space
+                line_h = 0
+            if not test_only:
+                it.setGeometry(QRect(QPoint(x, y), sz))
+            x = nx
+            line_h = max(line_h, sz.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
+class FlowRow(QWidget):
+    """FlowLayout を1行分の入れ物として使うためのラッパー。"""
+
+    def __init__(self, spacing=6):
+        super().__init__()
+        self._flow = FlowLayout(self, 0, spacing)
+        pol = self.sizePolicy()
+        pol.setHeightForWidth(True)
+        pol.setVerticalPolicy(QSizePolicy.Minimum)
+        self.setSizePolicy(pol)
+
+    def addWidget(self, w):
+        self._flow.addWidget(w)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._flow.heightForWidth(w)
+
+    def sizeHint(self):
+        w = self.width() or 400
+        return QSize(self._flow.minimumSize().width(), self.heightForWidth(w))
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+
 class RealtimePreviewWidget(QWidget):
     """Tab3 に埋め込む GPU リアルタイム軸間変換プレビュー。"""
 
@@ -1142,7 +1239,8 @@ class RealtimePreviewWidget(QWidget):
         v = QVBoxLayout(self)
         self.view = QLabel(self._t("placeholder"))
         self.view.setAlignment(Qt.AlignCenter)
-        self.view.setMinimumSize(480, 200)
+        # 狭い列でも設定行を押し出さないよう、映像側が先に縮むようにする
+        self.view.setMinimumSize(240, 120)
         # sizeHint を無視させ「pixmap サイズ → レイアウト拡大 → 更に大きく描画」の
         # フィードバックループを断つ (縦長映像で画面が少しずつ伸びる問題の対策)。
         # 表示領域は固定で、縦長映像はサイドに黒みが入るレターボックス表示になる。
@@ -1197,8 +1295,8 @@ class RealtimePreviewWidget(QWidget):
         tl.addWidget(self.time_label)
         v.addLayout(tl)
 
-        # --- 設定行 ---
-        ctl = QHBoxLayout()
+        # --- 設定行 (狭い列では折り返す) ---
+        ctl = FlowRow()
         # 適用モードはタブ2の「適用方法」に自動追従 (ここでは表示のみ)
         self.mode_label = QLabel(self._t("mode_info", m=self.mode))
         self.mode_label.setStyleSheet("color: gray; font-size: 11px;")
@@ -1261,11 +1359,10 @@ class RealtimePreviewWidget(QWidget):
             self.audio_chk.setEnabled(False)
             self.audio_chk.setToolTip(self._t("audio_no_qt"))
 
-        ctl.addStretch()
-        v.addLayout(ctl)
+        v.addWidget(ctl)
 
         # --- 音響FX 行 (now depth 駆動の変調。書き出し時に適用) ---
-        fx = QHBoxLayout()
+        fx = FlowRow()
         self._audio_fx_label = QLabel(self._t("audio_fx"))
         self._audio_fx_label.setStyleSheet("color: gray; font-size: 11px;")
         self._audio_fx_label.setToolTip(self._t("tip_audio_fx"))
@@ -1279,8 +1376,7 @@ class RealtimePreviewWidget(QWidget):
             c.setToolTip(self._t("tip_audio_fx"))
             c.setEnabled(False)
             fx.addWidget(c)
-        fx.addStretch()
-        v.addLayout(fx)
+        v.addWidget(fx)
 
         self.status = QLabel("")
         self.status.setStyleSheet("color: gray; font-size: 11px;")

@@ -41,7 +41,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize
 from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor,
-                         QMovie, QImageReader)
+                         QMovie, QImageReader, QFont, QTextCursor,
+                         QTextCharFormat, QTextDocument)
 
 import numpy as np
 import cv2
@@ -330,6 +331,22 @@ class VideoRotateWorker(QThread):
         self.done_signal.emit(ok, self.out if ok else "")
 
 
+class FitScrollArea(QScrollArea):
+    """中身の高さを推奨値として申告するスクロール領域。
+
+    既定の QScrollArea は中身によらず小さな sizeHint を返すため、縦に
+    余裕のある画面でも最小高で表示されてしまう。高さが足りるときは
+    そのまま全部見せ、足りないときだけスクロールさせたい箇所で使う。
+    """
+
+    def sizeHint(self):
+        s = super().sizeHint()
+        w = self.widget()
+        if w is not None:
+            s.setHeight(w.sizeHint().height() + 2 * self.frameWidth())
+        return s
+
+
 class Accordion(QWidget):
     """クリックで開閉する折りたたみパネル。出力/音声設定をまとめるのに使う。"""
 
@@ -361,6 +378,11 @@ class Accordion(QWidget):
     def _on_toggle(self, on):
         self.button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
         self.body.setVisible(on)
+        # 開いた分の高さを最小値として固定する。これが無いと、縦が足りない
+        # ときに親レイアウトが中身を比例縮小して設定項目が見えなくなる
+        # (親側はスクロールで逃がす。_sync_settings_height を参照)
+        self.body.setMinimumHeight(self.body_layout.sizeHint().height()
+                                   if on else 0)
 
     def set_title(self, t):
         self.button.setText(t)
@@ -785,12 +807,21 @@ class DocDialog(QDialog):
     本文と図を分離し、図は QLabel + QMovie で再生する。
     """
 
-    MAX_IMG_W = 620
+    MAX_IMG_W = 900
 
     def __init__(self, parent, title, subtitle, doc_text, images, where=""):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(700, 620)
+        self.setSizeGripEnabled(True)
+        # 画面に対する割合で開く。既定が小さいと audio_render のような
+        # 長い説明が細長い窓に押し込まれて読めなくなる。
+        scr = QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr is not None else None
+        if avail is not None:
+            self.resize(min(1000, max(700, int(avail.width() * 0.62))),
+                        min(900, max(600, int(avail.height() * 0.85))))
+        else:
+            self.resize(1000, 800)
         self._movies = []          # QMovie の生存維持
         v = QVBoxLayout(self)
 
@@ -802,16 +833,25 @@ class DocDialog(QDialog):
         v.addWidget(head)
 
         inner = QWidget()
+        self._inner = inner
         il = QVBoxLayout(inner)
         il.setContentsMargins(0, 0, 0, 0)
 
-        body = QTextEdit()
-        body.setReadOnly(True)
+        # 本文は QLabel のリッチテキストで置く。QTextEdit だと内側に
+        # 独自スクロールを持ってしまい、長い説明が狭い枠に閉じ込められる。
+        # QLabel なら折り返し後の高さが自動で決まり、外側のスクロールに乗る。
+        src = QTextDocument()
         try:
-            body.setMarkdown(doc_text)
+            src.setMarkdown(doc_text)
         except Exception:
-            body.setPlainText(doc_text)
-        body.setMinimumHeight(220)
+            src.setPlainText(doc_text)
+        self._restyle(src)
+        body = QLabel(src.toHtml())
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setContentsMargins(2, 2, 2, 2)
+        self._body = body
         il.addWidget(body)
 
         for path in images or []:
@@ -846,10 +886,32 @@ class DocDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         v.addWidget(scroll, 1)
+        self._scroll = scroll
 
         close = QPushButton("OK")
         close.clicked.connect(self.accept)
         v.addWidget(close, 0, Qt.AlignRight)
+
+    # 見出しの文字サイズ (pt)。README は #### 以下も使うが、Qt の
+    # setMarkdown は h5/h6 を本文より小さく描くため読めなくなる。
+    # setDefaultStyleSheet は setMarkdown に効かないので直接補正する。
+    HEAD_PT = {1: 19.0, 2: 17.0, 3: 15.5, 4: 14.5, 5: 14.0, 6: 13.5}
+    BODY_PT = 12.5
+
+    def _restyle(self, doc):
+        cur = QTextCursor(doc)
+        blk = doc.begin()
+        while blk.isValid():
+            lvl = blk.blockFormat().headingLevel()
+            fmt = QTextCharFormat()
+            fmt.setFontPointSize(self.HEAD_PT.get(lvl, self.BODY_PT))
+            if lvl:
+                fmt.setFontWeight(QFont.Bold)
+            cur.setPosition(blk.position())
+            cur.setPosition(blk.position() + max(0, blk.length() - 1),
+                            QTextCursor.KeepAnchor)
+            cur.mergeCharFormat(fmt)
+            blk = blk.next()
 
     def closeEvent(self, ev):
         for m in self._movies:
@@ -1714,7 +1776,8 @@ class DrawBeautifulManeuverApp(QWidget):
 
         self.plot_label = QLabel(tr("plot_waiting"))
         self.plot_label.setAlignment(Qt.AlignCenter)
-        self.plot_label.setMinimumSize(360, 260)
+        # 縦が足りないときは設定パネルより先にプロットが縮むようにする
+        self.plot_label.setMinimumSize(360, 180)
         self.plot_label.setStyleSheet(
             "QLabel { background:#ffffff; border:1px solid #555; color:#888; }")
         self._i18n.append(lambda: (None if self.plot_label.pixmap()
@@ -1747,8 +1810,27 @@ class DrawBeautifulManeuverApp(QWidget):
         actions.addWidget(self.export_btn)
         pg.addLayout(actions)
 
-        pg.addWidget(self._build_output_panel())
-        pg.addWidget(self._build_audio_panel())
+        # --- 出力設定 / 音声設定 ---
+        # 縦が足りないときは中身を潰さずスクロールさせる。低い画面でも
+        # 全項目に手が届くようにするため (レンダリングボタンは外に置く)。
+        self.settings_host = QWidget()
+        sh = QVBoxLayout(self.settings_host)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.setSpacing(4)
+        sh.addWidget(self._build_output_panel())
+        sh.addWidget(self._build_audio_panel())
+        sh.addStretch()
+        self.settings_scroll = FitScrollArea()
+        self.settings_scroll.setWidget(self.settings_host)
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.settings_scroll.setSizePolicy(QSizePolicy.Preferred,
+                                           QSizePolicy.Maximum)
+        for acc in (self.settings_host.findChildren(Accordion)):
+            acc.button.toggled.connect(lambda *_: self._sync_settings_height())
+        pg.addWidget(self.settings_scroll)
+        self._sync_settings_height()
 
         render_row = QHBoxLayout()
         self.render_btn = QPushButton()
@@ -1778,10 +1860,19 @@ class DrawBeautifulManeuverApp(QWidget):
         left = QWidget(); ll = QVBoxLayout(left); ll.addWidget(setup)
         cols.addWidget(left)
         cols.addWidget(chain_group)
-        right = QWidget(); rl = QVBoxLayout(right)
-        rl.addWidget(plot_group, 3)
+        # プロット/設定 と GPU プレビューの配分は可動にする。固定比だと
+        # 画面が低いときに設定パネル側が必要な高さを貰えず潰れてしまう。
         if self.rt_group is not None:
-            rl.addWidget(self.rt_group, 4)
+            right = QSplitter(Qt.Vertical)
+            right.addWidget(plot_group)
+            right.addWidget(self.rt_group)
+            right.setStretchFactor(0, 3)
+            right.setStretchFactor(1, 4)
+            self._right_split = right
+        else:
+            right = QWidget(); rl = QVBoxLayout(right)
+            rl.addWidget(plot_group)
+            self._right_split = None
         cols.addWidget(right)
         cols.setStretchFactor(0, 2)
         cols.setStretchFactor(1, 3)
@@ -1806,6 +1897,38 @@ class DrawBeautifulManeuverApp(QWidget):
         v.setContentsMargins(6, 6, 6, 6)
         v.addWidget(outer_split)
         self.setLayout(v)
+
+    def _sync_settings_height(self):
+        """設定スクロール領域の高さを中身に合わせる。
+
+        中身が収まるときはスクロールバーを出さずそのまま表示し、
+        画面が低いときだけスクロールに切り替わるようにする。
+        """
+        need = self.settings_host.sizeHint().height()
+        self.settings_scroll.setMaximumHeight(need)
+        # 低い画面ではここまで縮み、中身はスクロールで辿れる
+        self.settings_scroll.setMinimumHeight(min(need, 120))
+        self.settings_scroll.updateGeometry()
+        self._grow_settings_pane(need)
+
+    def _grow_settings_pane(self, need):
+        """アコーディオンを開いた分の高さを GPU プレビュー側から回してくる。
+
+        右列は可動スプリッタなので、開いたときに自動で配分を寄せておかないと
+        既定の比率のままスクロール表示になり、設定項目が見えにくい。
+        GPU プレビューの最小高は割らない (割る分はスクロールで辿れる)。
+        """
+        sp = getattr(self, "_right_split", None)
+        if sp is None or self.rt_group is None:
+            return
+        sizes = sp.sizes()
+        if len(sizes) != 2:
+            return
+        short = need - self.settings_scroll.height()
+        spare = sizes[1] - self.rt_group.minimumSizeHint().height()
+        move = max(0, min(short, spare))
+        if move:
+            sp.setSizes([sizes[0] + move, sizes[1] - move])
 
     # ---- 出力設定パネル ----
     def _build_output_panel(self):
@@ -1877,6 +2000,20 @@ class DrawBeautifulManeuverApp(QWidget):
         if self.out_kind_combo.currentData() == "still":
             return 0
         return int(self.out_type_combo.currentData())
+
+    @staticmethod
+    def _fx_box(layouts, *widgets):
+        """FX の詳細行をまとめて表示/非表示できる入れ物にする。"""
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        for lay in layouts:
+            lay.setContentsMargins(0, 0, 0, 0)
+            v.addLayout(lay)
+        for w in widgets:
+            v.addWidget(w)
+        return box
 
     # ---- 音声設定パネル ----
     def _build_audio_panel(self):
@@ -2002,7 +2139,6 @@ class DrawBeautifulManeuverApp(QWidget):
         self.reverb_predelay_spin.setValue(0.048)
         f2.addWidget(self.reverb_predelay_spin)
         f2.addStretch()
-        acc.addLayout(f2)
 
         # 空間の広さ: 感覚的に効くのでスライダーで
         fr = QHBoxLayout()
@@ -2026,11 +2162,11 @@ class DrawBeautifulManeuverApp(QWidget):
         self.reverb_duck_spin.setSingleStep(0.05)
         self.reverb_duck_spin.setValue(0.0)
         fr.addWidget(self.reverb_duck_spin)
-        acc.addLayout(fr)
         rh = self._trlabel("hint_reverb")
         rh.setStyleSheet("color:gray; font-size:10px;")
         rh.setWordWrap(True)
-        acc.addWidget(rh)
+        self.reverb_box = self._fx_box([f2, fr], rh)
+        acc.addWidget(self.reverb_box)
 
         fd = QHBoxLayout()
         fd.addWidget(self._trlabel("lbl_detune_cents"))
@@ -2046,31 +2182,48 @@ class DrawBeautifulManeuverApp(QWidget):
         self.detune_rate_spin.setValue(0.15)
         fd.addWidget(self.detune_rate_spin)
         fd.addStretch()
-        acc.addLayout(fd)
+        self.detune_box = self._fx_box([fd])
+        acc.addWidget(self.detune_box)
 
-        f3 = QHBoxLayout()
-        f3.addWidget(self._trlabel("lbl_lpf_range"))
+        fl = QHBoxLayout()
+        fl.addWidget(self._trlabel("lbl_lpf_range"))
         self.lpf_hi_spin = QSpinBox()
         self.lpf_hi_spin.setRange(100, 22000)
         self.lpf_hi_spin.setValue(18000)
-        f3.addWidget(self.lpf_hi_spin)
+        fl.addWidget(self.lpf_hi_spin)
         self.lpf_lo_spin = QSpinBox()
         self.lpf_lo_spin.setRange(20, 22000)
         self.lpf_lo_spin.setValue(600)
-        f3.addWidget(self.lpf_lo_spin)
-        f3.addWidget(self._trlabel("lbl_width_range"))
+        fl.addWidget(self.lpf_lo_spin)
+        fl.addStretch()
+        self.lpf_box = self._fx_box([fl])
+        acc.addWidget(self.lpf_box)
+
+        fw = QHBoxLayout()
+        fw.addWidget(self._trlabel("lbl_width_range"))
         self.width_lo_spin = QDoubleSpinBox()
         self.width_lo_spin.setRange(0.0, 4.0)
         self.width_lo_spin.setSingleStep(0.1)
         self.width_lo_spin.setValue(1.0)
-        f3.addWidget(self.width_lo_spin)
+        fw.addWidget(self.width_lo_spin)
         self.width_hi_spin = QDoubleSpinBox()
         self.width_hi_spin.setRange(0.0, 4.0)
         self.width_hi_spin.setSingleStep(0.1)
         self.width_hi_spin.setValue(1.8)
-        f3.addWidget(self.width_hi_spin)
-        f3.addStretch()
-        acc.addLayout(f3)
+        fw.addWidget(self.width_hi_spin)
+        fw.addStretch()
+        self.width_box = self._fx_box([fw])
+        acc.addWidget(self.width_box)
+
+        # 各 FX の詳細は、そのチェックが入っているときだけ出す。
+        # 常時出していると音声パネルが縦に長くなりすぎるため。
+        for chk, box in ((self.fx_reverb_chk, self.reverb_box),
+                         (self.fx_detune_chk, self.detune_box),
+                         (self.fx_lpf_chk, self.lpf_box),
+                         (self.fx_width_chk, self.width_box)):
+            box.setVisible(chk.isChecked())
+            chk.toggled.connect(box.setVisible)
+            chk.toggled.connect(lambda *_: self._sync_settings_height())
 
         self._audio_widgets = [
             self.audio_mode_combo, self.audio_voices_spin, self.audio_gain_spin,
