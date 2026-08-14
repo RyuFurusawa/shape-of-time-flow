@@ -28,6 +28,7 @@ import copy
 import time
 import json
 import shutil
+import glob
 import inspect
 import subprocess
 import traceback
@@ -39,10 +40,10 @@ from PyQt5.QtWidgets import (
     QFrame, QGroupBox, QScrollArea, QSplitter, QProgressBar, QSizePolicy,
     QSlider, QLineEdit, QFileDialog, QToolButton, QDialog,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize, QUrl
 from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor,
                          QMovie, QImageReader, QFont, QTextCursor,
-                         QTextCharFormat, QTextDocument)
+                         QTextCharFormat, QTextDocument, QDesktopServices)
 
 import numpy as np
 import cv2
@@ -135,7 +136,27 @@ TR = {
     "btn_render": {"ja": "レンダリング開始 / Start Rendering", "en": "Start Rendering"},
     "btn_export": {"ja": "実行用 .py を書き出し", "en": "Export .py"},
     "btn_zcheck": {"ja": "zPointCheck を実行", "en": "Run zPointCheck"},
+    "btn_open_workdir": {"ja": "作業フォルダを開く 📁",
+                          "en": "Open working folder 📁"},
+    "tip_open_workdir": {
+        "ja": "初期化時に作られた作業ディレクトリを Finder で開く\n(レンダリング結果や書き出した .py もここに入る)",
+        "en": "Reveal the working directory created at initialization\n(renders and exported .py land here)"},
     "btn_full2d": {"ja": "詳細 2D プロット (PNG)", "en": "Full 2D plot (PNG)"},
+    "btn_full3d": {"ja": "3D プロットアニメーション (MP4)",
+                    "en": "3D plot animation (MP4)"},
+    "plot3d_running": {"ja": "3D プロットを作成中… (時間がかかります)",
+                        "en": "Building the 3D plot… (this takes a while)"},
+    "plot3d_done": {"ja": "3D プロットを出力しました: {p}",
+                     "en": "3D plot written: {p}"},
+    "plot3d_fail": {"ja": "3D プロットの出力に失敗しました",
+                     "en": "Failed to write the 3D plot"},
+    "plot3d_still": {"ja": "3D プロット (1 フレーム) を作成中…",
+                      "en": "Building the 3D plot (single frame)…"},
+    "plot_single_note": {
+        "ja": "1 フレームのみのデータです。2D プロットは意味を持たないため "
+              "3D プロットを表示しています。",
+        "en": "Single-frame data. The 2D plot is meaningless here, "
+              "so the 3D plot is shown instead."},
     "lbl_log": {"ja": "Log:", "en": "Log:"},
     "need_init": {"ja": "先に動画を選択して「初期化」してください。",
                    "en": "Select a video and press Initialize first."},
@@ -146,6 +167,35 @@ TR = {
                      "en": "Export failed: {p} ({e})"},
     "rendering": {"ja": "レンダリング中…", "en": "Rendering…"},
     "render_done": {"ja": "レンダリング完了: {p}", "en": "Rendering done: {p}"},
+    "render_no_output": {
+        "ja": "[ERROR] 出力ファイルが作成されませんでした。"
+              "time に負の値/範囲超過が残っていないか (zPointCheck) を確認してください。",
+        "en": "[ERROR] No output file was produced. "
+              "Check for negative/out-of-range time (zPointCheck)."},
+    "btn_save_preview": {"ja": "プレビューを簡易保存 ⤓",
+                          "en": "Quick-save preview ⤓"},
+    "tip_save_preview": {
+        "ja": "GPU プレビューの見た目そのままを、作業ディレクトリへ\n"
+              "確認用の動画として書き出す (プレビュー解像度・音声なし)",
+        "en": "Save the GPU preview as-is to the working directory\n"
+              "as a check video (preview resolution, no audio)"},
+    "save_preview_running": {"ja": "プレビューを書き出し中… {i}/{n}",
+                              "en": "Saving preview… {i}/{n}"},
+    "save_preview_done": {"ja": "プレビューを保存しました: {p}",
+                           "en": "Preview saved: {p}"},
+    "save_preview_fail": {"ja": "プレビューの保存に失敗しました",
+                           "en": "Failed to save the preview"},
+    "save_preview_need": {
+        "ja": "先に GPU プレビューを構築してください",
+        "en": "Build the GPU preview first"},
+    "btn_open_output": {"ja": "書き出した動画を再生 ▶",
+                         "en": "Play rendered video ▶"},
+    "btn_open_output_dir": {"ja": "書き出したフォルダを開く 📁",
+                             "en": "Open output folder 📁"},
+    "open_output": {"ja": "既定のプレーヤーで開きます: {p}",
+                     "en": "Opening with the default player: {p}"},
+    "open_output_gone": {"ja": "書き出したファイルが見つかりません: {p}",
+                          "en": "Rendered file not found: {p}"},
     "render_failed": {"ja": "レンダリングに失敗しました (ログ参照)",
                        "en": "Rendering failed (see log)"},
     "param_required": {"ja": "必須", "en": "required"},
@@ -295,6 +345,47 @@ def apply_rotation_cv2(frame, rot_id):
 def rotated_video_path(src, rot_id):
     p = Path(src)
     return str(p.with_name(f"{p.stem}_rot-{rot_id}{p.suffix}"))
+
+
+def _newest_plot_output(work_dir, since, exts=(".mp4", ".png")):
+    """maneuver_3dplot / 2dplot が書いた最新の出力ファイルを探す。"""
+    found = []
+    for ext in exts:
+        for f in glob.glob(os.path.join(work_dir, "**", "*" + ext),
+                           recursive=True):
+            try:
+                if os.path.getmtime(f) >= since and "3dPlot" in os.path.basename(f):
+                    found.append(f)
+            except OSError:
+                pass
+    return max(found, key=os.path.getmtime) if found else ""
+
+
+class Plot3DWorker(QThread):
+    """maneuver_3dplot をバックグラウンドで走らせる (数十秒かかるため)。"""
+    log_signal = pyqtSignal(str)
+    done_signal = pyqtSignal(bool, str)
+
+    def __init__(self, dm, work_dir, **kwargs):
+        super().__init__()
+        self.dm, self.work_dir, self.kwargs = dm, work_dir, kwargs
+
+    def run(self):
+        since = time.time() - 1
+        try:
+            self.dm.maneuver_3dplot(**self.kwargs)
+        except Exception as e:
+            self.log_signal.emit("[ERROR] maneuver_3dplot: " + "".join(
+                traceback.format_exception_only(type(e), e)).strip())
+            self.done_signal.emit(False, "")
+            return
+        finally:
+            try:
+                plt.close("all")
+            except Exception:
+                pass
+        out = _newest_plot_output(self.work_dir, since)
+        self.done_signal.emit(bool(out), os.path.abspath(out) if out else "")
 
 
 class VideoRotateWorker(QThread):
@@ -1452,6 +1543,13 @@ class RenderWorker(QThread):
             if path and not os.path.isabs(path):
                 path = os.path.abspath(path)
             self.video_only_path = path if os.path.exists(path) else ""
+            # 動画出力なのにファイルが出来ていないなら失敗として扱う。
+            # new_transprocess は z<0 などを内部で握り潰して戻るため、
+            # ここで検知しないと「完了」と報告してしまう。
+            if self.out_type != 0 and not self.video_only_path:
+                self.log_signal.emit(tr("render_no_output"))
+                self.done_signal.emit(False, "")
+                return
 
             # 3) 音声 (プレビュー設定と同じく audio_video_out へ)
             if self.audio_out and path and os.path.exists(path):
@@ -1533,6 +1631,10 @@ class DrawManeuverGUI(QWidget):
         self.videopath = None
         self.videopath_src = None
         self._work_dir = os.getcwd()
+        self._status_active = False  # 進捗行を書き換え中か
+        self._plot3d_worker = None   # 3D プロット書き出しスレッド
+        self._output_path = ""      # 直近の書き出し先
+        self._output_is_dir = False
         self.dm = None
         self.steps = []                 # StepWidget のリスト
         self.runner = PipelineRunner()
@@ -1689,6 +1791,17 @@ class DrawManeuverGUI(QWidget):
         self.init_btn.clicked.connect(self.initialize_dm)
         self.init_btn.setEnabled(False)
         sg.addWidget(self.init_btn)
+        # 初期化で作られた作業ディレクトリを Finder で開くリンク
+        self.workdir_btn = QPushButton()
+        self._reg(lambda: (self.workdir_btn.setText(tr("btn_open_workdir")),
+                           self.workdir_btn.setToolTip(tr("tip_open_workdir"))))
+        self.workdir_btn.setStyleSheet(
+            "QPushButton { border:none; color:#2a6ebb; text-align:left;"
+            " padding:2px 0; }"
+            "QPushButton:hover { text-decoration:underline; }")
+        self.workdir_btn.clicked.connect(self.open_work_dir)
+        self.workdir_btn.setVisible(False)
+        sg.addWidget(self.workdir_btn)
         self.info_label = QLabel(tr("video_not_init"))
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("color:gray; font-size:10px;")
@@ -1819,6 +1932,12 @@ class DrawManeuverGUI(QWidget):
         self._reg(lambda: self.full2d_btn.setText(tr("btn_full2d")))
         self.full2d_btn.clicked.connect(self.run_full_2dplot)
         actions.addWidget(self.full2d_btn)
+        # 3D プロットアニメーション: フレームが複数あるときだけ出す
+        self.full3d_btn = QPushButton()
+        self._reg(lambda: self.full3d_btn.setText(tr("btn_full3d")))
+        self.full3d_btn.clicked.connect(self.run_full_3dplot)
+        self.full3d_btn.setVisible(False)
+        actions.addWidget(self.full3d_btn)
         self.export_btn = QPushButton()
         self._reg(lambda: self.export_btn.setText(tr("btn_export")))
         self.export_btn.clicked.connect(self.export_script)
@@ -1857,6 +1976,30 @@ class DrawManeuverGUI(QWidget):
         self.render_progress.setVisible(False)
         render_row.addWidget(self.render_progress, 1)
         pg.addLayout(render_row)
+
+        # 書き出したものを既定のアプリで開くボタン。
+        # レンダリングが成功したときだけ出す。
+        self.open_output_btn = QPushButton()
+        self._reg(lambda: self.open_output_btn.setText(
+            tr("btn_open_output_dir") if self._output_is_dir
+            else tr("btn_open_output")))
+        self.open_output_btn.setStyleSheet(
+            "QPushButton { background:#e8f4ea; color:#1f5c33;"
+            " border:1px solid #a9cfb5; border-radius:4px; padding:5px; }"
+            "QPushButton:hover { background:#d5ebdb; }")
+        self.open_output_btn.clicked.connect(self.open_rendered_output)
+        self.open_output_btn.setVisible(False)
+
+        # GPU プレビューの見た目をそのまま作業ディレクトリへ簡易保存する
+        self.save_preview_btn = QPushButton()
+        self._reg(lambda: (self.save_preview_btn.setText(tr("btn_save_preview")),
+                           self.save_preview_btn.setToolTip(tr("tip_save_preview"))))
+        self.save_preview_btn.clicked.connect(self.save_preview_video)
+
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.save_preview_btn, 1)
+        out_row.addWidget(self.open_output_btn, 1)
+        pg.addLayout(out_row)
 
         # --- GPU プレビュー ---
         if _HAS_RT_PREVIEW:
@@ -2552,6 +2695,8 @@ class DrawManeuverGUI(QWidget):
             self.info_label.setText(info)
             self.log(info)
             self._work_dir = os.getcwd()   # 実行用 .py の書き出し先
+            self.workdir_btn.setToolTip(self._work_dir)
+            self.workdir_btn.setVisible(True)
             self.log(f"作業ディレクトリ: {self._work_dir}")
             if self.rt_preview is not None:
                 self.rt_preview.set_video(self.videopath)
@@ -2761,6 +2906,8 @@ class DrawManeuverGUI(QWidget):
             self.runner.invalidate()
             self.plot_label.setPixmap(QPixmap())
             self.plot_label.setText(tr("plot_waiting"))
+            self.full2d_btn.setVisible(True)
+            self.full3d_btn.setVisible(False)
             self._set_data_info("")
             self._set_dirty(False)
             self.zcheck_btn.setVisible(False)
@@ -2806,11 +2953,29 @@ class DrawManeuverGUI(QWidget):
             factor = (real - 1) / max(1, proxy - 1)
             disp = data.copy()
             disp[:, :, 0] *= factor
+        # 1 フレームしか無いデータ (addSlicePlane など) では 2D プロットが
+        # 意味を持たない。代わりに 3D プロットを 1 枚だけ描いて見せる。
+        single = int(data.shape[0]) <= 1
+        self.full2d_btn.setVisible(not single)
+        self.full3d_btn.setVisible(not single)
+        if single:
+            pm = self._render_3d_still()
+            if pm is not None:
+                self.plot_label.setPixmap(pm)
+            else:
+                self.plot_label.setPixmap(QPixmap())
+                self.plot_label.setText(tr("plot3d_fail"))
+            self._finish_data_info(data, disp, factor, real,
+                                   note=tr("plot_single_note"))
+            return
         pm = render_maneuver_plot(
             disp, float(self.dm.outfps), float(self.dm.recfps),
             max(320, self.plot_label.width()), max(240, self.plot_label.height()))
         if pm is not None:
             self.plot_label.setPixmap(pm)
+        self._finish_data_info(data, disp, factor, real)
+
+    def _finish_data_info(self, data, disp, factor, real, note=""):
         # 表示するのは「書き出される data の形状」。プレビューは間引いた
         # 本数で計算しているので、そのままだと slits が実際と食い違う。
         out_slits = real if factor != 1.0 else int(data.shape[1])
@@ -2820,7 +2985,56 @@ class DrawManeuverGUI(QWidget):
             smin=float(disp[:, :, 0].min()), smax=float(disp[:, :, 0].max()))
         if factor != 1.0:
             info += tr("proxy_note", p=int(data.shape[1]), r=real)
+        if note:
+            info += "\n" + note
         self._set_data_info(info)
+
+    def _render_3d_still(self):
+        """1 フレームぶんの 3D プロットを描いて QPixmap で返す。"""
+        self.plot_label.setText(tr("plot3d_still"))
+        QApplication.processEvents()
+        since = time.time() - 1
+        try:
+            self.dm.maneuver_3dplot(out_framenums=1, out_fps=1, dpi=90)
+        except Exception as e:
+            self.log("[ERROR] maneuver_3dplot: " + str(e))
+            return None
+        finally:
+            plt.close("all")
+        out = _newest_plot_output(self._work_dir, since, exts=(".png",))
+        if not out:
+            return None
+        pm = QPixmap(out)
+        if pm.isNull():
+            return None
+        return pm.scaled(max(320, self.plot_label.width()),
+                         max(240, self.plot_label.height()),
+                         Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def run_full_3dplot(self):
+        """3D プロットのアニメーションを書き出す (別スレッド)。"""
+        if not self._has_data() or self._plot3d_worker is not None:
+            return
+        self.full3d_btn.setEnabled(False)
+        self.render_progress.setVisible(True)
+        self.log(tr("plot3d_running"))
+        self._plot3d_worker = Plot3DWorker(
+            self.dm, self._work_dir,
+            out_framenums=int(min(120, max(24, self.dm.data.shape[0]))),
+            out_fps=int(self.dm.outfps or 25), dpi=150)
+        self._plot3d_worker.log_signal.connect(self.log)
+        self._plot3d_worker.done_signal.connect(self._on_plot3d_done)
+        self._plot3d_worker.start()
+
+    def _on_plot3d_done(self, ok, path):
+        self._plot3d_worker = None
+        self.render_progress.setVisible(False)
+        self.full3d_btn.setEnabled(True)
+        if ok:
+            self.log(tr("plot3d_done", p=path))
+            self._set_output_target(path)
+        else:
+            self.log(tr("plot3d_fail"))
 
     def _set_data_info(self, text):
         """出力データ形状の表示を更新する (空なら枠ごと隠す)。"""
@@ -2849,7 +3063,8 @@ class DrawManeuverGUI(QWidget):
 
     def _update_gates(self):
         ok = self._has_data()
-        for b in (self.render_btn, self.export_btn, self.full2d_btn):
+        for b in (self.render_btn, self.export_btn, self.full2d_btn,
+                  self.full3d_btn):
             b.setEnabled(ok)
         self.add_step_btn.setEnabled(self.dm is not None)
 
@@ -2919,6 +3134,7 @@ class DrawManeuverGUI(QWidget):
         self._rendering = True
         self._rebuild_timer.stop()
         self.render_btn.setEnabled(False)
+        self.open_output_btn.setVisible(False)
         self.render_progress.setVisible(True)
         self.log(tr("rendering"))
         sep = int(self.separate_spin.value())
@@ -2955,12 +3171,103 @@ class DrawManeuverGUI(QWidget):
                 if isinstance(d, np.ndarray) and len(d) > 0:
                     self._last_full_data = d.copy()
             self.log(tr("render_done", p=path or "(不明)"))
+            # 連番画像出力は単一ファイルにならないので作業フォルダを開く
+            self._set_output_target(path or self._work_dir)
         else:
             self.log(tr("render_failed"))
         # プレビューキャッシュを破棄し、プロキシデータへ戻す
         self.runner.invalidate()
         self._request_rebuild()
         self._update_gates()
+
+    def open_work_dir(self):
+        """初期化で作られた作業ディレクトリを Finder (既定のファイラ) で開く。"""
+        d = self._work_dir
+        if not d or not os.path.isdir(d):
+            self.log(tr("open_output_gone", p=d or "(不明)"))
+            return
+        self.log(tr("open_output", p=d))
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(d)):
+            self.log(tr("open_output_gone", p=d))
+
+    def save_preview_video(self):
+        """GPU プレビューの内容を作業ディレクトリへ簡易書き出しする。"""
+        rt = self.rt_preview
+        if rt is None or not rt.is_preview_ready():
+            QMessageBox.information(self, "Info", tr("save_preview_need"))
+            return
+        path = self._unique_out_path("preview")
+        self.save_preview_btn.setEnabled(False)
+        self.render_progress.setVisible(True)
+        try:
+            out = rt.export_preview_video(
+                path, progress_cb=lambda i, n: self._preview_progress(i, n))
+        except Exception as e:
+            out = ""
+            self.log("[ERROR] " + str(e))
+        finally:
+            self.render_progress.setVisible(False)
+            self.save_preview_btn.setEnabled(True)
+        if out:
+            self.log(tr("save_preview_done", p=out))
+            self._set_output_target(out)
+        else:
+            self.log(tr("save_preview_fail"))
+
+    def _preview_progress(self, i, n):
+        self.log_status(tr("save_preview_running", i=i, n=n))
+        QApplication.processEvents()
+
+    def log_status(self, text):
+        """進捗表示。連続して呼ばれた分は最終行を書き換えて行を増やさない。"""
+        if self._status_active:
+            cur = self.log_window.textCursor()
+            cur.movePosition(QTextCursor.End)
+            cur.select(QTextCursor.LineUnderCursor)
+            cur.insertText(text)
+            self.log_window.setTextCursor(cur)
+            self.log_window.ensureCursorVisible()
+        else:
+            self.log(text)
+            self._status_active = True
+
+    def _unique_out_path(self, kind):
+        """作業ディレクトリ内で衝突しないパスを返す。"""
+        stem = os.path.splitext(os.path.basename(self.videopath or ""))[0]
+        base = f"{kind}_{stem}" if stem else kind
+        path = os.path.join(self._work_dir, base + ".mp4")
+        n = 2
+        while os.path.exists(path):
+            path = os.path.join(self._work_dir, f"{base}_{n}.mp4")
+            n += 1
+        return path
+
+    def _set_output_target(self, path):
+        """「開く」ボタンの対象を設定する (無ければボタンを隠す)。"""
+        path = os.path.abspath(path) if path else ""
+        self._output_path = path if path and os.path.exists(path) else ""
+        self._output_is_dir = bool(self._output_path
+                                   and os.path.isdir(self._output_path))
+        self.open_output_btn.setText(
+            tr("btn_open_output_dir") if self._output_is_dir
+            else tr("btn_open_output"))
+        self.open_output_btn.setToolTip(self._output_path)
+        self.open_output_btn.setVisible(bool(self._output_path))
+
+    def open_rendered_output(self):
+        """書き出したものを OS の既定アプリで開く。
+
+        動画なら QuickTime 等のプレーヤーで再生が始まり、連番画像なら
+        書き出し先フォルダが開く。
+        """
+        path = self._output_path
+        if not path or not os.path.exists(path):
+            self.log(tr("open_output_gone", p=path or "(不明)"))
+            self.open_output_btn.setVisible(False)
+            return
+        self.log(tr("open_output", p=path))
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+            self.log(tr("open_output_gone", p=path))
 
     # ---- .py 書き出し ----
     def build_script(self):
@@ -3030,6 +3337,7 @@ class DrawManeuverGUI(QWidget):
 
     # ---- log ----
     def log(self, text):
+        self._status_active = False
         self.log_window.append(str(text))
         self.log_window.ensureCursorVisible()
 

@@ -1777,6 +1777,53 @@ class RealtimePreviewWidget(QWidget):
         else:
             self.start()
 
+    # ---- プレビュー内容の簡易書き出し ----
+    def is_preview_ready(self):
+        """GPU プレビューが構築済みで書き出せる状態か。"""
+        return bool(self._backend and self._F is not None and self._dims)
+
+    def export_preview_video(self, out_path, progress_cb=None,
+                             should_stop=None):
+        """いま見えているプレビューをそのまま連続レンダリングして動画にする。
+
+        本レンダリングと違い、プレビュー解像度・プレビュー品質のままの
+        「確認用の簡易動画」。音声は付かない。
+
+        戻り値: 書き出したパス (失敗時は "")。
+        """
+        if not self.is_preview_ready():
+            return ""
+        ow, oh = self._dims
+        n = max(1, int(self.time_size))
+        fps = float(self.out_fps) or 30.0
+        writer = None
+        for tag in ("avc1", "mp4v"):
+            wr = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*tag),
+                                 fps, (ow, oh))
+            if wr.isOpened():
+                writer = wr
+                break
+            wr.release()
+        if writer is None:
+            return ""
+        saved_t, saved_head = self._t_out, self._playhead
+        try:
+            for i in range(n):
+                if should_stop is not None and should_stop():
+                    break
+                self._t_out = float(i)
+                self._playhead = self._playhead_from_tout()
+                img = self._backend.render(self._params())
+                writer.write(cv2.cvtColor(np.ascontiguousarray(img),
+                                          cv2.COLOR_RGB2BGR))
+                if progress_cb is not None and (i % 10 == 0 or i == n - 1):
+                    progress_cb(i + 1, n)
+        finally:
+            writer.release()
+            self._t_out, self._playhead = saved_t, saved_head
+            self._render_once()
+        return out_path if os.path.exists(out_path) else ""
+
     def _params(self):
         F = self._F
         p = np.zeros((), _PARAMS_DTYPE)
