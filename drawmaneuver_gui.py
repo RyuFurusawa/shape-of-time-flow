@@ -76,6 +76,7 @@ TR = {
     "window_title": {"ja": "drawManeuver GUI", "en": "drawManeuver GUI"},
     "grp_setup": {"ja": "入力 (Setup)", "en": "Setup"},
     "lang_label": {"ja": "言語 / Language:", "en": "Language / 言語:"},
+    "tip_drop_video": {"ja": "またはここに Finder から動画をドラッグ＆ドロップ", "en": "…or drag & drop a video here from Finder"},
     "btn_select_video": {"ja": "動画を選択 / Select Video File",
                           "en": "Select Video File"},
     "no_video": {"ja": "動画が未選択です", "en": "No video file selected"},
@@ -369,6 +370,25 @@ def _newest_plot_output(work_dir, since, exts=(".mp4", ".png")):
             except OSError:
                 pass
     return max(found, key=os.path.getmtime) if found else ""
+
+
+# ドラッグ＆ドロップで受け付ける動画の拡張子
+VIDEO_DROP_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm",
+                   ".mpg", ".mpeg", ".mts", ".m2ts", ".wmv", ".flv")
+VIDEO_FILE_FILTER = ("Video Files (" +
+                     " ".join("*" + e for e in VIDEO_DROP_EXTS) + ")")
+
+
+def dropped_video_path(mime):
+    """ドロップされた MIME から最初の動画ファイルのパスを返す (無ければ "")。"""
+    if mime is None or not mime.hasUrls():
+        return ""
+    for u in mime.urls():
+        p = u.toLocalFile()
+        if (p and os.path.isfile(p)
+                and os.path.splitext(p)[1].lower() in VIDEO_DROP_EXTS):
+            return p
+    return ""
 
 
 class ClickableLabel(QLabel):
@@ -1671,6 +1691,7 @@ class DrawManeuverGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(tr("window_title"))
+        self.setAcceptDrops(True)   # Finder から動画をドロップできる
         self.resize(1560, 980)
         self.setMinimumSize(900, 640)
 
@@ -1761,7 +1782,8 @@ class DrawManeuverGUI(QWidget):
         sg.addLayout(lang_row)
 
         self.video_btn = QPushButton()
-        self._reg(lambda: self.video_btn.setText(tr("btn_select_video")))
+        self._reg(lambda: (self.video_btn.setText(tr("btn_select_video")),
+                           self.video_btn.setToolTip(tr("tip_drop_video"))))
         self.video_btn.clicked.connect(self.select_video)
         sg.addWidget(self.video_btn)
         self.video_label = QLabel(tr("no_video"))
@@ -2487,14 +2509,33 @@ class DrawManeuverGUI(QWidget):
     # ---- 入力映像 ----
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select video file", "", "Video Files (*.mp4 *.avi *.mov)")
-        if not path:
-            return
+            self, "Select video file", "", VIDEO_FILE_FILTER)
+        if path:
+            self._apply_selected_video(path)
+
+    def _apply_selected_video(self, path):
+        """選択/ドロップされた映像を入力として設定する。"""
         self.videopath_src = self.videopath = path
         self.video_label.setText(f"Selected: {path}")
         self.log(f"Video selected: {path}")
         self._open_video_preview(path)
         self.init_btn.setEnabled(True)
+
+    # ---- ドラッグ＆ドロップ (Finder から動画を放り込む) ----
+    def dragEnterEvent(self, ev):
+        if dropped_video_path(ev.mimeData()):
+            ev.acceptProposedAction()
+
+    def dragMoveEvent(self, ev):
+        if dropped_video_path(ev.mimeData()):
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        path = dropped_video_path(ev.mimeData())
+        if not path:
+            return
+        ev.acceptProposedAction()
+        self._apply_selected_video(path)
 
     def _open_video_preview(self, path):
         if self._vid_cap is not None:
