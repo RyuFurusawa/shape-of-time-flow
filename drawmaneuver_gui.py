@@ -1,4 +1,4 @@
-"""DrawBeautifulManeuver — drawManeuver メソッドチェーン エディタ (2026-08)
+"""drawmaneuver_gui — drawManeuver メソッドチェーン エディタ (2026-08)
 
 Shape_of_time_flow.py が「グレー画像 → マニューバデータ」を作るのに対し、
 本アプリは imgtrans の drawManeuver が持つ **クラスメソッドそのもの** を
@@ -72,7 +72,7 @@ if LANG not in ("ja", "en"):
     LANG = "ja"
 
 TR = {
-    "window_title": {"ja": "DrawBeautifulManeuver", "en": "DrawBeautifulManeuver"},
+    "window_title": {"ja": "drawManeuver GUI", "en": "drawManeuver GUI"},
     "grp_setup": {"ja": "入力 (Setup)", "en": "Setup"},
     "lang_label": {"ja": "言語 / Language:", "en": "Language / 言語:"},
     "btn_select_video": {"ja": "動画を選択 / Select Video File",
@@ -124,9 +124,11 @@ TR = {
                       "en": "(shown after Initialize + steps)"},
     "plot_building": {"ja": "再構築中…", "en": "rebuilding…"},
     "plot_error": {"ja": "エラー: {e}", "en": "Error: {e}"},
-    "lbl_data_info": {"ja": "data: {f} frames × {s} slits   |   z {zmin:.0f}–{zmax:.0f}"
+    "lbl_data_info": {"ja": "出力 data.shape = ({f}, {s}, 2)   —   {f} frames × {s} slits"
+                            "   |   time {zmin:.0f}–{zmax:.0f}"
                             "   |   space {smin:.0f}–{smax:.0f}",
-                       "en": "data: {f} frames × {s} slits   |   z {zmin:.0f}–{zmax:.0f}"
+                       "en": "output data.shape = ({f}, {s}, 2)   —   {f} frames × {s} slits"
+                             "   |   time {zmin:.0f}–{zmax:.0f}"
                              "   |   space {smin:.0f}–{smax:.0f}"},
     "grp_realtime": {"ja": "リアルタイム軸間変換プレビュー (GPU)",
                       "en": "Realtime axis-transform preview (GPU)"},
@@ -140,6 +142,8 @@ TR = {
     "need_steps": {"ja": "マニューバデータがありません (Add 系のステップが必要です)。",
                     "en": "No maneuver data — add an Add-category step first."},
     "export_done": {"ja": "書き出しました: {p}", "en": "Exported: {p}"},
+    "export_fail": {"ja": "書き出しに失敗: {p} ({e})",
+                     "en": "Export failed: {p} ({e})"},
     "rendering": {"ja": "レンダリング中…", "en": "Rendering…"},
     "render_done": {"ja": "レンダリング完了: {p}", "en": "Rendering done: {p}"},
     "render_failed": {"ja": "レンダリングに失敗しました (ログ参照)",
@@ -1518,7 +1522,7 @@ class RenderWorker(QThread):
 
 
 # ======== メイン GUI ========
-class DrawBeautifulManeuverApp(QWidget):
+class DrawManeuverGUI(QWidget):
 
     def __init__(self):
         super().__init__()
@@ -1528,6 +1532,7 @@ class DrawBeautifulManeuverApp(QWidget):
 
         self.videopath = None
         self.videopath_src = None
+        self._work_dir = os.getcwd()
         self.dm = None
         self.steps = []                 # StepWidget のリスト
         self.runner = PipelineRunner()
@@ -1774,6 +1779,19 @@ class DrawBeautifulManeuverApp(QWidget):
         ctrl.addStretch()
         pg.addLayout(ctrl)
 
+        # 出力データの形状。2D プロットの「上」に常時表示する。
+        # データが組み上がって以降、何を書き出そうとしているのかが
+        # 常に目に入るようにするため、プロット画像とは分けて出す。
+        self.data_info = QLabel("")
+        self.data_info.setAlignment(Qt.AlignCenter)
+        self.data_info.setWordWrap(True)
+        self.data_info.setStyleSheet(
+            "QLabel { background:#eef4fb; border:1px solid #b8cfe6;"
+            " border-radius:4px; color:#1f3d5c; font-size:12px;"
+            " font-weight:bold; padding:5px 8px; }")
+        self.data_info.setVisible(False)
+        pg.addWidget(self.data_info)
+
         self.plot_label = QLabel(tr("plot_waiting"))
         self.plot_label.setAlignment(Qt.AlignCenter)
         # 縦が足りないときは設定パネルより先にプロットが縮むようにする
@@ -1783,9 +1801,6 @@ class DrawBeautifulManeuverApp(QWidget):
         self._i18n.append(lambda: (None if self.plot_label.pixmap()
                                    else self.plot_label.setText(tr("plot_waiting"))))
         pg.addWidget(self.plot_label, 1)
-        self.data_info = QLabel("")
-        self.data_info.setStyleSheet("color:#555; font-size:10px;")
-        pg.addWidget(self.data_info)
 
         # zPointCheck 警告 (time が負/範囲超過のときだけ出現し、
         # 押すとチェーン末尾に zPointCheck ステップを追加する)
@@ -2536,7 +2551,8 @@ class DrawBeautifulManeuverApp(QWidget):
                     f"scan_nums: {self.dm.scan_nums}")
             self.info_label.setText(info)
             self.log(info)
-            self.log(f"作業ディレクトリ: {os.getcwd()}")
+            self._work_dir = os.getcwd()   # 実行用 .py の書き出し先
+            self.log(f"作業ディレクトリ: {self._work_dir}")
             if self.rt_preview is not None:
                 self.rt_preview.set_video(self.videopath)
                 self.rt_preview.set_params(sd=int(self.dm.scan_direction),
@@ -2745,7 +2761,7 @@ class DrawBeautifulManeuverApp(QWidget):
             self.runner.invalidate()
             self.plot_label.setPixmap(QPixmap())
             self.plot_label.setText(tr("plot_waiting"))
-            self.data_info.setText("")
+            self._set_data_info("")
             self._set_dirty(False)
             self.zcheck_btn.setVisible(False)
             self._update_timeline_band()
@@ -2764,7 +2780,7 @@ class DrawBeautifulManeuverApp(QWidget):
             self._warn_expand_position()
             self.log(f"[ERROR] step {err_i + 1}: {msg}")
             self.plot_label.setText(tr("plot_error", e=msg))
-            self.data_info.setText("")
+            self._set_data_info("")
             self._update_gates()
             return
         self.log(f"[chain] {len(specs)} steps → data "
@@ -2795,13 +2811,21 @@ class DrawBeautifulManeuverApp(QWidget):
             max(320, self.plot_label.width()), max(240, self.plot_label.height()))
         if pm is not None:
             self.plot_label.setPixmap(pm)
+        # 表示するのは「書き出される data の形状」。プレビューは間引いた
+        # 本数で計算しているので、そのままだと slits が実際と食い違う。
+        out_slits = real if factor != 1.0 else int(data.shape[1])
         info = tr(
-            "lbl_data_info", f=data.shape[0], s=data.shape[1],
+            "lbl_data_info", f=int(data.shape[0]), s=out_slits,
             zmin=float(data[:, :, 1].min()), zmax=float(data[:, :, 1].max()),
             smin=float(disp[:, :, 0].min()), smax=float(disp[:, :, 0].max()))
         if factor != 1.0:
-            info += tr("proxy_note", p=data.shape[1], r=real)
-        self.data_info.setText(info)
+            info += tr("proxy_note", p=int(data.shape[1]), r=real)
+        self._set_data_info(info)
+
+    def _set_data_info(self, text):
+        """出力データ形状の表示を更新する (空なら枠ごと隠す)。"""
+        self.data_info.setText(text)
+        self.data_info.setVisible(bool(text))
 
     def _push_to_rt_preview(self):
         if self.rt_preview is None or self.dm is None:
@@ -2943,7 +2967,7 @@ class DrawBeautifulManeuverApp(QWidget):
         """現在のチェーンを実行する単体 Python スクリプトを生成する。"""
         sd = "True" if self.slit_toggle.isChecked() else "False"
         lines = [
-            '"""DrawBeautifulManeuver が書き出した実行用スクリプト',
+            '"""drawmaneuver_gui が書き出した実行用スクリプト',
             "",
             f"生成日時: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             '"""',
@@ -2986,18 +3010,23 @@ class DrawBeautifulManeuverApp(QWidget):
         if not self.steps:
             QMessageBox.warning(self, "Error", tr("need_steps"))
             return
-        default = os.path.join(os.getcwd(), "maneuver_script.py")
-        path, _ = QFileDialog.getSaveFileName(
-            self, tr("btn_export"), default, "Python (*.py)")
-        if not path:
-            return
+        # 保存先は聞かず、初期化した作業ディレクトリへそのまま書き出す。
+        # 既存の書き出しを黙って上書きしないよう、名前が衝突したら連番を付ける。
+        stem = os.path.splitext(os.path.basename(self.videopath or ""))[0]
+        base = f"maneuver_{stem}" if stem else "maneuver_script"
+        path = os.path.join(self._work_dir, base + ".py")
+        n = 2
+        while os.path.exists(path):
+            path = os.path.join(self._work_dir, f"{base}_{n}.py")
+            n += 1
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.build_script())
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+            self.log("[ERROR] " + tr("export_fail", p=path, e=str(e)))
             return
-        self.log(tr("export_done", p=path))
+        self.log(tr("export_done", p=os.path.abspath(path)))
 
     # ---- log ----
     def log(self, text):
@@ -3007,6 +3036,6 @@ class DrawBeautifulManeuverApp(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = DrawBeautifulManeuverApp()
+    win = DrawManeuverGUI()
     win.show()
     sys.exit(app.exec_())
