@@ -141,6 +141,16 @@ TR = {
     "tip_open_workdir": {
         "ja": "初期化時に作られた作業ディレクトリを Finder で開く\n(レンダリング結果や書き出した .py もここに入る)",
         "en": "Reveal the working directory created at initialization\n(renders and exported .py land here)"},
+    "busy_now": {"ja": "処理中です。完了してから実行してください。",
+                 "en": "Busy — wait until the current job finishes."},
+    "tip_plot_dblclick": {"ja": "ダブルクリックで原寸表示",
+                           "en": "Double-click to view full size"},
+    "still_default": {
+        "ja": "1 フレームのみのため、出力形式を連番画像に切り替えました。",
+        "en": "Single frame — switched the output format to image sequence."},
+    "video_restored": {
+        "ja": "フレームが複数になったため、出力形式を動画へ戻しました。",
+        "en": "Multiple frames — switched the output format back to video."},
     "btn_full2d": {"ja": "詳細 2D プロット (PNG)", "en": "Full 2D plot (PNG)"},
     "btn_full3d": {"ja": "3D プロットアニメーション (MP4)",
                     "en": "3D plot animation (MP4)"},
@@ -359,6 +369,42 @@ def _newest_plot_output(work_dir, since, exts=(".mp4", ".png")):
             except OSError:
                 pass
     return max(found, key=os.path.getmtime) if found else ""
+
+
+class ClickableLabel(QLabel):
+    """ダブルクリックを通知する QLabel (プロットの原寸表示に使う)。"""
+    doubleClicked = pyqtSignal()
+
+    def mouseDoubleClickEvent(self, ev):
+        self.doubleClicked.emit()
+        super().mouseDoubleClickEvent(ev)
+
+
+class ImageWindow(QDialog):
+    """画像を原寸で表示する別ウィンドウ (大きい場合はスクロール)。"""
+
+    def __init__(self, parent, title, pixmap):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setSizeGripEnabled(True)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel()
+        lbl.setPixmap(pixmap)
+        lbl.setAlignment(Qt.AlignCenter)
+        scroll = QScrollArea()
+        scroll.setWidget(lbl)
+        scroll.setAlignment(Qt.AlignCenter)
+        scroll.setFrameShape(QFrame.NoFrame)
+        v.addWidget(scroll)
+        scr = QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr is not None else None
+        if avail is not None:
+            self.resize(min(pixmap.width() + 24, int(avail.width() * 0.9)),
+                        min(pixmap.height() + 24, int(avail.height() * 0.9)))
+        else:
+            self.resize(min(pixmap.width() + 24, 1200),
+                        min(pixmap.height() + 24, 900))
 
 
 class Plot3DWorker(QThread):
@@ -1633,6 +1679,11 @@ class DrawManeuverGUI(QWidget):
         self._work_dir = os.getcwd()
         self._status_active = False  # 進捗行を書き換え中か
         self._plot3d_worker = None   # 3D プロット書き出しスレッド
+        self._saving_preview = False # プレビュー簡易保存の実行中フラグ
+        self._was_single = None      # 直前が1フレームだったか
+        self._auto_still = False     # 連番画像へ自動で切り替えたか
+        self._last_3d_png = ""       # 直近の 3D プロット静止画
+        self._plot_full = (None, None)  # 原寸表示のソース
         self._output_path = ""      # 直近の書き出し先
         self._output_is_dir = False
         self.dm = None
@@ -1905,8 +1956,10 @@ class DrawManeuverGUI(QWidget):
         self.data_info.setVisible(False)
         pg.addWidget(self.data_info)
 
-        self.plot_label = QLabel(tr("plot_waiting"))
+        self.plot_label = ClickableLabel(tr("plot_waiting"))
         self.plot_label.setAlignment(Qt.AlignCenter)
+        self.plot_label.doubleClicked.connect(self.open_plot_fullsize)
+        self._reg(lambda: self.plot_label.setToolTip(tr("tip_plot_dblclick")))
         # 縦が足りないときは設定パネルより先にプロットが縮むようにする
         self.plot_label.setMinimumSize(360, 180)
         self.plot_label.setStyleSheet(
@@ -2958,8 +3011,25 @@ class DrawManeuverGUI(QWidget):
         single = int(data.shape[0]) <= 1
         self.full2d_btn.setVisible(not single)
         self.full3d_btn.setVisible(not single)
+        if single != self._was_single:
+            self._was_single = single
+            # 1 フレームだけのデータは動画にならないので連番画像を既定にする。
+            # 複数フレームへ戻ったときは、こちらが勝手に変えた場合にかぎり
+            # 動画へ戻す (ユーザーが自分で選んだ連番設定は尊重する)。
+            kind = self.out_kind_combo.currentData()
+            if single and kind != "still":
+                self._auto_still = True
+                self.out_kind_combo.setCurrentIndex(
+                    self.out_kind_combo.findData("still"))
+                self.log(tr("still_default"))
+            elif not single and self._auto_still and kind == "still":
+                self._auto_still = False
+                self.out_kind_combo.setCurrentIndex(
+                    self.out_kind_combo.findData("video"))
+                self.log(tr("video_restored"))
         if single:
             pm = self._render_3d_still()
+            self._plot_full = ("3d", self._last_3d_png)
             if pm is not None:
                 self.plot_label.setPixmap(pm)
             else:
@@ -2968,6 +3038,7 @@ class DrawManeuverGUI(QWidget):
             self._finish_data_info(data, disp, factor, real,
                                    note=tr("plot_single_note"))
             return
+        self._plot_full = ("2d", disp)
         pm = render_maneuver_plot(
             disp, float(self.dm.outfps), float(self.dm.recfps),
             max(320, self.plot_label.width()), max(240, self.plot_label.height()))
@@ -3004,6 +3075,7 @@ class DrawManeuverGUI(QWidget):
         out = _newest_plot_output(self._work_dir, since, exts=(".png",))
         if not out:
             return None
+        self._last_3d_png = out
         pm = QPixmap(out)
         if pm.isNull():
             return None
@@ -3011,12 +3083,33 @@ class DrawManeuverGUI(QWidget):
                          max(240, self.plot_label.height()),
                          Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+    def open_plot_fullsize(self):
+        """プロットを原寸で別ウィンドウに開く (ダブルクリック)。"""
+        kind, src = self._plot_full
+        if kind == "3d":
+            if not src or not os.path.exists(src):
+                return
+            pm = QPixmap(src)
+            title = "3D plot"
+        elif kind == "2d":
+            scr = QApplication.primaryScreen()
+            avail = scr.availableGeometry() if scr is not None else None
+            w_px = int(avail.width() * 0.85) if avail else 1400
+            h_px = int(avail.height() * 0.8) if avail else 900
+            pm = render_maneuver_plot(src, float(self.dm.outfps),
+                                      float(self.dm.recfps), w_px, h_px)
+            title = "2D plot"
+        else:
+            return
+        if pm is None or pm.isNull():
+            return
+        ImageWindow(self, title, pm).exec_()
+
     def run_full_3dplot(self):
         """3D プロットのアニメーションを書き出す (別スレッド)。"""
         if not self._has_data() or self._plot3d_worker is not None:
             return
-        self.full3d_btn.setEnabled(False)
-        self.render_progress.setVisible(True)
+        self._set_busy(True)
         self.log(tr("plot3d_running"))
         self._plot3d_worker = Plot3DWorker(
             self.dm, self._work_dir,
@@ -3028,8 +3121,7 @@ class DrawManeuverGUI(QWidget):
 
     def _on_plot3d_done(self, ok, path):
         self._plot3d_worker = None
-        self.render_progress.setVisible(False)
-        self.full3d_btn.setEnabled(True)
+        self._set_busy(False)
         if ok:
             self.log(tr("plot3d_done", p=path))
             self._set_output_target(path)
@@ -3056,16 +3148,36 @@ class DrawManeuverGUI(QWidget):
             self.rt_preview.refresh_maps()
 
     # ---- アクション ----
+    def _is_busy(self):
+        """レンダリング/3D プロット/プレビュー保存のいずれかが走っているか。"""
+        return bool(self._rendering or self._plot3d_worker is not None
+                    or self._saving_preview)
+
+    def _set_busy(self, busy):
+        """重い処理どうしがぶつからないよう、実行系のボタンをまとめて塞ぐ。
+
+        レンダリング中にプレビュー保存を始めると、進捗を出すための
+        processEvents でレンダリング完了処理が入れ子で走り、
+        GPU プレビューのデータが差し替わってしまう。
+        """
+        self.render_progress.setVisible(bool(busy))
+        for b in (self.render_btn, self.full2d_btn, self.full3d_btn,
+                  self.save_preview_btn, self.export_btn):
+            b.setEnabled(not busy)
+        if not busy:
+            self._update_gates()
+
     def _has_data(self):
         return (self.dm is not None
                 and isinstance(getattr(self.dm, "data", None), np.ndarray)
                 and len(self.dm.data) > 0)
 
     def _update_gates(self):
-        ok = self._has_data()
+        ok = self._has_data() and not self._is_busy()
         for b in (self.render_btn, self.export_btn, self.full2d_btn,
                   self.full3d_btn):
             b.setEnabled(ok)
+        self.save_preview_btn.setEnabled(not self._is_busy())
         self.add_step_btn.setEnabled(self.dm is not None)
 
     def _refresh_zcheck_warning(self):
@@ -3133,7 +3245,7 @@ class DrawManeuverGUI(QWidget):
                       and os.path.exists(self._last_video_path))
         self._rendering = True
         self._rebuild_timer.stop()
-        self.render_btn.setEnabled(False)
+        self._set_busy(True)
         self.open_output_btn.setVisible(False)
         self.render_progress.setVisible(True)
         self.log(tr("rendering"))
@@ -3158,8 +3270,7 @@ class DrawManeuverGUI(QWidget):
 
     def _on_render_done(self, ok, path):
         self._rendering = False
-        self.render_progress.setVisible(False)
-        self.render_btn.setEnabled(True)
+        self._set_busy(False)
         if ok:
             # 音声のみ再書き出しに備えて、映像のみのパスと本番解像度の
             # data を記録する (プロキシ再構築で dm.data が上書きされる前に)
@@ -3192,13 +3303,17 @@ class DrawManeuverGUI(QWidget):
 
     def save_preview_video(self):
         """GPU プレビューの内容を作業ディレクトリへ簡易書き出しする。"""
+        if self._is_busy():
+            self.log(tr("busy_now"))
+            QMessageBox.information(self, "Info", tr("busy_now"))
+            return
         rt = self.rt_preview
         if rt is None or not rt.is_preview_ready():
             QMessageBox.information(self, "Info", tr("save_preview_need"))
             return
         path = self._unique_out_path("preview")
-        self.save_preview_btn.setEnabled(False)
-        self.render_progress.setVisible(True)
+        self._saving_preview = True
+        self._set_busy(True)
         try:
             out = rt.export_preview_video(
                 path, progress_cb=lambda i, n: self._preview_progress(i, n))
@@ -3206,8 +3321,8 @@ class DrawManeuverGUI(QWidget):
             out = ""
             self.log("[ERROR] " + str(e))
         finally:
-            self.render_progress.setVisible(False)
-            self.save_preview_btn.setEnabled(True)
+            self._saving_preview = False
+            self._set_busy(False)
         if out:
             self.log(tr("save_preview_done", p=out))
             self._set_output_target(out)
