@@ -146,6 +146,27 @@ TR = {
                  "en": "Busy — wait until the current job finishes."},
     "tip_plot_dblclick": {"ja": "ダブルクリックで原寸表示",
                            "en": "Double-click to view full size"},
+    "lbl_still_split": {"ja": "1枚データの出力:", "en": "Single-frame output:"},
+    "still_split_one": {"ja": "1 枚にまとめて出力",
+                         "en": "One image for the whole span"},
+    "still_split_time": {"ja": "時間で分割して複数枚出力",
+                          "en": "Split by time into multiple images"},
+    "lbl_split_minutes": {"ja": "1 枚あたり", "en": "per image"},
+    "unit_minutes": {"ja": "分", "en": "min"},
+    "hint_still_split": {
+        "ja": "1 フレームのデータは映像の全尺が 1 枚に積み重なる。"
+              "長い素材では時間で区切って複数枚に分けると扱いやすい。",
+        "en": "A single frame stacks the whole clip into one image. "
+              "Splitting it by time is easier to handle for long sources."},
+    "still_split_dropped": {
+        "ja": "  (割り切れない端数 {n} スリットは切り捨てました)",
+        "en": "  (dropped {n} leftover slits that don't divide evenly)"},
+    "still_split_info": {"ja": "全 {total} → 各 {each} × {n} 枚",
+                          "en": "{total} total → {each} each × {n} images"},
+    "still_split_applied": {
+        "ja": "1枚データを時間で分割: 全 {total} を {n} 枚 (各 {each}) に分けて出力します",
+        "en": "Splitting the single frame by time: {total} into {n} images "
+              "({each} each)"},
     "still_default": {
         "ja": "1 フレームのみのため、出力形式を連番画像に切り替えました。",
         "en": "Single frame — switched the output format to image sequence."},
@@ -389,6 +410,52 @@ def dropped_video_path(mime):
                 and os.path.splitext(p)[1].lower() in VIDEO_DROP_EXTS):
             return p
     return ""
+
+
+def _fmt_dur(sec):
+    """秒 → 分:秒 の短い表記 (0.1 秒単位で丸めてから桁上げする)。"""
+    tenths = int(round(max(0.0, float(sec)) * 10))
+    m, rem = divmod(tenths, 600)
+    return f"{m}:{rem / 10.0:04.1f}" if m else f"{rem / 10.0:.1f}s"
+
+
+def plan_still_split(data, recfps, minutes):
+    """1 フレームのデータを時間で分割する計画を返す。
+
+    戻り値: (枚数, 1枚あたりの秒数, 全体の秒数)。分割できないときは (1, 全体, 全体)。
+    """
+    if data is None or len(data) != 1:
+        return 1, 0.0, 0.0
+    z = np.asarray(data[0, :, 1], dtype=np.float64)
+    span = float(z.max() - z.min())
+    fps = float(recfps) or 30.0
+    total_sec = span / fps
+    if span <= 0 or minutes <= 0:
+        return 1, total_sec, total_sec
+    seg_frames = float(minutes) * 60.0 * fps
+    n = max(1, int(np.ceil(span / seg_frames)))
+    return n, total_sec / n, total_sec
+
+
+def split_single_frame(data, n):
+    """1 フレームぶんの積み重ねを、時間軸に沿って n 枚へ切り分ける。
+
+    再サンプルはせず、元の並びをそのまま等分する。各画像は元画像の
+    一部分そのものなので、並べれば元の 1 枚に戻る。
+    長尺で縦に伸びすぎた 1 枚を、扱える大きさに分けるのが目的。
+
+    端数 (n で割り切れないぶん、最大 n-1 スリット) は切り捨てる。
+    """
+    if data is None or len(data) != 1 or n <= 1:
+        return data
+    stack = int(data.shape[1])
+    seg = stack // n
+    if seg < 2:
+        return data
+    out = np.empty((n, seg, data.shape[2]), dtype=np.float64)
+    for k in range(n):
+        out[k] = data[0, k * seg:(k + 1) * seg, :]
+    return out
 
 
 class ClickableLabel(QLabel):
@@ -1558,7 +1625,7 @@ class RenderWorker(QThread):
     def __init__(self, dm, specs, out_type=1, separate_num=None,
                  audio_out=False, audio_kwargs=None, audio_voices=20,
                  audio_only=False, video_path="", full_data=None,
-                 imgtype=None):
+                 imgtype=None, still_split=1):
         super().__init__()
         self.dm = dm
         self.specs = specs
@@ -1570,6 +1637,8 @@ class RenderWorker(QThread):
         self.audio_mode = self.audio_kwargs.get("mode", "play")
         self.audio_voices = max(2, int(audio_voices))
         self.imgtype = imgtype     # out_type=0 (連番画像) のときの拡張子
+        # 1 フレームのデータを時間で分割して複数枚出力するときの枚数
+        self.still_split = max(1, int(still_split))
         # 音声のみ再書き出し: チェーンが前回レンダリングと同一のとき、
         # 保存済みの映像 (video_path) に対して audio_video_out だけ実行する
         self.audio_only = audio_only
@@ -1592,6 +1661,20 @@ class RenderWorker(QThread):
                 self.done_signal.emit(False, "")
                 return
             d = self.dm.data
+            # 1 フレームのデータを時間で区切って複数枚に分ける
+            if self.still_split > 1 and len(d) == 1:
+                z = d[0, :, 1]
+                total = float(z.max() - z.min()) / (float(self.dm.recfps) or 30.0)
+                before_stack = int(d.shape[1])
+                self.dm.data = split_single_frame(d, self.still_split)
+                d = self.dm.data
+                dropped = before_stack - int(d.shape[0]) * int(d.shape[1])
+                self.log_signal.emit(tr(
+                    "still_split_applied", total=_fmt_dur(total),
+                    n=self.still_split,
+                    each=_fmt_dur(total / self.still_split)))
+                if dropped > 0:
+                    self.log_signal.emit(tr("still_split_dropped", n=dropped))
             self.log_signal.emit(
                 f"full data: {d.shape}  z {d[:, :, 1].min():.0f}"
                 f"–{d[:, :, 1].max():.0f}")
@@ -2201,6 +2284,38 @@ class DrawManeuverGUI(QWidget):
         self.img_hint.setStyleSheet("color:gray; font-size:10px;")
         acc.addWidget(self.img_hint)
 
+        # 1 フレームだけのデータ用: 全尺を 1 枚にするか時間で分割するか
+        self.split_row = QHBoxLayout()
+        self.split_row.addWidget(self._trlabel("lbl_still_split"))
+        self.still_split_combo = QComboBox()
+        self.still_split_combo.addItem(tr("still_split_one"), "one")
+        self.still_split_combo.addItem(tr("still_split_time"), "time")
+        self._reg(lambda: (
+            self.still_split_combo.setItemText(0, tr("still_split_one")),
+            self.still_split_combo.setItemText(1, tr("still_split_time"))))
+        self.still_split_combo.currentIndexChanged.connect(
+            self._sync_still_split)
+        self.split_row.addWidget(self.still_split_combo, 1)
+        self.split_row.addWidget(self._trlabel("lbl_split_minutes"))
+        self.split_min_spin = QDoubleSpinBox()
+        self.split_min_spin.setRange(0.05, 120.0)
+        self.split_min_spin.setDecimals(2)
+        self.split_min_spin.setSingleStep(0.5)
+        self.split_min_spin.setValue(1.0)
+        self.split_min_spin.valueChanged.connect(lambda *_: self._sync_still_split())
+        self.split_row.addWidget(self.split_min_spin)
+        self.split_unit_label = self._trlabel("unit_minutes")
+        self.split_row.addWidget(self.split_unit_label)
+        self.split_row.addStretch()
+        acc.addLayout(self.split_row)
+        self.split_info = QLabel("")
+        self.split_info.setStyleSheet("color:#1f3d5c; font-size:11px;")
+        acc.addWidget(self.split_info)
+        self.split_hint = self._trlabel("hint_still_split")
+        self.split_hint.setStyleSheet("color:gray; font-size:10px;")
+        self.split_hint.setWordWrap(True)
+        acc.addWidget(self.split_hint)
+
         r3 = QHBoxLayout()
         r3.addWidget(self._trlabel("lbl_separate"))
         self.separate_spin = QSpinBox()
@@ -2216,6 +2331,42 @@ class DrawManeuverGUI(QWidget):
         self._on_out_kind()
         return acc
 
+    def _sync_still_split(self, *_):
+        """1枚データ用の分割設定の表示と、分割枚数の見積もりを更新する。"""
+        single = bool(self._was_single)
+        still = self.out_kind_combo.currentData() == "still"
+        show = single and still
+        for i in range(self.split_row.count()):
+            w = self.split_row.itemAt(i).widget()
+            if w:
+                w.setVisible(show)
+        self.split_hint.setVisible(show)
+        by_time = self.still_split_combo.currentData() == "time"
+        self.split_min_spin.setVisible(show and by_time)
+        self.split_unit_label.setVisible(show and by_time)
+        if not (show and by_time):
+            self.split_info.setVisible(False)
+            return
+        data = getattr(self.dm, "data", None) if self.dm else None
+        n, each, total = plan_still_split(
+            data, getattr(self.dm, "recfps", 30.0), self.split_min_spin.value())
+        self.split_info.setText(tr("still_split_info", total=_fmt_dur(total),
+                                   each=_fmt_dur(each), n=n))
+        self.split_info.setVisible(True)
+
+    def still_split_count(self):
+        """レンダリング時に分割する枚数 (分割しないなら 1)。"""
+        if not self._was_single:
+            return 1
+        if self.out_kind_combo.currentData() != "still":
+            return 1
+        if self.still_split_combo.currentData() != "time":
+            return 1
+        data = getattr(self.dm, "data", None) if self.dm else None
+        n, _each, _total = plan_still_split(
+            data, getattr(self.dm, "recfps", 30.0), self.split_min_spin.value())
+        return n
+
     def _on_out_kind(self, *_):
         """動画 / 連番画像 で表示する設定を切り替える。"""
         still = self.out_kind_combo.currentData() == "still"
@@ -2228,6 +2379,7 @@ class DrawManeuverGUI(QWidget):
             if w:
                 w.setVisible(still)
         self.img_hint.setVisible(still)
+        self._sync_still_split()
 
     def selected_out_type(self):
         if self.out_kind_combo.currentData() == "still":
@@ -3068,6 +3220,7 @@ class DrawManeuverGUI(QWidget):
                 self.out_kind_combo.setCurrentIndex(
                     self.out_kind_combo.findData("video"))
                 self.log(tr("video_restored"))
+        self._sync_still_split()
         if single:
             pm = self._render_3d_still()
             self._plot_full = ("3d", self._last_3d_png)
@@ -3303,6 +3456,7 @@ class DrawManeuverGUI(QWidget):
             audio_only=audio_only,
             video_path=self._last_video_path,
             full_data=self._last_full_data,
+            still_split=self.still_split_count(),
         )
         self._pending_render_key = key
         self._render_worker.log_signal.connect(self.log)
@@ -3323,8 +3477,10 @@ class DrawManeuverGUI(QWidget):
                 if isinstance(d, np.ndarray) and len(d) > 0:
                     self._last_full_data = d.copy()
             self.log(tr("render_done", p=path or "(不明)"))
-            # 連番画像出力は単一ファイルにならないので作業フォルダを開く
-            self._set_output_target(path or self._work_dir)
+            # 連番画像出力は単一ファイルにならないので書き出し先フォルダを開く
+            img_dir = os.path.join(self._work_dir, "img")
+            self._set_output_target(
+                path or (img_dir if os.path.isdir(img_dir) else self._work_dir))
         else:
             self.log(tr("render_failed"))
         # プレビューキャッシュを破棄し、プロキシデータへ戻す
