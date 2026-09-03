@@ -1147,6 +1147,10 @@ class RealtimePreviewWidget(QWidget):
 
     _batch_decoded = pyqtSignal(int, int, object)  # (gen, start, frames)
     _decode_finished = pyqtSignal(int, object)     # (gen, error)
+    # 映像の実アスペクト比 (幅÷高さ) が判明するたびに発火。埋め込み側が、
+    # 縦長素材でプレビュー領域が横長のまま極端に小さくならないよう
+    # 自分のレイアウトを調整するためのフック (rebuild() 参照)。
+    previewAspectReady = pyqtSignal(float)
 
     def __init__(self, lang="ja"):
         super().__init__()
@@ -1549,6 +1553,8 @@ class RealtimePreviewWidget(QWidget):
         self._F = F
         self._srcW, self._srcH = sw, sh
         self._dims = (ow, oh)
+        if oh > 0:
+            self.previewAspectReady.emit(ow / oh)
         self._loaded = 0
         self._vol_mb = sw * sh * 4 * F / 1e6
 

@@ -2034,6 +2034,7 @@ class DrawManeuverGUI(QWidget):
 
         # --- 2D プロット + 実行 ---
         plot_group = QGroupBox()
+        self.plot_group = plot_group   # rt_group とのスプリッタ配分調整で参照する
         self._reg(lambda b=plot_group: b.setTitle(tr("grp_plot")))
         pg = QVBoxLayout(plot_group)
 
@@ -2192,6 +2193,7 @@ class DrawManeuverGUI(QWidget):
             rv = QVBoxLayout(self.rt_group)
             rv.setContentsMargins(4, 4, 4, 4)
             self.rt_preview = ManeuverRTPreview(lang=LANG)
+            self.rt_preview.previewAspectReady.connect(self._on_preview_aspect)
             rv.addWidget(self.rt_preview)
         else:
             self.rt_group = None
@@ -2271,6 +2273,49 @@ class DrawManeuverGUI(QWidget):
         move = max(0, min(short, spare))
         if move:
             sp.setSizes([sizes[0] + move, sizes[1] - move])
+
+    # 右列スプリッタの既定配分 (plot_group : rt_group)。setStretchFactor と揃える。
+    _RIGHT_SPLIT_DEFAULT = (3, 4)
+
+    def _reset_right_split(self):
+        """右列の高さ配分を既定比率へ戻す。
+
+        _on_preview_aspect は縦長素材のぶんだけ rt_group 側を広げるが、
+        戻す判断はしない (常時判定すると横長へ切り替えた瞬間に縮んで
+        ちらつく)。新しい映像を読み込むタイミングでまとめてリセットする。
+        """
+        sp = getattr(self, "_right_split", None)
+        if sp is None:
+            return
+        total = sum(sp.sizes())
+        if total <= 0:
+            return
+        a, b = self._RIGHT_SPLIT_DEFAULT
+        sp.setSizes([int(total * a / (a + b)), int(total * b / (a + b))])
+
+    def _on_preview_aspect(self, ratio):
+        """GPU プレビューの実際の映像アスペクト比が判明したら、縦長素材で
+        プレビューが横長の箱の中に小さく押し込まれたままにならないよう、
+        rt_group の高さの取り分を広げる。
+
+        箱の幅はそのまま (横に並ぶ他パネルの構成を崩さない)、高さだけを
+        映像の縦横比に近づける。横長/正方形の素材では現状より縮めない
+        (plot_group から奪うのは、映像を大きく見せるために必要な分だけ)。
+        """
+        sp = getattr(self, "_right_split", None)
+        if sp is None or self.rt_group is None or ratio <= 0:
+            return
+        sizes = sp.sizes()
+        if len(sizes) != 2 or sum(sizes) <= 0:
+            return
+        total = sum(sizes)
+        col_w = max(200, self.rt_group.width())
+        want_h = int(col_w / ratio)
+        floor_h = self.plot_group.minimumSizeHint().height()
+        max_rt_h = max(1, total - floor_h)
+        new_rt_h = min(max(want_h, sizes[1]), max_rt_h)
+        if new_rt_h > sizes[1]:
+            sp.setSizes([total - new_rt_h, new_rt_h])
 
     # ---- 出力設定パネル ----
     def _build_output_panel(self):
@@ -2991,6 +3036,9 @@ class DrawManeuverGUI(QWidget):
                 self.rt_preview.set_params(sd=int(self.dm.scan_direction),
                                            rec_fps=float(self.dm.recfps),
                                            out_fps=int(self.dm.outfps))
+            # 新しい映像を読み込んだら、前の映像のアスペクト比に合わせて
+            # 広げていた分をいったん既定比率へ戻す (_on_preview_aspect 参照)
+            self._reset_right_split()
             self.runner.invalidate()
             self._last_render_key = None
             self._last_video_path = ""
