@@ -158,15 +158,21 @@ TR = {
               "長い素材では時間で区切って複数枚に分けると扱いやすい。",
         "en": "A single frame stacks the whole clip into one image. "
               "Splitting it by time is easier to handle for long sources."},
-    "still_split_dropped": {
-        "ja": "  (割り切れない端数 {n} スリットは切り捨てました)",
-        "en": "  (dropped {n} leftover slits that don't divide evenly)"},
+    "lbl_scan_step": {"ja": "間引き 1/", "en": "step 1/"},
+    "tip_scan_step": {
+        "ja": "時間軸の間引き。出力幅 = 区間のフレーム数 ÷ この値。\n"
+              "1 なら 1 フレーム = 1 ピクセル (間引きなし)。",
+        "en": "Time-axis decimation. Output width = frames in the chunk / this.\n"
+              "1 means one frame per pixel (no decimation)."},
+    "still_split_tail": {"ja": "  (最後の 1 枚だけ {last})",
+                          "en": "  (last image is {last})"},
     "still_split_info": {"ja": "全 {total} → 各 {each} × {n} 枚",
                           "en": "{total} total → {each} each × {n} images"},
     "still_split_applied": {
-        "ja": "1枚データを時間で分割: 全 {total} を {n} 枚 (各 {each}) に分けて出力します",
-        "en": "Splitting the single frame by time: {total} into {n} images "
-              "({each} each)"},
+        "ja": "1枚データを時間で分割: 全 {total} を {n} 枚に分けて出力します",
+        "en": "Splitting the single frame by time: {total} into {n} images"},
+    "still_chunk_run": {"ja": "  [{i}/{n}] {s} – {e}  ({w} スリット)",
+                         "en": "  [{i}/{n}] {s} – {e}  ({w} slits)"},
     "still_default": {
         "ja": "1 フレームのみのため、出力形式を連番画像に切り替えました。",
         "en": "Single frame — switched the output format to image sequence."},
@@ -419,43 +425,41 @@ def _fmt_dur(sec):
     return f"{m}:{rem / 10.0:04.1f}" if m else f"{rem / 10.0:.1f}s"
 
 
-def plan_still_split(data, recfps, minutes):
-    """1 フレームのデータを時間で分割する計画を返す。
+def plan_still_chunks(data, recfps, minutes):
+    """1 フレームの積み重ねを「先頭から interval 分ずつ」区切る計画を返す。
 
-    戻り値: (枚数, 1枚あたりの秒数, 全体の秒数)。分割できないときは (1, 全体, 全体)。
+    SlitScan.py と同じ区切り方: 各区間はきっかり interval 分で、
+    最後だけ余った長さになる (等分ではない)。
+    戻り値: [(i0, i1, 開始秒, 終了秒), ...]
     """
     if data is None or len(data) != 1:
-        return 1, 0.0, 0.0
+        return []
     z = np.asarray(data[0, :, 1], dtype=np.float64)
-    span = float(z.max() - z.min())
     fps = float(recfps) or 30.0
-    total_sec = span / fps
-    if span <= 0 or minutes <= 0:
-        return 1, total_sec, total_sec
-    seg_frames = float(minutes) * 60.0 * fps
-    n = max(1, int(np.ceil(span / seg_frames)))
-    return n, total_sec / n, total_sec
-
-
-def split_single_frame(data, n):
-    """1 フレームぶんの積み重ねを、時間軸に沿って n 枚へ切り分ける。
-
-    再サンプルはせず、元の並びをそのまま等分する。各画像は元画像の
-    一部分そのものなので、並べれば元の 1 枚に戻る。
-    長尺で縦に伸びすぎた 1 枚を、扱える大きさに分けるのが目的。
-
-    端数 (n で割り切れないぶん、最大 n-1 スリット) は切り捨てる。
-    """
-    if data is None or len(data) != 1 or n <= 1:
-        return data
-    stack = int(data.shape[1])
-    seg = stack // n
-    if seg < 2:
-        return data
-    out = np.empty((n, seg, data.shape[2]), dtype=np.float64)
-    for k in range(n):
-        out[k] = data[0, k * seg:(k + 1) * seg, :]
+    interval = int(round(float(minutes) * 60.0 * fps))
+    if interval < 1:
+        return []
+    z0, z1 = float(z.min()), float(z.max())
+    order = np.argsort(z) if not np.all(np.diff(z) >= 0) else None
+    zs_sorted = z[order] if order is not None else z
+    out = []
+    start = int(np.floor(z0))
+    while start <= z1:
+        end = min(start + interval, int(np.floor(z1)) + 1)
+        i0 = int(np.searchsorted(zs_sorted, start, "left"))
+        i1 = int(np.searchsorted(zs_sorted, end, "left"))
+        if i1 > i0:
+            out.append((i0, i1, start / fps, end / fps))
+        start += interval
     return out
+
+
+def still_chunk_summary(chunks):
+    """チャンク計画 → (枚数, 全体秒, 各区間の秒のリスト)。"""
+    if not chunks:
+        return 0, 0.0, []
+    each = [c[3] - c[2] for c in chunks]
+    return len(chunks), chunks[-1][3] - chunks[0][2], each
 
 
 class ClickableLabel(QLabel):
@@ -1625,7 +1629,7 @@ class RenderWorker(QThread):
     def __init__(self, dm, specs, out_type=1, separate_num=None,
                  audio_out=False, audio_kwargs=None, audio_voices=20,
                  audio_only=False, video_path="", full_data=None,
-                 imgtype=None, still_split=1):
+                 imgtype=None, still_split_minutes=None, scan_step=1):
         super().__init__()
         self.dm = dm
         self.specs = specs
@@ -1637,8 +1641,9 @@ class RenderWorker(QThread):
         self.audio_mode = self.audio_kwargs.get("mode", "play")
         self.audio_voices = max(2, int(audio_voices))
         self.imgtype = imgtype     # out_type=0 (連番画像) のときの拡張子
-        # 1 フレームのデータを時間で分割して複数枚出力するときの枚数
-        self.still_split = max(1, int(still_split))
+        # 1 フレームのデータを時間で区切って複数枚出力するときの 1 枚あたりの分数
+        self.still_split_minutes = still_split_minutes
+        self.scan_step = max(1, int(scan_step))
         # 音声のみ再書き出し: チェーンが前回レンダリングと同一のとき、
         # 保存済みの映像 (video_path) に対して audio_video_out だけ実行する
         self.audio_only = audio_only
@@ -1661,23 +1666,16 @@ class RenderWorker(QThread):
                 self.done_signal.emit(False, "")
                 return
             d = self.dm.data
-            # 1 フレームのデータを時間で区切って複数枚に分ける
-            if self.still_split > 1 and len(d) == 1:
-                z = d[0, :, 1]
-                total = float(z.max() - z.min()) / (float(self.dm.recfps) or 30.0)
-                before_stack = int(d.shape[1])
-                self.dm.data = split_single_frame(d, self.still_split)
-                d = self.dm.data
-                dropped = before_stack - int(d.shape[0]) * int(d.shape[1])
-                self.log_signal.emit(tr(
-                    "still_split_applied", total=_fmt_dur(total),
-                    n=self.still_split,
-                    each=_fmt_dur(total / self.still_split)))
-                if dropped > 0:
-                    self.log_signal.emit(tr("still_split_dropped", n=dropped))
             self.log_signal.emit(
                 f"full data: {d.shape}  z {d[:, :, 1].min():.0f}"
                 f"–{d[:, :, 1].max():.0f}")
+
+            # 1 フレームのデータを時間で区切って複数枚に分ける。
+            # 最後の区間だけ短くなるため幅が揃わず 1 回では出せないので、
+            # SlitScan.py と同じくチャンクごとに transprocess を回す。
+            if self.still_split_minutes and len(d) == 1 and self.out_type == 0:
+                self._run_still_chunks(d)
+                return
 
             # 2) レンダリング
             if self.imgtype:
@@ -1722,6 +1720,34 @@ class RenderWorker(QThread):
                 plt.close("all")
             except Exception:
                 pass
+
+    def _run_still_chunks(self, data):
+        """1 枚ぶんの積み重ねを時間で区切り、区間ごとに 1 枚ずつ書き出す。"""
+        chunks = plan_still_chunks(data, self.dm.recfps,
+                                   self.still_split_minutes)
+        if not chunks:
+            self.log_signal.emit(tr("render_no_output"))
+            self.done_signal.emit(False, "")
+            return
+        n, total, _each = still_chunk_summary(chunks)
+        self.log_signal.emit(tr("still_split_applied",
+                                total=_fmt_dur(total), n=n))
+        if self.imgtype:
+            self.dm.imgtype = self.imgtype
+        for i, (i0, i1, s_sec, e_sec) in enumerate(chunks, 1):
+            self.log_signal.emit(tr(
+                "still_chunk_run", i=i, n=n, s=_fmt_dur(s_sec),
+                e=_fmt_dur(e_sec), w=(i1 - i0) // self.scan_step))
+            # SlitScan.py と同じ手順: 区間ごとに data と命名状態を作り直す
+            self.dm.data = np.ascontiguousarray(data[:, i0:i1, :])
+            self.dm.log = 0
+            self.dm.out_name_attr = ""
+            self.dm.sepVideoOut = 1
+            self.dm.new_transprocess(
+                out_type=0, scan_step=self.scan_step, del_data=False,
+                use_pyav=True,
+                title_atr=f"_{s_sec / 60:.0f}-{e_sec / 60:.0f}min")
+        self.done_signal.emit(True, "")
 
     def _audio_desc(self):
         fx = [k.replace("depth_", "") for k, v in self.audio_kwargs.items()
@@ -2306,6 +2332,15 @@ class DrawManeuverGUI(QWidget):
         self.split_row.addWidget(self.split_min_spin)
         self.split_unit_label = self._trlabel("unit_minutes")
         self.split_row.addWidget(self.split_unit_label)
+        # 時間軸の間引き (出力幅 = 区間フレーム数 / scan_step)
+        self.scan_step_label = self._trlabel("lbl_scan_step")
+        self.split_row.addWidget(self.scan_step_label)
+        self.scan_step_spin = QSpinBox()
+        self.scan_step_spin.setRange(1, 64)
+        self.scan_step_spin.setValue(1)
+        self._reg(lambda: self.scan_step_spin.setToolTip(tr("tip_scan_step")))
+        self.scan_step_spin.valueChanged.connect(lambda *_: self._sync_still_split())
+        self.split_row.addWidget(self.scan_step_spin)
         self.split_row.addStretch()
         acc.addLayout(self.split_row)
         self.split_info = QLabel("")
@@ -2342,30 +2377,37 @@ class DrawManeuverGUI(QWidget):
                 w.setVisible(show)
         self.split_hint.setVisible(show)
         by_time = self.still_split_combo.currentData() == "time"
-        self.split_min_spin.setVisible(show and by_time)
-        self.split_unit_label.setVisible(show and by_time)
+        for w in (self.split_min_spin, self.split_unit_label,
+                  self.scan_step_label, self.scan_step_spin):
+            w.setVisible(show and by_time)
         if not (show and by_time):
             self.split_info.setVisible(False)
             return
         data = getattr(self.dm, "data", None) if self.dm else None
-        n, each, total = plan_still_split(
+        chunks = plan_still_chunks(
             data, getattr(self.dm, "recfps", 30.0), self.split_min_spin.value())
-        self.split_info.setText(tr("still_split_info", total=_fmt_dur(total),
-                                   each=_fmt_dur(each), n=n))
+        n, total, each = still_chunk_summary(chunks)
+        if n == 0:
+            self.split_info.setVisible(False)
+            return
+        # 最後の区間だけ短くなる (SlitScan.py と同じ区切り方)
+        tail = ""
+        if n > 1 and abs(each[-1] - each[0]) > 0.05:
+            tail = tr("still_split_tail", last=_fmt_dur(each[-1]))
+        self.split_info.setText(
+            tr("still_split_info", total=_fmt_dur(total),
+               each=_fmt_dur(each[0]), n=n) + tail)
         self.split_info.setVisible(True)
 
-    def still_split_count(self):
-        """レンダリング時に分割する枚数 (分割しないなら 1)。"""
+    def still_split_minutes(self):
+        """分割して出力するときの 1 枚あたりの分数 (分割しないなら None)。"""
         if not self._was_single:
-            return 1
+            return None
         if self.out_kind_combo.currentData() != "still":
-            return 1
+            return None
         if self.still_split_combo.currentData() != "time":
-            return 1
-        data = getattr(self.dm, "data", None) if self.dm else None
-        n, _each, _total = plan_still_split(
-            data, getattr(self.dm, "recfps", 30.0), self.split_min_spin.value())
-        return n
+            return None
+        return float(self.split_min_spin.value())
 
     def _on_out_kind(self, *_):
         """動画 / 連番画像 で表示する設定を切り替える。"""
@@ -3456,7 +3498,8 @@ class DrawManeuverGUI(QWidget):
             audio_only=audio_only,
             video_path=self._last_video_path,
             full_data=self._last_full_data,
-            still_split=self.still_split_count(),
+            still_split_minutes=self.still_split_minutes(),
+            scan_step=int(self.scan_step_spin.value()),
         )
         self._pending_render_key = key
         self._render_worker.log_signal.connect(self.log)
