@@ -1179,7 +1179,11 @@ class RealtimePreviewWidget(QWidget):
         self._srcH = None
         self._loaded = 0       # デコード/アップロード済みフレーム数
         self._vol_mb = 0.0
-        self._dims = None      # (ow, oh)
+        self._dims = None      # (ow, oh) = 出力バッファの寸法
+        # 出力の積み重ね軸 (スキャン軸) の本番ピクセル数。None なら入力映像と同じ。
+        # addSlicePlane(aspect_mode='fix') や拡張系のように出力の幅が入力と
+        # 変わるチェーンでは、これを渡してもらわないと入力映像の形で描いてしまう。
+        self._out_stack = None
         self._playhead = 0.0   # 常駐ボリューム内の位置 [0, F)
         self._qimg_buf = None
 
@@ -1443,7 +1447,12 @@ class RealtimePreviewWidget(QWidget):
     def set_params(self, mode=None, space_set=None, vmin=None, vmax=None,
                    baseline=None, maxdev=None, time_size=None, out_fps=None,
                    sd=None, rec_fps=None, use_range="__keep__",
-                   sync_anchor=None):
+                   sync_anchor=None, out_stack="__keep__"):
+        if out_stack != "__keep__":
+            new = int(out_stack) if out_stack else None
+            if new != self._out_stack:
+                self._out_stack = new
+                self._apply_output_dims()
         if use_range != "__keep__":
             self.use_range = use_range    # None = 全尺 (明示渡しのみ更新)
         if sync_anchor is not None:
@@ -1516,6 +1525,58 @@ class RealtimePreviewWidget(QWidget):
     def _backend_kind(self):
         return "GPU/wgpu" if isinstance(self._backend, _WgpuBackend) else "CPU/numpy"
 
+    # 出力バッファの長辺の上限 (これを超える分はソースボリュームごと縮める)
+    MAX_OUT_PX = 8192
+
+    def _plan_output(self, sw, sh, in_w, in_h):
+        """出力バッファ (ow, oh) を決める。戻り値は (sw, sh, ow, oh)。
+
+        シェーダーは固定軸 (縦スリットなら Y) をソース行の素通しで描くため、
+        固定軸は常にソースボリュームと同寸。積み重ね軸だけ本番の本数
+        (_out_stack) をソースと同じ縮尺で縮めた長さにする。
+        出力が長辺の上限を超える場合はソースボリュームごと縮めて比率を保つ。
+        """
+        sd = int(self.scan_direction)
+        src_stack = in_w if sd == 1 else in_h
+        stack = self._out_stack
+        if not stack or stack == src_stack:
+            return sw, sh, sw, sh
+        if sd == 1:
+            scale = sh / max(1.0, float(in_h))
+            ow, oh = max(1, int(round(stack * scale))), sh
+        else:
+            scale = sw / max(1.0, float(in_w))
+            ow, oh = sw, max(1, int(round(stack * scale)))
+        long_side = max(ow, oh)
+        if long_side > self.MAX_OUT_PX:
+            k = self.MAX_OUT_PX / float(long_side)
+            sw = max(2, int(round(sw * k)))
+            sh = max(2, int(round(sh * k)))
+            ow = max(1, int(round(ow * k)))
+            oh = max(1, int(round(oh * k)))
+        return sw, sh, ow, oh
+
+    def _apply_output_dims(self):
+        """構築済みのプレビューに対して出力寸法だけ作り直す (再デコード不要)。"""
+        if self._backend is None or self._srcW is None or not self._dims:
+            return
+        in_w = getattr(self, "_in_w", None)
+        in_h = getattr(self, "_in_h", None)
+        if not in_w or not in_h:
+            return
+        sw, sh, ow, oh = self._plan_output(self._srcW, self._srcH, in_w, in_h)
+        if (sw, sh) != (self._srcW, self._srcH):
+            # ソースボリュームの縮小が必要 = デコードし直しが要る
+            self.rebuild()
+            return
+        if (ow, oh) == tuple(self._dims):
+            return
+        self._backend.finalize(ow, oh)
+        self._dims = (ow, oh)
+        if oh > 0:
+            self.previewAspectReady.emit(ow / oh)
+        self._render_once()
+
     def rebuild(self):
         """プログレッシブ再構築: 黒ボリュームを確保して即再生を開始し、
         バックグラウンドの順次デコードが進むにつれてピクセルに色が付いていく。"""
@@ -1549,7 +1610,7 @@ class RealtimePreviewWidget(QWidget):
         range_len = z1 - z0 + 1
 
         sw, sh, F = plan_volume(in_w, in_h, range_len)
-        ow, oh = sw, sh
+        sw, sh, ow, oh = self._plan_output(sw, sh, in_w, in_h)
         self._F = F
         self._srcW, self._srcH = sw, sh
         self._dims = (ow, oh)

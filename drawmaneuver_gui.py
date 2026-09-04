@@ -3426,8 +3426,16 @@ class DrawManeuverGUI(QWidget):
         # プレビューデータはプロキシ解像度: 空間座標は 0..(preview_scan-1)
         scan_full = int(self.preview_scan_spin.value())
         self.rt_preview.set_maneuver(data, scan_full)
+        # 出力の積み重ね軸の本番ピクセル数 (data_info の表示と同じ求め方)。
+        # プロキシ本数のままだと、addSlicePlane(aspect_mode='fix') のように
+        # 出力の幅が入力と異なるチェーンで、入力映像の形のまま描いてしまう。
+        proxy = max(2, scan_full)
+        real = int(self.dm.scan_nums)
+        out_stack = real if (data.shape[1] <= proxy and real > proxy) \
+            else int(data.shape[1])
         self.rt_preview.set_params(time_size=int(data.shape[0]),
-                                   out_fps=int(self.dm.outfps))
+                                   out_fps=int(self.dm.outfps),
+                                   out_stack=out_stack)
         if self.rt_preview._backend is not None:
             self.rt_preview.refresh_maps()
 
