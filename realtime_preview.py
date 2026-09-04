@@ -181,9 +181,23 @@ def _decode_ffmpeg_vt(video_path, sw, sh, idxs, batch_cb,
     ss = z0 / fps
     dur = (z1 - z0) / fps + 2.0     # GOP ぶんのマージン
 
-    vf = (f"scale_vt=w={sw}:h={sh},hwdownload,format={dlfmt},"
+    # Display Matrix 回転は ffmpeg 任せにしない (-noautorotate)。
+    # 自動回転はフィルタチェーンの「後ろ」に足されるため、±90° の素材では
+    # scale_vt で (sw, sh) に縮めた後に転置され、こちらが読み出す
+    # sw*sh*3 バイトの並びと食い違って絵が斜めに崩れる。
+    # ここでは回転前の向きで縮小し、小さくなったフレームを自分で回す
+    # (PyAV 経路の to_rgba と同じ扱い)。
+    rotation = 0
+    try:
+        from imgtrans_lib._utils import probe_video_rotation
+        rotation = int(probe_video_rotation(video_path))
+    except Exception:
+        pass
+    swap = (abs(rotation) % 180) == 90
+    vt_w, vt_h = (sh, sw) if swap else (sw, sh)
+    vf = (f"scale_vt=w={vt_w}:h={vt_h},hwdownload,format={dlfmt},"
           f"format=rgb24,showinfo")
-    cmd = ["ffmpeg", "-v", "info", "-nostats",
+    cmd = ["ffmpeg", "-v", "info", "-nostats", "-noautorotate",
            "-hwaccel", "videotoolbox",
            "-hwaccel_output_format", "videotoolbox_vld"]
     if keyframes_only:
@@ -208,7 +222,7 @@ def _decode_ffmpeg_vt(video_path, sw, sh, idxs, batch_cb,
 
     threading.Thread(target=read_stderr, daemon=True).start()
 
-    frame_bytes = sw * sh * 3
+    frame_bytes = vt_w * vt_h * 3
     buf = []
     start = 0
     j = 0
@@ -235,7 +249,9 @@ def _decode_ffmpeg_vt(video_path, sw, sh, idxs, batch_cb,
                 break
             got_any = True
             fi = z0 + int(round(pts * fps))
-            arr = np.frombuffer(data, np.uint8).reshape(sh, sw, 3)
+            arr = np.frombuffer(data, np.uint8).reshape(vt_h, vt_w, 3)
+            if rotation:
+                arr = np.ascontiguousarray(np.rot90(arr, k=int(rotation / 90)))
             rgba = np.empty((sh, sw, 4), np.uint8)
             rgba[..., :3] = arr
             rgba[..., 3] = 255
