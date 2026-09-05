@@ -67,6 +67,8 @@ _T = {
     "decode_fail": {"ja": "デコード失敗: {err}", "en": "Decode failed: {err}"},
     "ready": {"ja": "準備完了  S={sw}×{sh}, F={F}  ≈{mb:.0f} MB  [{kind}]",
               "en": "Ready  S={sw}×{sh}, F={F}  ≈{mb:.0f} MB  [{kind}]"},
+    "refresh_center": {"ja": "↻ チェーンが変わりました — プレビューを更新",
+                       "en": "↻ Chain changed — refresh preview"},
     "build_center": {"ja": "▶ プレビューを構築 / Build Preview",
                       "en": "▶ Build Preview"},
     "mode_info": {"ja": "適用: {m}", "en": "mode: {m}"},
@@ -1161,6 +1163,7 @@ class FlowRow(QWidget):
 class RealtimePreviewWidget(QWidget):
     """Tab3 に埋め込む GPU リアルタイム軸間変換プレビュー。"""
 
+    rebuilt = pyqtSignal()                          # rebuild() が走った
     _batch_decoded = pyqtSignal(int, int, object)  # (gen, start, frames)
     _decode_finished = pyqtSignal(int, object)     # (gen, error)
     # 映像の実アスペクト比 (幅÷高さ) が判明するたびに発火。埋め込み側が、
@@ -1239,6 +1242,7 @@ class RealtimePreviewWidget(QWidget):
             self._speed_label.setText(self._t("speed"))
             self.rebuild_btn.setText(self._t("rebuild"))
             self.center_btn.setText(self._t("build_center"))
+            self.refresh_btn.setText(self._t("refresh_center"))
             self.audio_chk.setText(self._t("audio"))
             self.audio_method.setItemText(0, self._t("audio_grain"))
             self.audio_method.setItemText(1, self._t("audio_play"))
@@ -1283,6 +1287,22 @@ class RealtimePreviewWidget(QWidget):
             "QPushButton:disabled { background: #444; color: #999; }")
         self.center_btn.adjustSize()
         self.center_btn.clicked.connect(self.rebuild)
+
+        # --- 構築済みプレビューの上に出す「更新」ボタン ---
+        # メソッドチェーンが変わると maps だけは即座に差し替わるが、常駐している
+        # 映像の時間範囲は古いままなので、範囲を超えた分は端でクランプされる。
+        # 正確な絵に戻すには再構築が要ることを、絵を隠さない半透明の
+        # オーバーレイで知らせる (mark_stale / rebuild で出し入れする)。
+        self.refresh_btn = QPushButton(self._t("refresh_center"), self.view)
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.setStyleSheet(
+            "QPushButton { background: rgba(230, 140, 20, 215); color: white;"
+            " border-radius: 8px; padding: 12px 24px; font-size: 14px;"
+            " font-weight: bold; }"
+            "QPushButton:hover { background: rgba(245, 160, 40, 240); }")
+        self.refresh_btn.adjustSize()
+        self.refresh_btn.clicked.connect(self.rebuild)
+        self.refresh_btn.hide()
 
         # --- デコード進捗バー (映像を隠さないよう下部に細く表示) ---
         # プログレッシブ表示: 再生は即開始し、デコード済み領域から色が付く。
@@ -1429,10 +1449,21 @@ class RealtimePreviewWidget(QWidget):
         return super().eventFilter(obj, ev)
 
     def _center_overlays(self):
-        w = self.center_btn
-        w.adjustSize()
-        w.move((self.view.width() - w.width()) // 2,
-               (self.view.height() - w.height()) // 2)
+        for w in (self.center_btn, self.refresh_btn):
+            w.adjustSize()
+            w.move((self.view.width() - w.width()) // 2,
+                   (self.view.height() - w.height()) // 2)
+
+    def mark_stale(self):
+        """構築済みのプレビューが、いま表示中のチェーンと食い違っていることを示す。"""
+        if self._backend is None or self._F is None:
+            return                      # 未構築なら center_btn が出ているので不要
+        self.refresh_btn.show()
+        self.refresh_btn.raise_()
+        self._center_overlays()
+
+    def clear_stale(self):
+        self.refresh_btn.hide()
 
     # ---- 外部 API ----
     def set_video(self, path):
@@ -1453,6 +1484,7 @@ class RealtimePreviewWidget(QWidget):
             self.view.setPixmap(QPixmap())
             self.view.setText(self._t("placeholder"))
             self.center_btn.show()
+            self.refresh_btn.hide()
             self._center_overlays()
 
     def set_maps(self, space_path=None, time_path=None, rate_path=None):
@@ -1652,6 +1684,8 @@ class RealtimePreviewWidget(QWidget):
         self._t_out = 0.0
         self._update_time_label()
         self.center_btn.hide()
+        self.refresh_btn.hide()
+        self.rebuilt.emit()
         self.decode_bar.setValue(0)
         self.decode_bar.show()
         self.status.setText(self._t(

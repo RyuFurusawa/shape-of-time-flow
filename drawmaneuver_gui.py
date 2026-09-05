@@ -29,6 +29,7 @@ import time
 import json
 import shutil
 import glob
+import html
 import inspect
 import subprocess
 import traceback
@@ -80,6 +81,17 @@ TR = {
     "btn_select_video": {"ja": "動画を選択 / Select Video File",
                           "en": "Select Video File"},
     "no_video": {"ja": "動画が未選択です", "en": "No video file selected"},
+    "drop_placeholder": {"ja": "🎬 ここに動画をドラッグ＆ドロップ\n(または上のボタンで選択)",
+                          "en": "🎬 Drop a video here\n(or use the button above)"},
+    "btn_play": {"ja": "▶ 再生", "en": "▶ Play"},
+    "btn_pause": {"ja": "⏸ 停止", "en": "⏸ Pause"},
+    "tip_play": {"ja": "入力映像をこの場で再生 (使用範囲があればその中をループ)",
+                 "en": "Play the input here (loops inside the used range if any)"},
+    "btn_reveal_video": {"ja": "Finder で表示 📁", "en": "Reveal in Finder 📁"},
+    "tip_reveal_video": {"ja": "入力映像のファイルを Finder で選択状態にして開く",
+                          "en": "Reveal the input video file in Finder"},
+    "lbl_out_size": {"ja": "出力 {w} × {h} px　{f} frames",
+                      "en": "Output {w} × {h} px　{f} frames"},
     "chk_vertical": {"ja": "縦スリット (Vertical)", "en": "Vertical slit"},
     "slit_h": {"ja": "スリット方向: 横 (horizontal)", "en": "Slit: horizontal"},
     "slit_v": {"ja": "スリット方向: 縦 (vertical)", "en": "Slit: vertical"},
@@ -686,6 +698,9 @@ class ManeuverTimelineSlider(QWidget):
     def set_playhead(self, f):
         self._pos = min(max(0.0, float(f)), 1.0)
         self.update()
+
+    def playhead(self):
+        return self._pos
 
     def used_range(self):
         return self._used
@@ -1814,6 +1829,7 @@ class DrawManeuverGUI(QWidget):
         self._auto_still = False     # 連番画像へ自動で切り替えたか
         self._last_3d_png = ""       # 直近の 3D プロット静止画
         self._plot_full = (None, None)  # 原寸表示のソース
+        self._rt_built_key = None    # GPU プレビューを構築した時点のチェーン指紋
         self._output_path = ""      # 直近の書き出し先
         self._output_is_dir = False
         self.dm = None
@@ -1902,13 +1918,41 @@ class DrawManeuverGUI(QWidget):
                                    else self.video_label.setText(tr("no_video"))))
         sg.addWidget(self.video_label)
 
-        self.video_preview = QLabel()
+        # 未選択のあいだはドロップ先であることを示すプレースホルダを出す
+        self.video_preview = QLabel(tr("drop_placeholder"))
         self.video_preview.setAlignment(Qt.AlignCenter)
         self.video_preview.setFixedHeight(150)
-        self.video_preview.setStyleSheet(
-            "QLabel { background:#111; border:1px solid #555; }")
-        self.video_preview.setVisible(False)
+        self.video_preview.setWordWrap(True)
+        self._reg(lambda: (None if self._vid_info
+                           else self.video_preview.setText(tr("drop_placeholder"))))
+        self._style_video_preview(empty=True)
         sg.addWidget(self.video_preview)
+
+        # 再生 / Finder で表示 (映像を読み込むまでは隠す)
+        vp_row = QHBoxLayout()
+        self.play_btn = QPushButton()
+        self.play_btn.setCheckable(True)
+        self._reg(lambda: (self.play_btn.setText(
+                               tr("btn_pause") if self.play_btn.isChecked()
+                               else tr("btn_play")),
+                           self.play_btn.setToolTip(tr("tip_play"))))
+        self.play_btn.toggled.connect(self._on_play_toggled)
+        self.play_btn.setVisible(False)
+        vp_row.addWidget(self.play_btn)
+        self.reveal_btn = QPushButton()
+        self._reg(lambda: (self.reveal_btn.setText(tr("btn_reveal_video")),
+                           self.reveal_btn.setToolTip(tr("tip_reveal_video"))))
+        self.reveal_btn.clicked.connect(self.reveal_video_in_finder)
+        self.reveal_btn.setVisible(False)
+        vp_row.addWidget(self.reveal_btn)
+        vp_row.addStretch()
+        sg.addLayout(vp_row)
+        # 再生は壁時計駆動 (重い素材ではフレームを落として実時間を保つ)
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(33)
+        self._play_timer.timeout.connect(self._on_play_tick)
+        self._play_t0 = 0.0
+        self._play_i0 = 0
         self.video_dim_label = QLabel("")
         self.video_dim_label.setStyleSheet("color:gray; font-size:10px;")
         sg.addWidget(self.video_dim_label)
@@ -2081,6 +2125,7 @@ class DrawManeuverGUI(QWidget):
         self.data_info = QLabel("")
         self.data_info.setAlignment(Qt.AlignCenter)
         self.data_info.setWordWrap(True)
+        self.data_info.setTextFormat(Qt.RichText)
         self.data_info.setStyleSheet(
             "QLabel { background:#eef4fb; border:1px solid #b8cfe6;"
             " border-radius:4px; color:#1f3d5c; font-size:12px;"
@@ -2194,6 +2239,7 @@ class DrawManeuverGUI(QWidget):
             rv.setContentsMargins(4, 4, 4, 4)
             self.rt_preview = ManeuverRTPreview(lang=LANG)
             self.rt_preview.previewAspectReady.connect(self._on_preview_aspect)
+            self.rt_preview.rebuilt.connect(self._on_rt_rebuilt)
             rv.addWidget(self.rt_preview)
         else:
             self.rt_group = None
@@ -2776,6 +2822,88 @@ class DrawManeuverGUI(QWidget):
         ev.acceptProposedAction()
         self._apply_selected_video(path)
 
+    def _style_video_preview(self, empty):
+        if empty:
+            self.video_preview.setStyleSheet(
+                "QLabel { background:#f4f6f9; color:#6b7a8c; font-size:12px;"
+                " border:2px dashed #9fb3c8; border-radius:6px; }")
+        else:
+            self.video_preview.setStyleSheet(
+                "QLabel { background:#111; border:1px solid #555; }")
+
+    # ---- 入力映像のその場再生 ----
+    _play_from_tick = False
+
+    def _on_play_toggled(self, on):
+        self.play_btn.setText(tr("btn_pause") if on else tr("btn_play"))
+        if on:
+            self._start_play()
+        else:
+            self._stop_play()
+
+    def _play_bounds(self):
+        """再生する入力フレーム範囲 [i0, i1)。使用範囲があればその中をループ。"""
+        n = int(self._vid_info[3])
+        used = self.timeline.used_range()
+        if used:
+            i0 = int(used[0] * max(0, n - 1))
+            i1 = max(i0 + 1, int(used[1] * max(0, n - 1)) + 1)
+        else:
+            i0, i1 = 0, n
+        return i0, min(i1, n)
+
+    def _start_play(self):
+        if self._vid_info is None:
+            self.play_btn.setChecked(False)
+            return
+        i0, i1 = self._play_bounds()
+        cur = int(self.timeline.playhead() * max(0, self._vid_info[3] - 1))
+        if not (i0 <= cur < i1 - 1):
+            cur = i0
+        self._play_i0 = cur
+        self._play_t0 = time.time()
+        fps = float(self._vid_info[2]) or 30.0
+        self._play_timer.setInterval(int(max(16, 1000.0 / min(fps, 30.0))))
+        self._play_timer.start()
+
+    def _stop_play(self):
+        self._play_timer.stop()
+        if self.play_btn.isChecked():
+            self.play_btn.blockSignals(True)
+            self.play_btn.setChecked(False)
+            self.play_btn.blockSignals(False)
+        self.play_btn.setText(tr("btn_play"))
+
+    def _on_play_tick(self):
+        if self._vid_info is None:
+            self._stop_play()
+            return
+        i0, i1 = self._play_bounds()
+        fps = float(self._vid_info[2]) or 30.0
+        span = max(1, i1 - i0)
+        # 壁時計から現在フレームを決める → 追いつけないぶんは自然に飛ぶ
+        idx = self._play_i0 + int((time.time() - self._play_t0) * fps)
+        idx = i0 + (idx - i0) % span
+        self._read_video_frame(idx)
+        self._present_video_frame()
+        self._play_from_tick = True
+        try:
+            self.timeline.set_playhead(idx / max(1, self._vid_info[3] - 1))
+        finally:
+            self._play_from_tick = False
+        self._update_timeline_readout()
+
+    def reveal_video_in_finder(self):
+        """入力映像を Finder (macOS) で選択状態にして開く。他 OS はフォルダを開く。"""
+        path = self.videopath_src or self.videopath
+        if not path or not os.path.exists(path):
+            self.log(tr("open_output_gone", p=path or "(不明)"))
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+
     def _open_video_preview(self, path):
         if self._vid_cap is not None:
             try:
@@ -2786,11 +2914,14 @@ class DrawManeuverGUI(QWidget):
         self._vid_info = None
         self._vid_pos = -1
         self._vid_frame_cache = None
+        self._stop_play()
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            self.video_preview.setVisible(False)
-            for wgt in (self.timeline_label, self.timeline,
-                        self.timeline_readout, self.timeline_hint):
+            self.video_preview.setPixmap(QPixmap())
+            self.video_preview.setText(tr("drop_placeholder"))
+            self._style_video_preview(empty=True)
+            for wgt in (self.timeline_label, self.timeline, self.play_btn,
+                        self.reveal_btn, self.timeline_readout, self.timeline_hint):
                 wgt.setVisible(False)
             return
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2801,9 +2932,9 @@ class DrawManeuverGUI(QWidget):
         self._vid_info = (w, h, fps, n, n / max(1e-6, fps))
         self.video_dim_label.setText(
             tr("vid_info", w=w, h=h, n=n, fps=fps, dur=n / max(1e-6, fps)))
-        self.video_preview.setVisible(True)
-        for wgt in (self.timeline_label, self.timeline,
-                    self.timeline_readout, self.timeline_hint):
+        self._style_video_preview(empty=False)
+        for wgt in (self.timeline_label, self.timeline, self.play_btn,
+                    self.reveal_btn, self.timeline_readout, self.timeline_hint):
             wgt.setVisible(True)
         self.timeline.set_used_range(None, None)
         self.timeline.set_playhead(0.0)
@@ -2881,6 +3012,8 @@ class DrawManeuverGUI(QWidget):
     def _on_scrub(self, frac):
         if self._vid_info is None:
             return
+        if self._play_timer.isActive() and not self._play_from_tick:
+            self._stop_play()          # 手でつまみを動かしたら再生は止める
         self._read_video_frame(frac * max(0, self._vid_info[3] - 1))
         self._present_video_frame()
         self._update_timeline_readout()
@@ -3334,15 +3467,23 @@ class DrawManeuverGUI(QWidget):
         # 表示するのは「書き出される data の形状」。プレビューは間引いた
         # 本数で計算しているので、そのままだと slits が実際と食い違う。
         out_slits = real if factor != 1.0 else int(data.shape[1])
-        info = tr(
+        # 出力画像の実ピクセル寸法: 積み重ね軸が out_slits、もう一方は映像そのまま
+        if int(self.dm.scan_direction) % 2 == 1:
+            out_w, out_h = out_slits, int(self.dm.height)
+        else:
+            out_w, out_h = int(self.dm.width), out_slits
+        big = tr("lbl_out_size", w=out_w, h=out_h, f=int(data.shape[0]))
+        detail = tr(
             "lbl_data_info", f=int(data.shape[0]), s=out_slits,
             zmin=float(data[:, :, 1].min()), zmax=float(data[:, :, 1].max()),
             smin=float(disp[:, :, 0].min()), smax=float(disp[:, :, 0].max()))
         if factor != 1.0:
-            info += tr("proxy_note", p=int(data.shape[1]), r=real)
+            detail += tr("proxy_note", p=int(data.shape[1]), r=real)
+        lines = [f'<span style="font-size:17px; font-weight:bold;">{html.escape(big)}</span>',
+                 f'<span style="font-size:11px; font-weight:normal;">{html.escape(detail)}</span>']
         if note:
-            info += "\n" + note
-        self._set_data_info(info)
+            lines.append(f'<span style="font-size:11px; font-weight:normal;">{html.escape(note)}</span>')
+        self._set_data_info("<br>".join(lines))
 
     def _render_3d_still(self):
         """1 フレームぶんの 3D プロットを描いて QPixmap で返す。"""
@@ -3438,6 +3579,18 @@ class DrawManeuverGUI(QWidget):
                                    out_stack=out_stack)
         if self.rt_preview._backend is not None:
             self.rt_preview.refresh_maps()
+            # maps は差し替わるが常駐している映像の時間範囲は古いまま。
+            # チェーンが前回の構築時から変わっていれば「更新」を促す。
+            if self._chain_key() != self._rt_built_key:
+                self.rt_preview.mark_stale()
+
+    def _chain_key(self):
+        return json.dumps(self.enabled_specs(), sort_keys=True, default=str)
+
+    def _on_rt_rebuilt(self):
+        """GPU プレビューを構築したら、そのときのチェーンを覚えておく。"""
+        self._rt_built_key = self._chain_key()
+        self._stop_play()               # GPU 再生と入力再生を同時には回さない
 
     # ---- アクション ----
     def _is_busy(self):
@@ -3537,6 +3690,7 @@ class DrawManeuverGUI(QWidget):
                       and os.path.exists(self._last_video_path))
         self._rendering = True
         self._rebuild_timer.stop()
+        self._stop_play()
         self._set_busy(True)
         self.open_output_btn.setVisible(False)
         self.render_progress.setVisible(True)
