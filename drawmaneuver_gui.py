@@ -4081,7 +4081,9 @@ class DrawManeuverGUI(QWidget):
         if rt is None or not rt.is_preview_ready():
             QMessageBox.information(self, "Info", tr("save_preview_need"))
             return
-        path = self._unique_out_path("preview")
+        # 1 フレームだけのデータは動画にならないので静止画で出す
+        single = int(getattr(rt, "time_size", 0) or 0) <= 1
+        path = self._unique_out_path("preview", ".png" if single else ".mp4")
         self._saving_preview = True
         self._set_busy(True)
         try:
@@ -4117,14 +4119,14 @@ class DrawManeuverGUI(QWidget):
             self.log(text)
             self._status_active = True
 
-    def _unique_out_path(self, kind):
+    def _unique_out_path(self, kind, ext=".mp4"):
         """作業ディレクトリ内で衝突しないパスを返す。"""
         stem = os.path.splitext(os.path.basename(self.videopath or ""))[0]
         base = f"{kind}_{stem}" if stem else kind
-        path = os.path.join(self._work_dir, base + ".mp4")
+        path = os.path.join(self._work_dir, base + ext)
         n = 2
         while os.path.exists(path):
-            path = os.path.join(self._work_dir, f"{base}_{n}.mp4")
+            path = os.path.join(self._work_dir, f"{base}_{n}{ext}")
             n += 1
         return path
 

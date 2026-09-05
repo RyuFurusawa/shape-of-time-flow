@@ -1901,10 +1901,11 @@ class RealtimePreviewWidget(QWidget):
 
     def export_preview_video(self, out_path, progress_cb=None,
                              should_stop=None):
-        """いま見えているプレビューをそのまま連続レンダリングして動画にする。
+        """いま見えているプレビューをそのまま連続レンダリングして書き出す。
 
         本レンダリングと違い、プレビュー解像度・プレビュー品質のままの
-        「確認用の簡易動画」。音声は付かない。
+        「確認用」。音声は付かない。1 フレームしかない場合は動画にせず
+        静止画 (PNG) で書き出す (out_path の拡張子も .png へ寄せる)。
 
         戻り値: 書き出したパス (失敗時は "")。
         """
@@ -1913,6 +1914,24 @@ class RealtimePreviewWidget(QWidget):
         ow, oh = self._dims
         n = max(1, int(self.time_size))
         fps = float(self.out_fps) or 30.0
+
+        # --- 1 フレームだけなら静止画で出す ---
+        if n == 1:
+            saved_t, saved_head = self._t_out, self._playhead
+            try:
+                self._t_out = 0.0
+                self._playhead = self._playhead_from_tout()
+                img = self._backend.render(self._params())
+                still = os.path.splitext(out_path)[0] + ".png"
+                ok = cv2.imwrite(still, cv2.cvtColor(
+                    np.ascontiguousarray(img), cv2.COLOR_RGB2BGR))
+                if progress_cb is not None:
+                    progress_cb(1, 1)
+            finally:
+                self._t_out, self._playhead = saved_t, saved_head
+                self._render_once()
+            return still if ok and os.path.exists(still) else ""
+
         writer = None
         for tag in ("avc1", "mp4v"):
             wr = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*tag),
