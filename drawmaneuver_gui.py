@@ -1979,6 +1979,9 @@ class RenderWorker(QThread):
                 f"=== new_transprocess (out_type={self.out_type}"
                 + (f", imgtype={self.imgtype}" if self.out_type == 0 else "")
                 + ") ===")
+            img_dir = os.path.join(os.getcwd(), "img")
+            imgs_before = set(glob.glob(os.path.join(img_dir, "*"))) \
+                if os.path.isdir(img_dir) else set()
             self.dm.new_transprocess(separate_num=self.separate_num,
                                      out_type=self.out_type, del_data=False)
             path = getattr(self.dm, "out_videopath", "") or ""
@@ -1991,6 +1994,19 @@ class RenderWorker(QThread):
             if self.out_type != 0 and not self.video_only_path:
                 self.log_signal.emit(tr("render_no_output"))
                 self.done_signal.emit(False, "")
+                return
+            if self.out_type == 0:
+                # 連番画像は out_videopath を持たないので、img/ に増えた
+                # ファイルの有無で成否を見る (z<0 などで 1 枚も出ないことがある)
+                imgs_now = set(glob.glob(os.path.join(img_dir, "*"))) \
+                    if os.path.isdir(img_dir) else set()
+                if not (imgs_now - imgs_before):
+                    self.log_signal.emit(tr("render_no_output"))
+                    self.done_signal.emit(False, "")
+                    return
+                # 連番画像は単一ファイルにならないので、書き出し先フォルダを報告する
+                # (従来は path が空で「完了: (不明)」になっていた)
+                self.done_signal.emit(True, os.path.abspath(img_dir))
                 return
 
             # 3) 音声 (プレビュー設定と同じく audio_video_out へ)
