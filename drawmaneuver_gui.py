@@ -82,6 +82,10 @@ TR = {
     "btn_select_video": {"ja": "動画を選択 / Select Video File",
                           "en": "Select Video File"},
     "no_video": {"ja": "動画が未選択です", "en": "No video file selected"},
+    "chk_slit_guide": {"ja": "スリットのガイド線を重ねる",
+                        "en": "Overlay slit guides"},
+    "tip_slit_guide": {"ja": "入力映像の上に、スリット方向を示す緑→赤のガイド線を重ねる",
+                        "en": "Overlay green→red guide lines showing the slit direction"},
     "drop_placeholder": {"ja": "🎬 ここに動画をドラッグ＆ドロップ\n(または上のボタンで選択)",
                           "en": "🎬 Drop a video here\n(or use the button above)"},
     "btn_play": {"ja": "▶ 再生", "en": "▶ Play"},
@@ -2261,6 +2265,12 @@ class DrawManeuverGUI(QWidget):
         self._reg(lambda: self.slit_label.setText(
             tr("slit_v") if self.slit_toggle.isChecked() else tr("slit_h")))
         sg.addWidget(self.slit_label)
+        self.slit_guide_chk = QCheckBox()
+        self.slit_guide_chk.setChecked(True)
+        self._reg(lambda: (self.slit_guide_chk.setText(tr("chk_slit_guide")),
+                           self.slit_guide_chk.setToolTip(tr("tip_slit_guide"))))
+        self.slit_guide_chk.toggled.connect(lambda *_: self._present_video_frame())
+        sg.addWidget(self.slit_guide_chk)
 
         vrow = QHBoxLayout()
         vrow.addWidget(self._trlabel("lbl_video_rotate"))
@@ -3277,7 +3287,8 @@ class DrawManeuverGUI(QWidget):
         qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
                       rgb.shape[1] * 3, QImage.Format_RGB888).copy()
         pm = QPixmap.fromImage(qimg)
-        self._draw_slit_overlay(pm)
+        if self.slit_guide_chk.isChecked():
+            self._draw_slit_overlay(pm)
         self.video_preview.setPixmap(pm)
         if self._vid_info:
             self.video_preview.setToolTip(f"frame {idx} / {self._vid_info[3]}")
