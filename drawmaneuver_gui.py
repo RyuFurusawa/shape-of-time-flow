@@ -40,9 +40,10 @@ from PyQt5.QtWidgets import (
     QComboBox, QTextEdit, QCheckBox, QMessageBox, QSpinBox, QDoubleSpinBox,
     QFrame, QGroupBox, QScrollArea, QSplitter, QProgressBar, QSizePolicy,
     QSlider, QLineEdit, QFileDialog, QToolButton, QDialog,
+    QListWidget, QListWidgetItem,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint, QSize, QUrl
-from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor,
+from PyQt5.QtGui import (QImage, QPixmap, QPainter, QPen, QColor, QIcon,
                          QMovie, QImageReader, QFont, QTextCursor,
                          QTextCharFormat, QTextDocument, QDesktopServices)
 
@@ -117,6 +118,19 @@ TR = {
     # --- ステップチェーン ---
     "grp_chain": {"ja": "メソッドチェーン (Maneuver Steps)", "en": "Method chain"},
     "lbl_category": {"ja": "種別:", "en": "Category:"},
+    "btn_help_methods": {"ja": "?", "en": "?"},
+    "tip_help_methods": {"ja": "メソッド一覧とヘルプを別ウィンドウで開く",
+                          "en": "Open the method browser / help window"},
+    "help_title": {"ja": "メソッド ヘルプ", "en": "Method help"},
+    "help_hint": {"ja": "上の種別をクリックすると絞り込み (もう一度押すと解除 = 全メソッド)",
+                  "en": "Click a category to filter (click again to clear = all methods)"},
+    "btn_add_from_help": {"ja": "＋ このメソッドをチェーンに追加",
+                           "en": "+ Add this method to the chain"},
+    "lbl_workdir_files": {"ja": "作業フォルダの中身:", "en": "Working folder:"},
+    "btn_dir_back": {"ja": "◀ 上へ", "en": "◀ Up"},
+    "tip_dir_click": {"ja": "クリック: ファイルは既定のアプリで開く / フォルダは中に入る",
+                       "en": "Click: open file with default app / enter folder"},
+    "dir_empty": {"ja": "(空のフォルダ)", "en": "(empty)"},
     "lbl_method": {"ja": "メソッド:", "en": "Method:"},
     "btn_add_step": {"ja": "＋ ステップを追加", "en": "+ Add step"},
     "cat_add": {"ja": "Add 系 (データを作る/継ぎ足す)", "en": "Add (create/append)"},
@@ -813,6 +827,27 @@ CATEGORY_ORDER = ["add", "apply", "data", "expand", "other"]
 CATEGORY_LABEL_KEY = {"add": "cat_add", "apply": "cat_apply",
                       "data": "cat_data", "expand": "cat_expand",
                       "other": "cat_other"}
+# 種別ごとの色。ステップカードの枠と背景、種別コンボ、ヘルプのチップで共通。
+CATEGORY_COLOR = {"add": "#2a6fd6", "apply": "#c07000",
+                  "data": "#2a8f4f", "expand": "#8e44ad", "other": "#777777"}
+
+
+def category_of(method_name):
+    for c, lst in METHOD_REGISTRY.items():
+        if any(n == method_name for n, _ in lst):
+            return c
+    return "other"
+
+
+def category_icon(cat, size=12):
+    pm = QPixmap(size, size)
+    pm.fill(QColor(CATEGORY_COLOR.get(cat, "#888")))
+    return QIcon(pm)
+
+
+def _rgba(hex_color, alpha):
+    c = QColor(hex_color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
 
 # スキャン方向のサイズ (data.shape[1]) を変えるメソッド群。
 # 実行後は配列の形が変わるため、置ける位置に制約がある。
@@ -1047,42 +1082,62 @@ def fmt_value(v):
     return repr(v)
 
 
-class DocDialog(QDialog):
-    """README のメソッド説明を、図・GIF アニメーション付きで表示する。
+def method_doc_parts(method_name):
+    """(署名, 本文, 図パス, 定義場所) を返す (README 優先 → docstring)。"""
+    fn = getattr(drawManeuver, method_name, None)
+    try:
+        sig = str(inspect.signature(fn)).replace("self, ", "").replace("self", "")
+    except Exception:
+        sig = "()"
+    try:
+        where = (f"{os.path.basename(inspect.getfile(fn))}:"
+                 f"{inspect.getsourcelines(fn)[1]}")
+    except Exception:
+        where = ""
+    doc = readme_doc(method_name)
+    if doc:
+        text, images = doc["text"], doc["images"]
+    else:
+        text, images = (inspect.getdoc(fn) if fn else None) or tr("no_doc"), []
+    return sig, text, images, where
+
+
+class DocBody(QScrollArea):
+    """README のメソッド説明を、図・GIF アニメーション付きで表示する本文部分。
 
     QTextEdit の markdown 表示は GIF を静止画としてしか扱えないため、
     本文と図を分離し、図は QLabel + QMovie で再生する。
+    DocDialog (単体) と MethodHelpWindow (一覧付き) の両方で使う。
     """
 
     MAX_IMG_W = 900
 
-    def __init__(self, parent, title, subtitle, doc_text, images, where=""):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setSizeGripEnabled(True)
-        # 画面に対する割合で開く。既定が小さいと audio_render のような
-        # 長い説明が細長い窓に押し込まれて読めなくなる。
-        scr = QApplication.primaryScreen()
-        avail = scr.availableGeometry() if scr is not None else None
-        if avail is not None:
-            self.resize(min(1000, max(700, int(avail.width() * 0.62))),
-                        min(900, max(600, int(avail.height() * 0.85))))
-        else:
-            self.resize(1000, 800)
-        self._movies = []          # QMovie の生存維持
-        v = QVBoxLayout(self)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self._movies = []
+        self._inner = None
+        self._body = None
+
+    def set_doc(self, title, subtitle, doc_text, images, where=""):
+        for m in self._movies:
+            try:
+                m.stop()
+            except Exception:
+                pass
+        self._movies = []
+        inner = QWidget()
+        self._inner = inner
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(0, 0, 0, 0)
 
         head = QLabel(f"<b>{title}</b> <span style='color:#666;'>{subtitle}</span>"
                       + (f"<br><span style='color:#999; font-size:10px;'>{where}</span>"
                          if where else ""))
         head.setWordWrap(True)
         head.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        v.addWidget(head)
-
-        inner = QWidget()
-        self._inner = inner
-        il = QVBoxLayout(inner)
-        il.setContentsMargins(0, 0, 0, 0)
+        il.addWidget(head)
 
         # 本文は QLabel のリッチテキストで置く。QTextEdit だと内側に
         # 独自スクロールを持ってしまい、長い説明が狭い枠に閉じ込められる。
@@ -1127,17 +1182,8 @@ class DocDialog(QDialog):
                     lbl.setPixmap(pm)
             il.addWidget(lbl)
         il.addStretch()
-
-        scroll = QScrollArea()
-        scroll.setWidget(inner)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        v.addWidget(scroll, 1)
-        self._scroll = scroll
-
-        close = QPushButton("OK")
-        close.clicked.connect(self.accept)
-        v.addWidget(close, 0, Qt.AlignRight)
+        self.setWidget(inner)
+        self.verticalScrollBar().setValue(0)
 
     # 見出しの文字サイズ (pt)。README は #### 以下も使うが、Qt の
     # setMarkdown は h5/h6 を本文より小さく描くため読めなくなる。
@@ -1160,33 +1206,262 @@ class DocDialog(QDialog):
             cur.mergeCharFormat(fmt)
             blk = blk.next()
 
-    def closeEvent(self, ev):
+    def stop_movies(self):
         for m in self._movies:
             try:
                 m.stop()
             except Exception:
                 pass
+
+
+def _size_for_screen(widget, frac_w=0.62, frac_h=0.85, max_w=1000, max_h=900):
+    scr = QApplication.primaryScreen()
+    avail = scr.availableGeometry() if scr is not None else None
+    if avail is not None:
+        widget.resize(min(max_w, max(700, int(avail.width() * frac_w))),
+                      min(max_h, max(600, int(avail.height() * frac_h))))
+    else:
+        widget.resize(max_w, max_h)
+
+
+class DocDialog(QDialog):
+    """1 メソッドぶんの説明ダイアログ (ⓘ ボタン用)。"""
+
+    def __init__(self, parent, title, subtitle, doc_text, images, where=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setSizeGripEnabled(True)
+        _size_for_screen(self)
+        v = QVBoxLayout(self)
+        self.body = DocBody(self)
+        self.body.set_doc(title, subtitle, doc_text, images, where)
+        v.addWidget(self.body, 1)
+        close = QPushButton("OK")
+        close.clicked.connect(self.accept)
+        v.addWidget(close, 0, Qt.AlignRight)
+
+    def closeEvent(self, ev):
+        self.body.stop_movies()
+        super().closeEvent(ev)
+
+
+class MethodHelpWindow(QDialog):
+    """メソッド一覧 + ヘルプ。上段の種別チップで絞り込み、中段のコンボで選び、
+    下段にそのメソッドの README 説明を出す (非モーダル)。"""
+    add_requested = pyqtSignal(str, str)     # (category, method)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("help_title"))
+        self.setSizeGripEnabled(True)
+        self.setModal(False)
+        _size_for_screen(self, 0.66, 0.85, 1100, 950)
+        v = QVBoxLayout(self)
+
+        # --- 種別チップ (横並び・トグル、未選択 = 全メソッド) ---
+        chips = QHBoxLayout()
+        self.chips = {}
+        for c in CATEGORY_ORDER:
+            b = QToolButton()
+            b.setCheckable(True)
+            b.setText(tr(CATEGORY_LABEL_KEY[c]).split(" (")[0])
+            b.setToolTip(tr(CATEGORY_LABEL_KEY[c]))
+            col = CATEGORY_COLOR[c]
+            b.setStyleSheet(
+                f"QToolButton {{ border:1px solid {col}; border-radius:10px;"
+                f" padding:4px 12px; color:{col}; font-weight:bold;"
+                f" background:{_rgba(col, 0.08)}; }}"
+                f"QToolButton:checked {{ background:{col}; color:white; }}")
+            b.clicked.connect(lambda _=False, cc=c: self._on_chip(cc))
+            chips.addWidget(b)
+            self.chips[c] = b
+        chips.addStretch()
+        v.addLayout(chips)
+        hint = QLabel(tr("help_hint"))
+        hint.setStyleSheet("color:gray; font-size:10px;")
+        v.addWidget(hint)
+
+        # --- メソッド選択 ---
+        row = QHBoxLayout()
+        row.addWidget(QLabel(tr("lbl_method")))
+        self.method_combo = QComboBox()
+        self.method_combo.setMinimumWidth(320)
+        self.method_combo.currentIndexChanged.connect(self._on_method)
+        row.addWidget(self.method_combo, 1)
+        self.add_btn = QPushButton(tr("btn_add_from_help"))
+        self.add_btn.clicked.connect(self._on_add)
+        row.addWidget(self.add_btn)
+        v.addLayout(row)
+
+        # --- 説明 ---
+        self.body = DocBody(self)
+        v.addWidget(self.body, 1)
+
+        self._cat = None
+        self._fill_methods()
+
+    def _on_chip(self, cat):
+        # 押した種別が既に選ばれていれば解除 (= 全メソッド)
+        self._cat = None if self._cat == cat else cat
+        for c, b in self.chips.items():
+            b.setChecked(c == self._cat)
+        self._fill_methods()
+
+    def _fill_methods(self, keep=None):
+        cur = keep or self.method_combo.currentData()
+        self.method_combo.blockSignals(True)
+        self.method_combo.clear()
+        cats = [self._cat] if self._cat else CATEGORY_ORDER
+        for c in cats:
+            for name, sig in METHOD_REGISTRY.get(c, []):
+                params = [p for p in sig.parameters if p != "self"]
+                self.method_combo.addItem(category_icon(c), name, name)
+                self.method_combo.setItemData(
+                    self.method_combo.count() - 1,
+                    f"[{c}] {name}({', '.join(params)})", Qt.ToolTipRole)
+        self.method_combo.blockSignals(False)
+        i = self.method_combo.findData(cur) if cur else -1
+        self.method_combo.setCurrentIndex(i if i >= 0 else 0)
+        self._on_method()
+
+    def _on_method(self, *_):
+        name = self.method_combo.currentData()
+        if not name:
+            return
+        sig, text, images, where = method_doc_parts(name)
+        self.body.set_doc(name, sig, text, images, where)
+        self.add_btn.setEnabled(True)
+
+    def _on_add(self):
+        name = self.method_combo.currentData()
+        if name:
+            self.add_requested.emit(category_of(name), name)
+
+    def select(self, category=None, method=None):
+        """メインウィンドウで選ばれている種別/メソッドに合わせて開く。"""
+        self._cat = category if category in CATEGORY_ORDER else None
+        for c, b in self.chips.items():
+            b.setChecked(c == self._cat)
+        self._fill_methods(keep=method)
+
+    def closeEvent(self, ev):
+        self.body.stop_movies()
         super().closeEvent(ev)
 
 
 def show_method_doc(parent, method_name):
     """メソッドの説明ダイアログを開く (README 優先 → docstring)。"""
-    fn = getattr(drawManeuver, method_name, None)
-    try:
-        sig = str(inspect.signature(fn)).replace("self, ", "").replace("self", "")
-    except Exception:
-        sig = "()"
-    try:
-        where = (f"{os.path.basename(inspect.getfile(fn))}:"
-                 f"{inspect.getsourcelines(fn)[1]}")
-    except Exception:
-        where = ""
-    doc = readme_doc(method_name)
-    if doc:
-        text, images = doc["text"], doc["images"]
-    else:
-        text, images = (inspect.getdoc(fn) if fn else None) or tr("no_doc"), []
+    sig, text, images, where = method_doc_parts(method_name)
     DocDialog(parent, method_name, sig, text, images, where).exec_()
+
+
+class WorkDirBrowser(QWidget):
+    """作業ディレクトリの簡易ファイラ。クリックでファイルを既定のアプリで開き、
+    フォルダはその中へ入る。「上へ」でルート (作業ディレクトリ) まで戻れる。"""
+
+    ICON = {".mp4": "🎞", ".mov": "🎞", ".m4v": "🎞", ".avi": "🎞", ".mkv": "🎞",
+            ".png": "🖼", ".jpg": "🖼", ".jpeg": "🖼", ".tif": "🖼", ".tiff": "🖼",
+            ".gif": "🖼", ".bmp": "🖼", ".wav": "🔊", ".aif": "🔊", ".aiff": "🔊",
+            ".py": "🐍", ".txt": "📄", ".log": "📄", ".csv": "📄", ".json": "📄",
+            ".npy": "🧮", ".scd": "🎼"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._root = ""
+        self._cwd = ""
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        head = QHBoxLayout()
+        self.back_btn = QToolButton()
+        self.back_btn.setText(tr("btn_dir_back"))
+        self.back_btn.clicked.connect(self.go_up)
+        head.addWidget(self.back_btn)
+        self.path_label = QLabel("")
+        self.path_label.setStyleSheet("color:#555; font-size:10px;")
+        self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        head.addWidget(self.path_label, 1)
+        self.refresh_btn = QToolButton()
+        self.refresh_btn.setText("↻")
+        self.refresh_btn.clicked.connect(self.refresh)
+        head.addWidget(self.refresh_btn)
+        v.addLayout(head)
+        self.list = QListWidget()
+        self.list.setFixedHeight(170)
+        self.list.setStyleSheet("QListWidget { font-size:11px; }")
+        self.list.setToolTip(tr("tip_dir_click"))
+        self.list.itemClicked.connect(self._on_item)
+        v.addWidget(self.list)
+
+    def set_root(self, path):
+        self._root = os.path.abspath(path) if path else ""
+        self._cwd = self._root
+        self.refresh()
+
+    def refresh(self):
+        self.list.clear()
+        if not self._cwd or not os.path.isdir(self._cwd):
+            self.path_label.setText("")
+            self.back_btn.setEnabled(False)
+            return
+        rel = os.path.relpath(self._cwd, self._root) if self._root else self._cwd
+        self.path_label.setText(os.path.basename(self._root) + ("" if rel == "." else "/" + rel))
+        self.back_btn.setEnabled(self._cwd != self._root)
+        try:
+            names = sorted(os.listdir(self._cwd), key=str.lower)
+        except OSError:
+            names = []
+        dirs = [n for n in names if os.path.isdir(os.path.join(self._cwd, n))
+                and not n.startswith(".")]
+        files = [n for n in names if os.path.isfile(os.path.join(self._cwd, n))
+                 and not n.startswith(".")]
+        for n in dirs:
+            it = QListWidgetItem(f"📁 {n}/")
+            it.setData(Qt.UserRole, os.path.join(self._cwd, n))
+            it.setData(Qt.UserRole + 1, "dir")
+            self.list.addItem(it)
+        for n in files:
+            ext = os.path.splitext(n)[1].lower()
+            full = os.path.join(self._cwd, n)
+            try:
+                sz = os.path.getsize(full)
+            except OSError:
+                sz = 0
+            it = QListWidgetItem(f"{self.ICON.get(ext, '·')} {n}   ({_fmt_size(sz)})")
+            it.setData(Qt.UserRole, full)
+            it.setData(Qt.UserRole + 1, "file")
+            it.setToolTip(full)
+            self.list.addItem(it)
+        if not dirs and not files:
+            it = QListWidgetItem(tr("dir_empty"))
+            it.setFlags(Qt.NoItemFlags)
+            self.list.addItem(it)
+
+    def go_up(self):
+        if self._cwd and self._cwd != self._root:
+            self._cwd = os.path.dirname(self._cwd)
+            if not self._cwd.startswith(self._root):
+                self._cwd = self._root
+            self.refresh()
+
+    def _on_item(self, it):
+        path = it.data(Qt.UserRole)
+        kind = it.data(Qt.UserRole + 1)
+        if not path:
+            return
+        if kind == "dir":
+            self._cwd = path
+            self.refresh()
+        elif os.path.exists(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+
+def _fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
 
 
 # ======== 引数エディタ ========
@@ -1309,8 +1584,7 @@ class StepWidget(QFrame):
     remove_requested = pyqtSignal(object)
     duplicate_requested = pyqtSignal(object)
 
-    CAT_COLOR = {"add": "#2a6fd6", "apply": "#c07000",
-                 "data": "#2a8f4f", "expand": "#8e44ad", "other": "#777777"}
+    CAT_COLOR = CATEGORY_COLOR
 
     def __init__(self, category, method_name, values=None, enabled=True):
         super().__init__()
@@ -1385,9 +1659,11 @@ class StepWidget(QFrame):
     def _set_border(self):
         on = self.enable_chk.isChecked() if hasattr(self, "enable_chk") else True
         col = self.CAT_COLOR.get(self.category, "#888")
+        # 背景も種別の色で薄く塗る (チェーン上で種別が一目で分かるように)
         self.setStyleSheet(
             f"StepWidget {{ border:1px solid {col if on else '#ccc'};"
-            f" border-radius:4px; background: rgba(128,128,128,{18 if on else 6}); }}")
+            f" border-radius:4px;"
+            f" background: {_rgba(col, 0.13) if on else 'rgba(128,128,128,0.04)'}; }}")
 
     def set_index(self, i):
         self.index_label.setText(str(i + 1))
@@ -2028,6 +2304,13 @@ class DrawManeuverGUI(QWidget):
         self.workdir_btn.clicked.connect(self.open_work_dir)
         self.workdir_btn.setVisible(False)
         sg.addWidget(self.workdir_btn)
+        self.workdir_files_label = self._trlabel("lbl_workdir_files")
+        self.workdir_files_label.setStyleSheet("font-size:11px;")
+        self.workdir_files_label.setVisible(False)
+        sg.addWidget(self.workdir_files_label)
+        self.workdir_browser = WorkDirBrowser()
+        self.workdir_browser.setVisible(False)
+        sg.addWidget(self.workdir_browser)
         self.info_label = QLabel(tr("video_not_init"))
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("color:gray; font-size:10px;")
@@ -2054,13 +2337,13 @@ class DrawManeuverGUI(QWidget):
         scroll.setWidget(steps_holder)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        cg.addWidget(scroll, 1)
 
+        # 種別/メソッドの選択はチェーンの「上」に置く (追加 → 下に並ぶ流れ)
         addrow = QHBoxLayout()
         addrow.addWidget(self._trlabel("lbl_category"))
         self.cat_combo = QComboBox()
         for c in CATEGORY_ORDER:
-            self.cat_combo.addItem(tr(CATEGORY_LABEL_KEY[c]), c)
+            self.cat_combo.addItem(category_icon(c), tr(CATEGORY_LABEL_KEY[c]), c)
         self._reg(lambda: [self.cat_combo.setItemText(i, tr(CATEGORY_LABEL_KEY[c]))
                            for i, c in enumerate(CATEGORY_ORDER)])
         self.cat_combo.currentIndexChanged.connect(self._refresh_method_combo)
@@ -2073,7 +2356,18 @@ class DrawManeuverGUI(QWidget):
         self._reg(lambda: self.add_step_btn.setText(tr("btn_add_step")))
         self.add_step_btn.clicked.connect(self._add_step_from_combo)
         addrow.addWidget(self.add_step_btn)
+        # 右端: メソッド一覧 + ヘルプの別ウィンドウ
+        self.help_btn = QToolButton()
+        self._reg(lambda: (self.help_btn.setText(tr("btn_help_methods")),
+                           self.help_btn.setToolTip(tr("tip_help_methods"))))
+        self.help_btn.setStyleSheet(
+            "QToolButton { border:1px solid #888; border-radius:11px; min-width:22px;"
+            " min-height:22px; font-weight:bold; }")
+        self.help_btn.clicked.connect(self.open_method_help)
+        addrow.addWidget(self.help_btn)
         cg.addLayout(addrow)
+        cg.addWidget(scroll, 1)
+        self._help_window = None
         self._refresh_method_combo()
 
         # --- 2D プロット + 実行 ---
@@ -3163,6 +3457,9 @@ class DrawManeuverGUI(QWidget):
             self._work_dir = os.getcwd()   # 実行用 .py の書き出し先
             self.workdir_btn.setToolTip(self._work_dir)
             self.workdir_btn.setVisible(True)
+            self.workdir_browser.set_root(self._work_dir)
+            self.workdir_files_label.setVisible(True)
+            self.workdir_browser.setVisible(True)
             self.log(f"作業ディレクトリ: {self._work_dir}")
             if self.rt_preview is not None:
                 self.rt_preview.set_video(self.videopath)
@@ -3189,10 +3486,31 @@ class DrawManeuverGUI(QWidget):
         self.method_combo.clear()
         for name, sig in METHOD_REGISTRY.get(cat, []):
             params = [p for p in sig.parameters if p != "self"]
-            self.method_combo.addItem(name, name)
+            self.method_combo.addItem(category_icon(cat), name, name)
             self.method_combo.setItemData(
                 self.method_combo.count() - 1,
                 f"{name}({', '.join(params)})", Qt.ToolTipRole)
+
+    def open_method_help(self):
+        """メソッド一覧 + ヘルプの別ウィンドウ (非モーダル・1 枚だけ)。"""
+        if self._help_window is None:
+            self._help_window = MethodHelpWindow(self)
+            self._help_window.add_requested.connect(self._add_from_help)
+        self._help_window.select(self.cat_combo.currentData(),
+                                 self.method_combo.currentData())
+        self._help_window.show()
+        self._help_window.raise_()
+        self._help_window.activateWindow()
+
+    def _add_from_help(self, category, name):
+        self.add_step(category, name)
+        # メインの選択も追従させる (続けて同じ系統を足しやすいように)
+        i = self.cat_combo.findData(category)
+        if i >= 0:
+            self.cat_combo.setCurrentIndex(i)
+        j = self.method_combo.findData(name)
+        if j >= 0:
+            self.method_combo.setCurrentIndex(j)
 
     def _add_step_from_combo(self):
         name = self.method_combo.currentData()
@@ -3549,6 +3867,7 @@ class DrawManeuverGUI(QWidget):
         self._set_busy(False)
         if ok:
             self.log(tr("plot3d_done", p=path))
+            self.workdir_browser.refresh()
             self._set_output_target(path)
         else:
             self.log(tr("plot3d_fail"))
@@ -3730,6 +4049,7 @@ class DrawManeuverGUI(QWidget):
                 if isinstance(d, np.ndarray) and len(d) > 0:
                     self._last_full_data = d.copy()
             self.log(tr("render_done", p=path or "(不明)"))
+            self.workdir_browser.refresh()
             # 連番画像出力は単一ファイルにならないので書き出し先フォルダを開く
             img_dir = os.path.join(self._work_dir, "img")
             self._set_output_target(
@@ -3775,6 +4095,7 @@ class DrawManeuverGUI(QWidget):
             self._set_busy(False)
         if out:
             self.log(tr("save_preview_done", p=out))
+            self.workdir_browser.refresh()
             self._set_output_target(out)
         else:
             self.log(tr("save_preview_fail"))
@@ -3899,6 +4220,7 @@ class DrawManeuverGUI(QWidget):
             self.log("[ERROR] " + tr("export_fail", p=path, e=str(e)))
             return
         self.log(tr("export_done", p=os.path.abspath(path)))
+        self.workdir_browser.refresh()
 
     # ---- log ----
     def log(self, text):
